@@ -18,13 +18,19 @@
 (function () {
 	"use strict";
 
+	// LOUD diagnostic so we can SEE this script execute in the browser console.
+	console.log("[frappe_profiler] floating_widget.js LOADED at", new Date().toISOString());
+
 	// Only run inside Desk (not on web pages or guest sessions).
 	if (typeof frappe === "undefined" || typeof frappe.session === "undefined") {
+		console.warn("[frappe_profiler] no frappe global, script exiting");
 		return;
 	}
 	if (frappe.session.user === "Guest") {
+		console.warn("[frappe_profiler] user is Guest, script exiting");
 		return;
 	}
+	console.log("[frappe_profiler] proceeding for user:", frappe.session.user);
 
 	const POLL_INTERVAL_MS = 5000;
 	const REQUIRED_ROLES = ["System Manager", "Profiler User", "Administrator"];
@@ -100,9 +106,11 @@
 	}
 
 	function mountWidget() {
+		console.log("[frappe_profiler] mountWidget() called");
 		// Idempotent: don't double-mount on accidental re-init.
 		const existing = document.getElementById("frappe-profiler-widget");
 		if (existing) {
+			console.log("[frappe_profiler] widget already in DOM, skipping mount");
 			widget = existing;
 			return;
 		}
@@ -115,29 +123,35 @@
 			<span class="fp-elapsed"></span>
 		`;
 		widget.addEventListener("click", onClick);
-		// Inline styles as a safety net — these mirror floating_widget.css
-		// but guarantee the pill is visible even if the CSS file is stale,
-		// blocked, or the user has a custom theme that overrides it.
+		// Inline styles with MAXIMUM visibility — bright red, large, top-right,
+		// max z-index. This is intentionally loud so the user can SEE it.
+		// Once we confirm it's visible we'll dial it back to the styled pill.
 		widget.style.cssText = [
 			"position: fixed",
 			"right: 20px",
 			"bottom: 20px",
-			"z-index: 1040",
-			"display: block",
-			"min-width: 140px",
-			"padding: 10px 16px",
-			"border-radius: 24px",
-			"border: 1px solid rgba(0, 0, 0, 0.1)",
-			"background: #ffffff",
-			"box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12)",
-			"font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-			"font-size: 0.85rem",
-			"font-weight: 500",
-			"color: #1f2937",
+			"z-index: 2147483647",  /* max int32 — above everything */
+			"display: block !important",
+			"visibility: visible !important",
+			"opacity: 1 !important",
+			"min-width: 180px",
+			"padding: 16px 24px",
+			"border-radius: 32px",
+			"border: 3px solid #b91c1c",
+			"background: #fef2f2",
+			"box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3)",
+			"font-family: -apple-system, BlinkMacSystemFont, sans-serif",
+			"font-size: 1rem",
+			"font-weight: 700",
+			"color: #b91c1c",
 			"cursor: pointer",
 			"user-select: none",
+			"pointer-events: auto",
 		].join("; ");
 		document.body.appendChild(widget);
+		console.log("[frappe_profiler] widget appended to body, id=#frappe-profiler-widget");
+		console.log("[frappe_profiler] widget element:", widget);
+		console.log("[frappe_profiler] body has child count:", document.body.children.length);
 	}
 
 	function setDisplay(display, label, elapsed) {
@@ -351,6 +365,7 @@
 	// runs (Desk.set_globals at desk.js:329 runs later, asynchronously).
 	// The server-side _require_profiler_user check is the real gate.
 	function bootstrap() {
+		console.log("[frappe_profiler] bootstrap() called, document.body exists:", !!document.body);
 		if (!document.body) {
 			setTimeout(bootstrap, 50);
 			return;
@@ -358,12 +373,11 @@
 		try {
 			init();
 		} catch (e) {
-			// Last-ditch fallback: mount a minimal pill so the user can
-			// at least see SOMETHING and report it back.
 			console.error("[frappe_profiler] init failed:", e);
 		}
 	}
 
+	console.log("[frappe_profiler] document.readyState:", document.readyState);
 	if (document.readyState === "loading") {
 		document.addEventListener("DOMContentLoaded", bootstrap);
 	} else {
