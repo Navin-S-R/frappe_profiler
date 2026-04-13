@@ -77,7 +77,19 @@ def clear_active_session(user: str) -> None:
 
 
 def set_session_meta(session_uuid: str, meta: dict) -> None:
-	"""Store session metadata (started_at, user, label, etc.)."""
+	"""Store session metadata.
+
+	Recognized keys (consumers may add more, but these are the canonical):
+	  - session_uuid, docname, user, label, started_at  (set by api.start)
+	  - cap_warning                                     (set by register_recording)
+	  - capture_python_tree (bool)                      (v0.3.0+, set by api.start)
+
+	The v0.3.0 capture_python_tree flag is read by hooks_callbacks
+	before_request/before_job to decide whether to set
+	frappe.local._profiler_active_session_id. When False, the new
+	pyinstrument capture and sidecar wraps stay inert; SQL recording
+	via frappe.recorder proceeds as usual.
+	"""
 	frappe.cache.set_value(_meta_key(session_uuid), meta)
 
 
