@@ -49,15 +49,32 @@ def _identify_args(fn_name: str, args: tuple, kwargs: dict):
 	"""Build (identifier_raw, identifier_safe) for one captured call.
 
 	Sub-shapes per wrapped function:
-	  - get_doc(doctype, name)        → ((doctype, name), (doctype, hash(name)))
-	  - cache_get(key)                → (key, hash(key))
-	  - has_permission(doctype, name=None, ptype="read")
-	                                  → ((doctype, name, ptype),
-	                                     (doctype, hash(name), ptype))
+	  - get_doc("DocType", "name")     → ((doctype, name), (doctype, hash(name)))
+	  - get_doc({"doctype": ..., ...}) → extract from dict; name may be missing
+	    on unsaved docs ("__islocal"=1), in which case identifier is just doctype
+	  - cache_get(self, key)           → (key, hash(key))
+	  - has_permission(doctype, ptype="read", doc=None, ...)
+	                                   → ((doctype, name, ptype),
+	                                      (doctype, hash(name), ptype))
+	    where `name` is extracted from `doc` (which may be a Document, dict,
+	    or string)
+
+	Both `identifier_raw` and `identifier_safe` are guaranteed to be
+	hashable (strings, Nones, or tuples of those) so they can be used as
+	dict keys in the redundant_calls bucketing logic.
 	"""
 	if fn_name == "get_doc":
-		doctype = args[0] if len(args) > 0 else kwargs.get("doctype")
-		name = args[1] if len(args) > 1 else kwargs.get("name")
+		first = args[0] if len(args) > 0 else kwargs.get("doctype")
+		# Dict-arg form: frappe.get_doc({"doctype": "X", "name": "Y", ...})
+		if isinstance(first, dict):
+			doctype = first.get("doctype")
+			name = first.get("name") if not first.get("__islocal") else None
+		else:
+			doctype = first
+			name = args[1] if len(args) > 1 else kwargs.get("name")
+		# Coerce to strings/None so the result is always hashable
+		doctype = str(doctype) if doctype is not None else None
+		name = str(name) if name is not None else None
 		return (doctype, name), (doctype, _hash_identifier(name))
 
 	if fn_name == "cache_get":
@@ -66,16 +83,38 @@ def _identify_args(fn_name: str, args: tuple, kwargs: dict):
 		# wrap at the class level — not at frappe.cache — because
 		# frappe.cache is None at app-import time (no site bound yet).
 		key = args[1] if len(args) > 1 else kwargs.get("key")
+		# Cache keys may be bytes (Frappe sometimes builds them with the
+		# site prefix as bytes); coerce to str for hashability + display.
+		if isinstance(key, bytes):
+			key = key.decode("utf-8", errors="replace")
+		key = str(key) if key is not None else None
 		return key, _hash_identifier(key)
 
 	if fn_name == "has_permission":
+		# Frappe signature: has_permission(doctype, ptype="read", doc=None, ...)
+		# args[0]=doctype, args[1]=ptype, args[2]=doc.
 		doctype = args[0] if len(args) > 0 else kwargs.get("doctype")
-		name = args[1] if len(args) > 1 else kwargs.get("doc_name")
-		ptype = args[2] if len(args) > 2 else kwargs.get("ptype", "read")
+		ptype = args[1] if len(args) > 1 else kwargs.get("ptype", "read")
+		doc = args[2] if len(args) > 2 else kwargs.get("doc")
+		# Extract a stable identifier from doc, which may be a Document,
+		# a dict, or a string name.
+		if doc is None:
+			name = None
+		elif hasattr(doc, "name"):
+			name = getattr(doc, "name", None)
+		elif isinstance(doc, dict):
+			name = doc.get("name")
+		else:
+			name = doc
+		# Coerce all components to hashable types
+		doctype = str(doctype) if doctype is not None else None
+		ptype = str(ptype) if ptype is not None else None
+		name = str(name) if name is not None else None
 		return (doctype, name, ptype), (doctype, _hash_identifier(name), ptype)
 
-	# Unknown — return raw passthrough; should not happen in practice.
-	return (args, kwargs), (args, kwargs)
+	# Unknown — return None tuples so the bucket key is hashable but
+	# meaningless (the redundant_calls analyzer skips such entries).
+	return (None, None), (None, None)
 
 
 # Maximum entries per recording's sidecar list. Above this, additional

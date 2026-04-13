@@ -97,6 +97,7 @@ def analyze(recordings: list, context) -> AnalyzerResult:
 	# Bucket: (fn_name, identifier_safe_tuple) → list of (action_idx, raw)
 	buckets: dict = defaultdict(list)
 	truncation_seen = False
+	skipped_unhashable = 0
 
 	for action_idx, recording in enumerate(recordings):
 		sidecar = recording.get("sidecar") or []
@@ -111,9 +112,23 @@ def analyze(recordings: list, context) -> AnalyzerResult:
 			raw = entry.get("identifier_raw")
 			if fn_name is None or safe is None:
 				continue
-			# Convert lists to tuples so they're hashable as dict keys
-			key = (fn_name, _to_hashable(safe))
-			buckets[key].append((action_idx, raw))
+			# Convert lists to tuples so they're hashable as dict keys.
+			# Defensive: if the conversion still leaves an unhashable value
+			# (e.g. a dict slipped through capture._identify_args because
+			# the wrapped function was called with an unexpected shape),
+			# skip the entry rather than crash the whole analyzer.
+			try:
+				key = (fn_name, _to_hashable(safe))
+				buckets[key].append((action_idx, raw))
+			except TypeError:
+				skipped_unhashable += 1
+				continue
+
+	if skipped_unhashable:
+		context.warnings.append(
+			f"redundant_calls: skipped {skipped_unhashable} sidecar entries "
+			"with unhashable identifiers (likely dict-arg get_doc on unsaved docs)."
+		)
 
 	if truncation_seen:
 		context.warnings.append(

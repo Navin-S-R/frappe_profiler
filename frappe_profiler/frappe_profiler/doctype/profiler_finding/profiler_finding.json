@@ -21,7 +21,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Type",
-   "options": "N+1 Query\nFull Table Scan\nFilesort\nTemporary Table\nLow Filter Ratio\nMissing Index\nSlow Query",
+   "options": "N+1 Query\nFull Table Scan\nFilesort\nTemporary Table\nLow Filter Ratio\nMissing Index\nSlow Query\nSlow Hot Path\nHook Bottleneck\nRepeated Hot Frame\nRedundant Call",
    "read_only": 1
   },
   {
