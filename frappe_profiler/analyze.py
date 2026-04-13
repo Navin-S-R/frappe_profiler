@@ -39,6 +39,7 @@ from frappe_profiler.analyzers import (
 	index_suggestions,
 	n_plus_one,
 	per_action,
+	redundant_calls,
 	table_breakdown,
 	top_queries,
 )
@@ -65,7 +66,8 @@ _BUILTIN_ANALYZERS = [
 	explain_flags.analyze,
 	index_suggestions.analyze,
 	table_breakdown.analyze,
-	call_tree.analyze,  # v0.3.0 — must run after per_action
+	call_tree.analyze,        # v0.3.0 — must run after per_action
+	redundant_calls.analyze,  # v0.3.0 — independent
 ]
 
 # Backward-compat alias: the old name is still the public-facing list
