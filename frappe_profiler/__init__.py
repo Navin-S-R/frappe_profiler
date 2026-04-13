@@ -70,12 +70,22 @@ _patch_enqueue()
 # v0.3.0: install sidecar wraps for redundant-call detection.
 # Idempotent — safe to call multiple times. Wraps are activation-gated
 # at call time so they're no-ops for non-recording users.
+#
+# Both layers are wrapped in try/except: the install itself, AND the
+# logging fallback. In test contexts that stub `frappe` with a minimal
+# fake module (e.g. test_enqueue_patch.py), `install_wraps()` may raise
+# because `frappe.permissions` / `frappe.utils.redis_wrapper` aren't
+# present, AND `frappe.log_error` may not exist either. Both failures
+# are silent — the v0.2.0 enqueue patch above uses the same defensive
+# pattern (`pass` on any exception) for the same reason.
 try:
 	from frappe_profiler import capture
 
 	capture.install_wraps()
 except Exception:
-	# Never let a wrap install failure break app load.
-	import frappe
+	try:
+		import frappe
 
-	frappe.log_error(title="frappe_profiler capture.install_wraps")
+		frappe.log_error(title="frappe_profiler capture.install_wraps")
+	except Exception:
+		pass  # never let a logging failure break app load

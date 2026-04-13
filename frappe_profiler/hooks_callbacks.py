@@ -82,6 +82,24 @@ def before_request(*args, **kwargs):
 		import frappe.recorder
 
 		frappe.recorder.record(force=True)
+
+		# v0.3.0: gate the new pyinstrument + sidecar capture on the
+		# session's capture_python_tree flag. Setting
+		# _profiler_active_session_id is what activates the wraps
+		# (they gate on its presence in their hot path). When the
+		# flag is False we leave it unset and SQL-only capture proceeds.
+		meta = session.get_session_meta(session_uuid) or {}
+		if meta.get("capture_python_tree", True):
+			frappe.local._profiler_active_session_id = session_uuid
+			from frappe_profiler import capture as _capture
+
+			interval_ms = int(
+				frappe.conf.get("profiler_sampler_interval_ms")
+				or _capture.DEFAULT_SAMPLER_INTERVAL_MS
+			)
+			_capture._start_pyi_session(
+				local_proxy=frappe.local, interval_ms=interval_ms
+			)
 	except Exception:
 		# Never let a profiler bug break a customer request. Log and move on.
 		frappe.log_error(title="frappe_profiler before_request")
@@ -210,6 +228,21 @@ def before_job(method=None, kwargs=None, **rest):
 		import frappe.recorder
 
 		frappe.recorder.record(force=True)
+
+		# v0.3.0: gate the new pyinstrument + sidecar capture on the
+		# session's capture_python_tree flag. Mirrors before_request.
+		meta = session.get_session_meta(session_uuid) or {}
+		if meta.get("capture_python_tree", True):
+			frappe.local._profiler_active_session_id = session_uuid
+			from frappe_profiler import capture as _capture
+
+			interval_ms = int(
+				frappe.conf.get("profiler_sampler_interval_ms")
+				or _capture.DEFAULT_SAMPLER_INTERVAL_MS
+			)
+			_capture._start_pyi_session(
+				local_proxy=frappe.local, interval_ms=interval_ms
+			)
 	except Exception:
 		frappe.log_error(title="frappe_profiler before_job")
 
