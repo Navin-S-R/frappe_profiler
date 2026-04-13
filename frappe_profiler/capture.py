@@ -140,3 +140,116 @@ def _make_wrap(orig, fn_name: str, local_proxy=None):
 
 	wrapped._profiler_original = orig
 	return wrapped
+
+
+# Default pyinstrument sample interval in milliseconds. Overridable via
+# site_config.json: profiler_sampler_interval_ms. 1ms is pyinstrument's
+# default and balances fidelity vs overhead well.
+DEFAULT_SAMPLER_INTERVAL_MS = 1
+
+
+def _start_pyi_session(local_proxy, interval_ms: int = DEFAULT_SAMPLER_INTERVAL_MS):
+	"""Start a pyinstrument profiler scoped to this request.
+
+	Stores the running profiler on `local_proxy.profiler_pyinstrument` so
+	`after_request`/`after_job` can stop and serialize it. Returns the
+	profiler instance, or None if pyinstrument is not available.
+
+	Note: pyinstrument is imported inside the try-except so a broken
+	install (rare, but possible in air-gapped environments) doesn't
+	break app load. The module-level _PYINSTRUMENT_AVAILABLE flag is the
+	authoritative check.
+	"""
+	if not _PYINSTRUMENT_AVAILABLE:
+		return None
+	try:
+		from pyinstrument import Profiler
+
+		# pyinstrument expects interval in seconds (float)
+		prof = Profiler(interval=interval_ms / 1000.0, async_mode="enabled")
+		prof.start()
+		local_proxy.profiler_pyinstrument = prof
+		return prof
+	except Exception:
+		# Any failure to start pyinstrument is non-fatal — degrade to
+		# SQL-only capture for this recording.
+		return None
+
+
+def _force_stop_inflight_capture(local_proxy):
+	"""Stop any in-flight pyinstrument session and clear all capture state.
+
+	Called by api.start() (and the underlying _stop_session) before
+	flipping the active flag, so a previous in-flight capture from the
+	same worker doesn't leak into the new session.
+	"""
+	prof = getattr(local_proxy, "profiler_pyinstrument", None)
+	if prof is not None:
+		try:
+			prof.stop()
+		except Exception:
+			pass
+		try:
+			delattr(local_proxy, "profiler_pyinstrument")
+		except AttributeError:
+			pass
+
+	for attr in (
+		"_profiler_active_session_id",
+		"profiler_sidecar",
+		"profiler_sidecar_truncated",
+		"_profiler_in_wrap",
+	):
+		try:
+			delattr(local_proxy, attr)
+		except AttributeError:
+			pass
+
+
+# ----- Wrap installation on the real frappe modules -----------------------
+#
+# Installed once at app import time from frappe_profiler/__init__.py.
+# install_wraps() is idempotent: calling it twice does not double-wrap,
+# and pre-existing wraps from other apps are detected via the
+# _profiler_original attribute convention.
+
+
+def _wrap_targets():
+	"""Return the list of (module, attr_name, fn_name) tuples to wrap.
+
+	Lazy so that importing capture.py does not import frappe.permissions
+	(which would trigger a circular import at app load on some sites).
+	"""
+	import frappe
+	import frappe.permissions
+
+	return [
+		(frappe, "get_doc", "get_doc"),
+		(frappe.cache, "get_value", "cache_get"),
+		(frappe.permissions, "has_permission", "has_permission"),
+	]
+
+
+def install_wraps():
+	"""Install all three sidecar wraps. Idempotent.
+
+	If `frappe.get_doc` is already a `_profiler_is_our_wrap`-tagged wrapper,
+	we do not double-wrap.
+	"""
+	import frappe
+
+	for module, attr, fn_name in _wrap_targets():
+		current = getattr(module, attr)
+		if getattr(current, "_profiler_is_our_wrap", False):
+			continue  # already wrapped by us
+		new_wrap = _make_wrap(current, fn_name, local_proxy=frappe.local)
+		new_wrap._profiler_is_our_wrap = True
+		setattr(module, attr, new_wrap)
+
+
+def uninstall_wraps():
+	"""Restore originals. Used by before_uninstall and tests."""
+	for module, attr, fn_name in _wrap_targets():
+		current = getattr(module, attr)
+		if getattr(current, "_profiler_is_our_wrap", False):
+			setattr(module, attr, current._profiler_original)

@@ -165,3 +165,68 @@ def test_wrap_identify_args_failure_does_not_break_orig_call(fake_local, monkeyp
 	assert fake_local.profiler_sidecar == []
 	# Re-entrancy flag must be cleared even on the skip path
 	assert getattr(fake_local, "_profiler_in_wrap", False) is False
+
+
+def test_start_pyi_session_returns_none_when_unavailable(monkeypatch, fake_local):
+	monkeypatch.setattr(capture, "_PYINSTRUMENT_AVAILABLE", False)
+	result = capture._start_pyi_session(local_proxy=fake_local, interval_ms=1)
+	assert result is None
+	assert getattr(fake_local, "profiler_pyinstrument", None) is None
+
+
+def test_start_pyi_session_starts_when_available(fake_local):
+	if not capture._PYINSTRUMENT_AVAILABLE:
+		pytest.skip("pyinstrument not installed")
+	prof = capture._start_pyi_session(local_proxy=fake_local, interval_ms=10)
+	assert prof is not None
+	assert fake_local.profiler_pyinstrument is prof
+	# Cleanup so the test runner doesn't leak the profiler
+	prof.stop()
+
+
+def test_force_stop_inflight_capture_clears_state(fake_local):
+	fake_local._profiler_active_session_id = "session-123"
+	fake_local.profiler_sidecar = [{"x": 1}]
+	fake_local.profiler_sidecar_truncated = True
+
+	if capture._PYINSTRUMENT_AVAILABLE:
+		fake_local.profiler_pyinstrument = capture._start_pyi_session(
+			local_proxy=FakeLocal(), interval_ms=10
+		)
+
+	capture._force_stop_inflight_capture(local_proxy=fake_local)
+
+	assert getattr(fake_local, "_profiler_active_session_id", None) is None
+	assert getattr(fake_local, "profiler_sidecar", None) is None
+	assert getattr(fake_local, "profiler_sidecar_truncated", None) is None
+	assert getattr(fake_local, "profiler_pyinstrument", None) is None
+
+
+def test_install_wraps_idempotent():
+	"""Calling install_wraps twice does not double-wrap."""
+	import frappe
+
+	# Save original references
+	orig_get_doc = frappe.get_doc
+	# Install once
+	capture.install_wraps()
+	first_wrap = frappe.get_doc
+	# Install again
+	capture.install_wraps()
+	second_wrap = frappe.get_doc
+	# Both wraps point at the same underlying original
+	assert first_wrap._profiler_original is orig_get_doc or \
+	       getattr(first_wrap._profiler_original, "_profiler_original", None) is orig_get_doc
+	assert second_wrap is first_wrap  # not re-wrapped
+	# Restore for other tests
+	capture.uninstall_wraps()
+
+
+def test_uninstall_wraps_restores_originals():
+	import frappe
+
+	orig_get_doc = frappe.get_doc
+	capture.install_wraps()
+	assert frappe.get_doc is not orig_get_doc
+	capture.uninstall_wraps()
+	assert frappe.get_doc is orig_get_doc

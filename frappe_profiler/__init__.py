@@ -65,3 +65,17 @@ def _patch_enqueue():
 
 
 _patch_enqueue()
+
+
+# v0.3.0: install sidecar wraps for redundant-call detection.
+# Idempotent — safe to call multiple times. Wraps are activation-gated
+# at call time so they're no-ops for non-recording users.
+try:
+	from frappe_profiler import capture
+
+	capture.install_wraps()
+except Exception:
+	# Never let a wrap install failure break app load.
+	import frappe
+
+	frappe.log_error(title="frappe_profiler capture.install_wraps")
