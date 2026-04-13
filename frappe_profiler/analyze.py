@@ -55,6 +55,11 @@ ANALYZE_TOTAL_BUDGET_SECONDS = 20 * 60
 # logged as a warning but doesn't halt the pipeline.
 ANALYZE_PER_ANALYZER_SOFT_CAP_SECONDS = 60
 
+# v0.3.0: persistence size limits for call_tree_json on Profiler Action.
+CALL_TREE_OVERFLOW_THRESHOLD_BYTES = 200_000   # write to file above this
+CALL_TREE_HARD_MAX_BYTES = 16_000_000          # last-line sanity guard
+CALL_TREE_HARD_TRUNCATE_KEEP_FRAMES = 100      # frames kept on fallback
+
 
 # per_action is first because it builds the Profiler Action rows that the
 # rest of the analyzers reference via action_ref. The remainder are
@@ -488,6 +493,118 @@ def _shape_key(query: str) -> str:
 	return re.sub(r"\s+", " ", query.lower().strip())[:500]
 
 
+# ---------------------------------------------------------------------------
+# v0.3.0: call_tree_json overflow handling
+# ---------------------------------------------------------------------------
+
+
+def _apply_overflow_or_pass(
+	tree_json: str,
+	action_idx: int,
+	docname: str,
+	write_file=None,
+	warnings_sink: list = None,
+	hard_max_bytes: int = CALL_TREE_HARD_MAX_BYTES,
+) -> tuple[str, str | None]:
+	"""Decide whether to inline, overflow-to-file, or hard-truncate a tree blob.
+
+	Returns:
+	    (json_to_persist, overflow_file_url_or_None)
+
+	  - If `tree_json` is < CALL_TREE_OVERFLOW_THRESHOLD_BYTES → return as-is.
+	  - If `tree_json` is between the threshold and hard_max_bytes → call
+	    write_file(filename, content) to create a private File attachment;
+	    return a one-line marker JSON pointing at the URL. On write failure,
+	    fall back to a hard-truncated tree.
+	  - If `tree_json` is > hard_max_bytes → hard-truncate immediately
+	    without attempting an overflow file.
+	"""
+	import json as _json
+
+	size = len(tree_json)
+	warnings = warnings_sink if warnings_sink is not None else []
+
+	# Path 1: small enough to inline
+	if size < CALL_TREE_OVERFLOW_THRESHOLD_BYTES:
+		return tree_json, None
+
+	# Path 2: hard sanity guard — truncate immediately, never attempt file
+	if size > hard_max_bytes:
+		warnings.append(
+			f"Action {action_idx}: tree exceeded hard guard "
+			f"({size} > {hard_max_bytes}); hard-truncated"
+		)
+		return _hard_truncate_tree(tree_json), None
+
+	# Path 3: try to write overflow file
+	if write_file is None:
+		warnings.append(
+			f"Action {action_idx}: no overflow writer; tree hard-truncated"
+		)
+		return _hard_truncate_tree(tree_json), None
+
+	filename = f"profiler_call_tree_{docname}_action_{action_idx}.json"
+	try:
+		url = write_file(filename, tree_json.encode("utf-8"))
+		marker = _json.dumps({"_overflow": True, "url": url})
+		return marker, url
+	except Exception:
+		warnings.append(
+			f"Action {action_idx}: overflow file write failed; "
+			"tree hard-truncated"
+		)
+		return _hard_truncate_tree(tree_json), None
+
+
+def _hard_truncate_tree(tree_json: str) -> str:
+	"""Build a top-100-frames truncated tree JSON as a fallback."""
+	import json as _json
+
+	try:
+		tree = _json.loads(tree_json)
+	except Exception:
+		return _json.dumps({
+			"_truncated": True, "_parse_failed": True,
+			"function": "<root>", "children": [],
+		})
+
+	# Walk and collect the top-N frames by cumulative_ms
+	all_nodes: list = []
+
+	def collect(n):
+		all_nodes.append(n)
+		for c in n.get("children", []):
+			collect(c)
+
+	collect(tree)
+	all_nodes.sort(key=lambda n: n.get("cumulative_ms", 0), reverse=True)
+	kept = all_nodes[:CALL_TREE_HARD_TRUNCATE_KEEP_FRAMES]
+
+	flat_children = [
+		{
+			"function": n.get("function"),
+			"filename": n.get("filename"),
+			"lineno": n.get("lineno"),
+			"self_ms": n.get("self_ms", 0),
+			"cumulative_ms": n.get("cumulative_ms", 0),
+			"kind": n.get("kind", "python"),
+			"children": [],
+		}
+		for n in kept
+	]
+	out = {
+		"_truncated": True,
+		"function": "<root>",
+		"filename": "",
+		"lineno": 0,
+		"self_ms": 0,
+		"cumulative_ms": tree.get("cumulative_ms", 0),
+		"kind": "python",
+		"children": flat_children,
+	}
+	return _json.dumps(out, default=str)
+
+
 def _persist(
 	docname: str,
 	context: AnalyzeContext,
@@ -526,6 +643,34 @@ def _persist(
 	doc.total_python_ms = round(context.aggregate.get("total_python_ms", 0), 2)
 	doc.total_sql_ms = round(context.aggregate.get("total_sql_ms", 0), 2)
 	doc.analyzer_warnings = "\n".join(context.warnings) if context.warnings else None
+
+	# v0.3.0: apply overflow / hard-truncate to each action's call_tree_json.
+	def _writer(filename, content, _docname=docname):
+		file_doc = frappe.get_doc({
+			"doctype": "File",
+			"file_name": filename,
+			"attached_to_doctype": "Profiler Session",
+			"attached_to_name": _docname,
+			"is_private": 1,
+			"content": content,
+		})
+		file_doc.insert(ignore_permissions=True)
+		return file_doc.file_url
+
+	for action in context.actions:
+		tree_json = action.get("call_tree_json")
+		if not tree_json:
+			continue
+		new_json, overflow_url = _apply_overflow_or_pass(
+			tree_json,
+			action_idx=action.get("idx", 0),
+			docname=docname,
+			write_file=_writer,
+			warnings_sink=context.warnings,
+		)
+		action["call_tree_json"] = new_json
+		action["call_tree_size_bytes"] = len(new_json)
+		action["call_tree_overflow_file"] = overflow_url
 
 	# Reset and re-populate child tables (in case of re-run)
 	doc.set("actions", [])
