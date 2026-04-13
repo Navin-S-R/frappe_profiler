@@ -147,7 +147,11 @@ def run(session_uuid: str):
 		_publish_progress(5, "Fetching recordings", session_uuid)
 
 		recording_uuids = session.get_recordings(session_uuid)
-		recordings = _fetch_recordings(recording_uuids)
+		# v0.3.0: _fetch_recordings is now a generator. Materialize here
+		# for the analyzer pipeline (which makes multiple passes), but
+		# each recording's pyi_session is dropped after call_tree finishes
+		# with it (handled in the analyzer itself).
+		recordings = list(_fetch_recordings(recording_uuids))
 
 		if not recordings:
 			_finalize_with_empty_session(docname)
@@ -233,14 +237,61 @@ def run(session_uuid: str):
 # ---------------------------------------------------------------------------
 
 
-def _fetch_recordings(recording_uuids: list[str]) -> list[dict]:
-	"""Read recording dicts from RECORDER_REQUEST_HASH."""
-	out = []
+def _fetch_recordings(recording_uuids: list[str]):
+	"""Stream recording dicts from Redis, one at a time.
+
+	v0.3.0 changes:
+	  - This is now a generator (was: list-returning) so the analyze
+	    pipeline can drop unpruned pyi_session blobs from memory between
+	    recordings rather than holding all 200 in RAM at once.
+	  - For each recording, also loads the per-recording pyi tree pickle
+	    from `profiler:tree:<uuid>` and the sidecar log from
+	    `profiler:sidecar:<uuid>`. Both are best-effort — failures
+	    log a warning and yield None for the missing piece.
+
+	Yields recording dicts shaped like:
+	    {
+	      ...existing recorder fields (uuid, calls, etc.)...
+	      "pyi_session": <pyinstrument.session.Session or dict or None>,
+	      "sidecar": <list[dict]>,
+	    }
+	"""
+	import pickle
+
 	for uuid in recording_uuids:
 		rec = frappe.cache.hget(RECORDER_REQUEST_HASH, uuid)
-		if rec:
-			out.append(rec)
-	return out
+		if not rec:
+			continue
+
+		# Load the pyinstrument tree pickle (best-effort)
+		pyi_session = None
+		try:
+			tree_blob = frappe.cache.get_value(f"profiler:tree:{uuid}")
+			if tree_blob:
+				pyi_session = pickle.loads(tree_blob)
+		except Exception:
+			frappe.log_error(
+				title="frappe_profiler analyze",
+				message=f"Failed to deserialize pyi tree for {uuid}",
+			)
+			pyi_session = None
+
+		# Load the sidecar argument log (best-effort)
+		sidecar = []
+		try:
+			loaded = frappe.cache.get_value(f"profiler:sidecar:{uuid}")
+			if isinstance(loaded, list):
+				sidecar = loaded
+		except Exception:
+			frappe.log_error(
+				title="frappe_profiler analyze",
+				message=f"Failed to load sidecar for {uuid}",
+			)
+			sidecar = []
+
+		rec["pyi_session"] = pyi_session
+		rec["sidecar"] = sidecar
+		yield rec
 
 
 # Per-recording enrichment caps. On a session that hit the 200-recording
