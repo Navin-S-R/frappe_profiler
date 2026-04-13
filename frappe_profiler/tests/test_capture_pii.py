@@ -23,7 +23,12 @@ def test_identify_args_get_doc_deterministic():
 
 
 def test_identify_args_cache_get_hashes_key():
-	raw, safe = capture._identify_args("cache_get", ("user_lang:admin@example.com",), {})
+	# cache_get wraps RedisWrapper.get_value (a class method), so args[0]
+	# is the RedisWrapper instance (self) and args[1] is the actual key.
+	fake_self = object()
+	raw, safe = capture._identify_args(
+		"cache_get", (fake_self, "user_lang:admin@example.com"), {},
+	)
 	assert raw == "user_lang:admin@example.com"
 	assert isinstance(safe, str) and len(safe) == 12
 	assert "@" not in safe

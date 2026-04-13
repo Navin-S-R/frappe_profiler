@@ -61,7 +61,11 @@ def _identify_args(fn_name: str, args: tuple, kwargs: dict):
 		return (doctype, name), (doctype, _hash_identifier(name))
 
 	if fn_name == "cache_get":
-		key = args[0] if len(args) > 0 else kwargs.get("key")
+		# This wraps RedisWrapper.get_value (a method), so args[0] is the
+		# RedisWrapper instance (self) and args[1] is the actual key. We
+		# wrap at the class level — not at frappe.cache — because
+		# frappe.cache is None at app-import time (no site bound yet).
+		key = args[1] if len(args) > 1 else kwargs.get("key")
 		return key, _hash_identifier(key)
 
 	if fn_name == "has_permission":
@@ -218,14 +222,24 @@ def _wrap_targets():
 	"""Return the list of (module, attr_name, fn_name) tuples to wrap.
 
 	Lazy so that importing capture.py does not import frappe.permissions
-	(which would trigger a circular import at app load on some sites).
+	or frappe.utils.redis_wrapper (which would trigger circular imports
+	at app load on some sites).
+
+	Note about the cache target: we wrap `RedisWrapper.get_value` (a class
+	method), NOT `frappe.cache.get_value`, because `frappe.cache` is None
+	at app-import time (the per-site cache instance is bound only after
+	`frappe.init(site)` runs). Wrapping the class method ensures every
+	cache instance created later uses the wrapped version. Because this
+	is a method wrap, the wrapper sees `self` as args[0] and the actual
+	key as args[1] — handled in `_identify_args` for `cache_get`.
 	"""
 	import frappe
 	import frappe.permissions
+	import frappe.utils.redis_wrapper
 
 	return [
 		(frappe, "get_doc", "get_doc"),
-		(frappe.cache, "get_value", "cache_get"),
+		(frappe.utils.redis_wrapper.RedisWrapper, "get_value", "cache_get"),
 		(frappe.permissions, "has_permission", "has_permission"),
 	]
 

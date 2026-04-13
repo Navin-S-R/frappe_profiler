@@ -206,27 +206,43 @@ def test_install_wraps_idempotent():
 	"""Calling install_wraps twice does not double-wrap."""
 	import frappe
 
-	# Save original references
-	orig_get_doc = frappe.get_doc
+	# Reset to a clean state — frappe_profiler/__init__.py runs
+	# install_wraps() at app-import time, so without this reset
+	# `frappe.get_doc` is already wrapped when this test starts.
+	capture.uninstall_wraps()
+
+	orig_get_doc = frappe.get_doc  # the TRUE original now
 	# Install once
 	capture.install_wraps()
 	first_wrap = frappe.get_doc
 	# Install again
 	capture.install_wraps()
 	second_wrap = frappe.get_doc
-	# Both wraps point at the same underlying original
-	assert first_wrap._profiler_original is orig_get_doc or \
-	       getattr(first_wrap._profiler_original, "_profiler_original", None) is orig_get_doc
-	assert second_wrap is first_wrap  # not re-wrapped
+	# First install produced a wrap whose _profiler_original is the true original
+	assert first_wrap is not orig_get_doc
+	assert first_wrap._profiler_original is orig_get_doc
+	# Second install was a no-op (idempotent)
+	assert second_wrap is first_wrap
 	# Restore for other tests
 	capture.uninstall_wraps()
+	assert frappe.get_doc is orig_get_doc
+
+	# Re-install so the rest of the test session has the wraps in place
+	# (matches the state set up by frappe_profiler/__init__.py).
+	capture.install_wraps()
 
 
 def test_uninstall_wraps_restores_originals():
 	import frappe
+
+	# Reset to clean state first (see comment in test_install_wraps_idempotent)
+	capture.uninstall_wraps()
 
 	orig_get_doc = frappe.get_doc
 	capture.install_wraps()
 	assert frappe.get_doc is not orig_get_doc
 	capture.uninstall_wraps()
 	assert frappe.get_doc is orig_get_doc
+
+	# Re-install so the rest of the test session has the wraps in place
+	capture.install_wraps()
