@@ -291,3 +291,511 @@ def reconcile(pyi_session_or_dict, sql_calls: list, action_wall_time_ms: float) 
 
 	_coalesce_sql_siblings(tree)
 	return tree
+
+
+# ---------------------------------------------------------------------------
+# Pruning and soft cap (Task 17)
+# ---------------------------------------------------------------------------
+
+
+DEFAULT_PRUNE_THRESHOLD_PCT = 0.005
+DEFAULT_TREE_NODE_CAP = 500
+
+
+def _prune(tree: dict, action_wall_time_ms: float, threshold_pct: float) -> dict:
+	"""Drop nodes whose cumulative_ms is below the threshold.
+
+	Pruned siblings under the same parent merge into one
+	`[other: N frames]` placeholder with summed time. Operates in-place
+	and also returns the tree for chaining.
+	"""
+	threshold = max(2.0, action_wall_time_ms * threshold_pct)
+	_prune_recursive(tree, threshold)
+	return tree
+
+
+def _prune_recursive(node: dict, threshold: float) -> None:
+	children = node.get("children", [])
+	kept = []
+	dropped_count = 0
+	dropped_self_ms = 0.0
+	dropped_cumulative_ms = 0.0
+	for child in children:
+		# Never prune SQL leaves — they're always meaningful
+		if child.get("kind") == "sql":
+			kept.append(child)
+			continue
+		if child.get("cumulative_ms", 0) < threshold:
+			dropped_count += 1
+			dropped_self_ms += child.get("self_ms", 0)
+			dropped_cumulative_ms += child.get("cumulative_ms", 0)
+			continue
+		_prune_recursive(child, threshold)
+		kept.append(child)
+	if dropped_count:
+		kept.append({
+			"function": f"[other: {dropped_count} frames]",
+			"filename": "",
+			"lineno": 0,
+			"self_ms": dropped_self_ms,
+			"cumulative_ms": dropped_cumulative_ms,
+			"kind": "python",
+			"children": [],
+		})
+	node["children"] = kept
+
+
+def _soft_cap_nodes(tree: dict, max_nodes: int) -> dict:
+	"""If the tree has more than max_nodes, drop cold siblings to fit.
+
+	Walks depth-first, always descending the highest-cumulative child
+	first. Counts every node visited. Once the count reaches max_nodes,
+	any unvisited children are replaced with a single `[N more frames omitted]`
+	placeholder. The hot path is always preserved.
+
+	Returns the tree (mutated in place).
+	"""
+	state = {"count": 0}
+	_soft_cap_recursive(tree, max_nodes, state)
+	return tree
+
+
+def _soft_cap_recursive(node: dict, max_nodes: int, state: dict) -> None:
+	state["count"] += 1
+	children = sorted(
+		node.get("children", []),
+		key=lambda c: c.get("cumulative_ms", 0),
+		reverse=True,
+	)
+	kept = []
+	omitted_count = 0
+	omitted_ms = 0.0
+	for child in children:
+		if state["count"] >= max_nodes:
+			omitted_count += 1
+			omitted_ms += child.get("cumulative_ms", 0)
+			continue
+		_soft_cap_recursive(child, max_nodes, state)
+		kept.append(child)
+	if omitted_count:
+		kept.append({
+			"function": f"[{omitted_count} more frames omitted]",
+			"filename": "",
+			"lineno": 0,
+			"self_ms": 0.0,
+			"cumulative_ms": omitted_ms,
+			"kind": "python",
+			"children": [],
+		})
+	node["children"] = kept
+
+
+# ---------------------------------------------------------------------------
+# Per-action findings (Task 18)
+# ---------------------------------------------------------------------------
+
+
+DEFAULT_HOT_PATH_PCT = 0.25
+DEFAULT_HOT_PATH_MS = 200
+DEFAULT_HOT_PATH_HIGH_PCT = 0.50
+DEFAULT_HOT_PATH_HIGH_MS = 500
+SQL_DOMINANCE_SUPPRESSION_PCT = 0.80
+
+
+def _largest_sql_child(node: dict):
+	"""Return the largest SQL leaf among direct children, or None."""
+	sql_children = [c for c in node.get("children", []) if c.get("kind") == "sql"]
+	if not sql_children:
+		return None
+	return max(sql_children, key=lambda c: c.get("cumulative_ms", 0))
+
+
+def _emit_per_action_findings(
+	tree: dict,
+	action_idx: int,
+	action_label: str,
+	action_wall_time_ms: float,
+) -> list:
+	"""Walk the tree and emit Slow Hot Path / Hook Bottleneck findings.
+
+	One finding per qualifying subtree. F3 (Hook Bottleneck) takes
+	precedence over F1 (Slow Hot Path). F1 is suppressed when a single
+	SQL leaf dominates the subtree.
+	"""
+	if action_wall_time_ms <= 0:
+		return []
+
+	findings = []
+	_walk_for_findings(
+		tree,
+		parent_chain=[],
+		action_idx=action_idx,
+		action_label=action_label,
+		action_wall_time_ms=action_wall_time_ms,
+		findings=findings,
+	)
+	return findings
+
+
+def _walk_for_findings(
+	node: dict,
+	parent_chain: list,
+	action_idx: int,
+	action_label: str,
+	action_wall_time_ms: float,
+	findings: list,
+) -> None:
+	cumulative = node.get("cumulative_ms", 0)
+	pct_of_action = cumulative / action_wall_time_ms if action_wall_time_ms else 0
+
+	# Qualifies as a hot subtree?
+	# Skip framework frames (frappe.* / frappe_profiler.*) so we descend
+	# through them and emit the finding on the user-code or hook frame
+	# inside. Without this, Document.run_method itself would qualify and
+	# we'd emit a generic Slow Hot Path on it instead of the actual hook.
+	qualifies = (
+		pct_of_action >= DEFAULT_HOT_PATH_PCT
+		and cumulative >= DEFAULT_HOT_PATH_MS
+		and node.get("kind") == "python"
+		and not (node.get("function") or "").startswith("[")  # skip [other] / [omitted]
+		and node.get("function") != "<root>"
+		and not _is_framework_frame(node)
+	)
+
+	if qualifies:
+		# SQL-dominated suppression check
+		largest_sql = _largest_sql_child(node)
+		sql_dominates = (
+			largest_sql is not None
+			and (largest_sql.get("cumulative_ms", 0) / cumulative) >= SQL_DOMINANCE_SUPPRESSION_PCT
+		)
+		if not sql_dominates:
+			# Hook detection: any ancestor frame is Document.run_method?
+			is_hook = any(
+				"Document.run_method" in (p.get("function") or "")
+				for p in parent_chain
+			)
+			severity = (
+				"High" if (pct_of_action >= DEFAULT_HOT_PATH_HIGH_PCT
+				           and cumulative >= DEFAULT_HOT_PATH_HIGH_MS)
+				else "Medium"
+			)
+			pct_str = f"{pct_of_action * 100:.0f}%"
+			fn_name = node.get("function", "<unknown>")
+
+			if is_hook:
+				findings.append({
+					"finding_type": "Hook Bottleneck",
+					"severity": severity,
+					"title": f"In {action_label}, the {fn_name} hook consumed {cumulative:.0f}ms",
+					"customer_description": (
+						f"During *{action_label}*, the **{fn_name}** doc-event hook "
+						f"consumed {pct_str} of the total time ({cumulative:.0f}ms). "
+						"Hook functions run on every save/submit — optimizing this "
+						"would speed up every similar action across your site."
+					),
+					"technical_detail_json": json.dumps({
+						"function": fn_name,
+						"filename": node.get("filename"),
+						"lineno": node.get("lineno"),
+						"cumulative_ms": cumulative,
+						"action_wall_time_ms": action_wall_time_ms,
+						"is_hook": True,
+					}, default=str),
+					"estimated_impact_ms": round(cumulative, 2),
+					"affected_count": 1,
+					"action_ref": str(action_idx),
+				})
+			else:
+				findings.append({
+					"finding_type": "Slow Hot Path",
+					"severity": severity,
+					"title": f"In {action_label}, {pct_str} of the time was spent in {fn_name}",
+					"customer_description": (
+						f"During *{action_label}*, **{fn_name}** and its callees "
+						f"consumed {pct_str} of the total time ({cumulative:.0f}ms). "
+						"This is the highest-impact code path for this action."
+					),
+					"technical_detail_json": json.dumps({
+						"function": fn_name,
+						"filename": node.get("filename"),
+						"lineno": node.get("lineno"),
+						"cumulative_ms": cumulative,
+						"action_wall_time_ms": action_wall_time_ms,
+						"is_hook": False,
+					}, default=str),
+					"estimated_impact_ms": round(cumulative, 2),
+					"affected_count": 1,
+					"action_ref": str(action_idx),
+				})
+			# When we emit a finding for this node, do NOT recurse into
+			# its children — children are already represented in the
+			# subtree's cumulative_ms, and recursing would create
+			# overlapping nested findings.
+			return
+
+	# Recurse into children
+	new_chain = parent_chain + [node]
+	for child in node.get("children", []):
+		if child.get("kind") == "sql":
+			continue
+		_walk_for_findings(
+			child, new_chain, action_idx, action_label, action_wall_time_ms, findings,
+		)
+
+
+# ---------------------------------------------------------------------------
+# Cross-action aggregation + leaderboard (Task 19)
+# ---------------------------------------------------------------------------
+
+
+DEFAULT_REPEATED_FRAME_MIN_ACTIONS = 3
+DEFAULT_REPEATED_FRAME_MIN_TOTAL_MS = 500
+HOT_FRAMES_LEADERBOARD_SIZE = 20
+HOT_FRAMES_INTERMEDIATE_CAP = 1000
+
+
+def _redacted_module_key(function: str) -> str:
+	"""Build the dedup key for cross-action aggregation."""
+	if not function or function.startswith("[") or function == "<root>" or function == "<sql>":
+		return None
+	return function  # full name; renderer collapses at display time
+
+
+def _aggregate_hot_frames(per_action_trees: list):
+	"""Build the cross-action hot frames map → (findings, leaderboard).
+
+	Returns:
+	  findings   — list of Repeated Hot Frame findings (session-wide,
+	               no action_ref)
+	  leaderboard — list of top-N dicts for hot_frames_json
+	"""
+	# {function_key: [(action_idx, cumulative_ms), ...]}
+	occurrences: dict = defaultdict(list)
+
+	for action_idx, tree in enumerate(per_action_trees):
+		_walk_for_aggregation(tree, action_idx, occurrences)
+		# Cap intermediate map size to bound memory
+		if len(occurrences) > HOT_FRAMES_INTERMEDIATE_CAP * 2:
+			by_total = sorted(
+				occurrences.items(),
+				key=lambda kv: sum(ms for _, ms in kv[1]),
+				reverse=True,
+			)[:HOT_FRAMES_INTERMEDIATE_CAP]
+			occurrences = defaultdict(list, dict(by_total))
+
+	findings = []
+	leaderboard_rows = []
+
+	for key, occs in occurrences.items():
+		distinct_actions = {idx for idx, _ in occs}
+		total_ms = sum(ms for _, ms in occs)
+		row = {
+			"function": key,
+			"total_ms": round(total_ms, 2),
+			"occurrences": len(occs),
+			"distinct_actions": len(distinct_actions),
+			"action_refs": sorted(distinct_actions),
+		}
+		leaderboard_rows.append(row)
+
+		if (
+			len(distinct_actions) >= DEFAULT_REPEATED_FRAME_MIN_ACTIONS
+			and total_ms >= DEFAULT_REPEATED_FRAME_MIN_TOTAL_MS
+		):
+			severity = "High" if total_ms >= 2000 else "Medium"
+			findings.append({
+				"finding_type": "Repeated Hot Frame",
+				"severity": severity,
+				"title": (
+					f"{key} appeared in {len(distinct_actions)} actions "
+					f"and consumed {total_ms:.0f}ms total"
+				),
+				"customer_description": (
+					f"The function **{key}** ran across {len(distinct_actions)} "
+					f"different actions in this session, consuming {total_ms:.0f}ms "
+					"in total. Optimizing it would help every flow that touches it."
+				),
+				"technical_detail_json": json.dumps({
+					"function": key,
+					"total_ms": round(total_ms, 2),
+					"distinct_actions": len(distinct_actions),
+					"action_refs": sorted(distinct_actions),
+				}, default=str),
+				"estimated_impact_ms": round(total_ms, 2),
+				"affected_count": len(occs),
+				"action_ref": None,
+			})
+
+	leaderboard_rows.sort(key=lambda r: r["total_ms"], reverse=True)
+	leaderboard = leaderboard_rows[:HOT_FRAMES_LEADERBOARD_SIZE]
+
+	return findings, leaderboard
+
+
+def _walk_for_aggregation(node: dict, action_idx: int, occurrences: dict) -> None:
+	if node.get("kind") == "python":
+		key = _redacted_module_key(node.get("function", ""))
+		if key:
+			occurrences[key].append((action_idx, node.get("cumulative_ms", 0)))
+	for child in node.get("children", []):
+		_walk_for_aggregation(child, action_idx, occurrences)
+
+
+# ---------------------------------------------------------------------------
+# Session-wide donut breakdown + analyzer entry point (Task 20)
+# ---------------------------------------------------------------------------
+
+
+def _top_level_app(function: str, filename: str) -> str:
+	"""Return the top-level app name for bucketing the donut."""
+	if not function:
+		return "[other]"
+	if function.startswith("[") or function in ("<root>", "<sql>"):
+		return "[other]"
+	parts = function.split(".", 1)
+	if parts and parts[0]:
+		return parts[0]
+	return "[other]"
+
+
+def _build_session_breakdown(per_action_trees: list, sql_total_ms: float) -> dict:
+	"""Compute the donut data: sql ms + python ms + per-app self ms."""
+	by_app: dict = defaultdict(float)
+	python_total = 0.0
+	for tree in per_action_trees:
+		_walk_for_breakdown(tree, by_app)
+		python_total += _sum_self_python(tree)
+	return {
+		"sql_ms": round(sql_total_ms, 2),
+		"python_ms": round(python_total, 2),
+		"by_app": {k: round(v, 2) for k, v in by_app.items()},
+	}
+
+
+def _walk_for_breakdown(node: dict, by_app: dict) -> None:
+	if node.get("kind") == "python" and node.get("function") not in ("<root>",):
+		app = _top_level_app(node.get("function", ""), node.get("filename", ""))
+		by_app[app] += node.get("self_ms", 0)
+	for child in node.get("children", []):
+		_walk_for_breakdown(child, by_app)
+
+
+def _sum_self_python(node: dict) -> float:
+	total = 0.0
+	if node.get("kind") == "python" and node.get("function") != "<root>":
+		total += node.get("self_ms", 0)
+	for child in node.get("children", []):
+		total += _sum_self_python(child)
+	return total
+
+
+def _conf_float(key: str, default: float) -> float:
+	try:
+		import frappe
+
+		v = frappe.conf.get(key)
+		if v is not None:
+			return float(v)
+	except Exception:
+		pass
+	return default
+
+
+def _conf_int(key: str, default: int) -> int:
+	try:
+		import frappe
+
+		v = frappe.conf.get(key)
+		if v is not None:
+			return int(v)
+	except Exception:
+		pass
+	return default
+
+
+def analyze(recordings: list, context) -> AnalyzerResult:
+	"""call_tree analyzer entry point.
+
+	For each recording with a pyi_session, reconcile + prune + cap the tree,
+	emit per-action findings, and record the unified tree on the action.
+	After all recordings are processed, emit cross-action Repeated Hot
+	Frame findings and build the session-wide donut + leaderboard.
+	"""
+	findings: list = []
+	aggregate: dict = {}
+	per_action_trees: list = []
+	sql_total_ms = 0.0
+
+	# Threshold config (read once)
+	prune_pct = _conf_float("profiler_tree_prune_threshold_pct", DEFAULT_PRUNE_THRESHOLD_PCT)
+	node_cap = _conf_int("profiler_tree_node_cap", DEFAULT_TREE_NODE_CAP)
+
+	for action_idx, recording in enumerate(recordings):
+		pyi = recording.get("pyi_session")
+		calls = recording.get("calls") or []
+		# Track SQL time even if no pyi tree
+		sql_total_ms += sum(c.get("duration", 0) for c in calls)
+
+		# Action label / wall time from context if available, else fall back
+		action_label = "?"
+		action_wall_time = 0
+		if action_idx < len(context.actions):
+			a = context.actions[action_idx]
+			action_label = a.get("action_label") or a.get("path") or "?"
+			action_wall_time = a.get("duration_ms") or 0
+
+		if pyi is None:
+			per_action_trees.append({
+				"function": "<root>", "children": [],
+				"cumulative_ms": 0, "self_ms": 0, "kind": "python",
+			})
+			# Set null call_tree on the action — renderer falls back gracefully
+			if action_idx < len(context.actions):
+				context.actions[action_idx]["call_tree_json"] = None
+			continue
+
+		# Reconcile, prune, cap
+		try:
+			tree = reconcile(pyi, calls, action_wall_time)
+			tree = _prune(tree, action_wall_time or 1, prune_pct)
+			tree = _soft_cap_nodes(tree, node_cap)
+		except Exception:
+			context.warnings.append(
+				f"Reconciliation failed for action {action_idx} (see error log)"
+			)
+			tree = {
+				"function": "<root>", "children": [],
+				"cumulative_ms": 0, "self_ms": 0, "kind": "python",
+			}
+
+		per_action_trees.append(tree)
+
+		# Per-action findings
+		findings.extend(_emit_per_action_findings(
+			tree,
+			action_idx=action_idx,
+			action_label=action_label,
+			action_wall_time_ms=action_wall_time or tree.get("cumulative_ms", 0),
+		))
+
+		# Persist the tree as JSON on the action (overflow handling in
+		# Task 23 happens later at _persist time)
+		tree_json = json.dumps(tree, default=str)
+		if action_idx < len(context.actions):
+			context.actions[action_idx]["call_tree_json"] = tree_json
+			context.actions[action_idx]["call_tree_size_bytes"] = len(tree_json)
+
+	# Cross-action aggregation
+	repeated_findings, leaderboard = _aggregate_hot_frames(per_action_trees)
+	findings.extend(repeated_findings)
+
+	# Donut breakdown
+	breakdown = _build_session_breakdown(per_action_trees, sql_total_ms=sql_total_ms)
+
+	aggregate["hot_frames"] = leaderboard
+	aggregate["session_time_breakdown"] = breakdown
+	aggregate["total_python_ms"] = breakdown["python_ms"]
+	aggregate["total_sql_ms"] = breakdown["sql_ms"]
+
+	return AnalyzerResult(findings=findings, aggregate=aggregate)

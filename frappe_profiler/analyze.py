@@ -34,6 +34,7 @@ from frappe.recorder import (
 
 from frappe_profiler import renderer, session
 from frappe_profiler.analyzers import (
+	call_tree,
 	explain_flags,
 	index_suggestions,
 	n_plus_one,
@@ -64,6 +65,7 @@ _BUILTIN_ANALYZERS = [
 	explain_flags.analyze,
 	index_suggestions.analyze,
 	table_breakdown.analyze,
+	call_tree.analyze,  # v0.3.0 — must run after per_action
 ]
 
 # Backward-compat alias: the old name is still the public-facing list
@@ -512,6 +514,15 @@ def _persist(
 	doc.table_breakdown_json = json.dumps(
 		context.aggregate.get("table_breakdown", []), default=str
 	)
+	# v0.3.0: call_tree analyzer outputs
+	doc.hot_frames_json = json.dumps(
+		context.aggregate.get("hot_frames", []), default=str
+	)
+	doc.session_time_breakdown_json = json.dumps(
+		context.aggregate.get("session_time_breakdown", {}), default=str
+	)
+	doc.total_python_ms = round(context.aggregate.get("total_python_ms", 0), 2)
+	doc.total_sql_ms = round(context.aggregate.get("total_sql_ms", 0), 2)
 	doc.analyzer_warnings = "\n".join(context.warnings) if context.warnings else None
 
 	# Reset and re-populate child tables (in case of re-run)
