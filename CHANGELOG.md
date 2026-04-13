@@ -8,6 +8,136 @@ versions may contain breaking changes — see migration notes below).
 
 ---
 
+## [0.3.0] — 2026-04-13
+
+Adds a Python call tree capture and analysis layer on top of the existing
+SQL-only profiler. Customers reading a safe report now see where their
+flow spent time across SQL **and** Python, with hot-path detection,
+hook bottleneck findings, and redundant-call detection. See
+`apps/frappe_profiler_design/specs/2026-04-13-call-tree-and-redundant-calls-design.md`
+for the full design spec.
+
+### Added
+
+- **pyinstrument-based Python call tree capture** per recording. Sampled
+  at 1ms intervals (configurable via
+  `site_config.json: profiler_sampler_interval_ms`). Scoped per request
+  so non-recording users are unaffected.
+- **Reconciled unified call tree** — each captured SQL call is grafted
+  onto the deepest user-code frame in the pyinstrument tree, so the
+  customer sees "your `discounts.calculate` function spent 320ms — 280ms
+  of that in 14 SQL queries (children below)".
+- **Four new finding types:**
+  - `Slow Hot Path` — a Python subtree consumes >25% of an action AND >200ms.
+  - `Hook Bottleneck` — same shape, but the subtree is a doc-event hook
+    (called via `Document.run_method`); the finding names the hook function.
+  - `Repeated Hot Frame` — the same frame appears in ≥3 actions and
+    consumes ≥500ms total across the session.
+  - `Redundant Call` — the same `frappe.get_doc(doctype, name)` /
+    `frappe.cache.get_value(key)` / `frappe.permissions.has_permission(...)`
+    fired N times from the same callsite (thresholds: 5/10/10 by default,
+    all configurable).
+- **Session-wide time-attribution donut** in the safe report — at-a-glance
+  "this session was 38% SQL, 22% erpnext, 18% your custom code, …".
+- **Hot frames leaderboard** in the safe report — top 20 hottest function
+  paths across the whole session, sortable.
+- **`api.start(label, capture_python_tree=True)`** — new kwarg lets
+  customers opt out per session (falls back to v0.2.0 SQL-only capture).
+  Surfaced in the floating widget's start dialog as a checkbox.
+- **Auto-promote of large per-action call trees** to private File
+  attachments when the inline JSON exceeds 200KB. Hard-truncation
+  fallback if the file write fails. 16MB hard guard against pathological
+  trees.
+- **Sidecar wraps** for redundant-call detection on `frappe.get_doc`,
+  `RedisWrapper.get_value` (the underlying class behind `frappe.cache`),
+  and `frappe.permissions.has_permission`. Idempotent install at app
+  load; restored on uninstall.
+- **PII safety on sidecar arguments:** values that may contain user data
+  (doc names, cache keys) are sha256-hashed (`identifier_safe`) for
+  safe-mode display. Raw values stored only in raw-mode-visible
+  technical details. Doctype names and ptypes are NOT hashed (schema,
+  not data).
+- **`pyinstrument >= 4.6, < 6` dependency** added to `pyproject.toml`.
+  Pure-Python, MIT, no compiled extensions.
+- **Streaming `_fetch_recordings`** — converted from list-returning to
+  generator so the analyze pipeline holds bounded memory across large
+  sessions.
+- **Per-analyzer wall-clock budget tracker** — analyzers exceeding 60s
+  are flagged; total analyze budgeted at 20 min (5-min headroom under
+  RQ long-queue timeout). Past the cap, remaining analyzers are skipped
+  with a partial-completion warning.
+- **`api.export_session()` v0.3.0 fields** — JSON output now includes
+  `call_tree`, `hot_frames`, `session_time_breakdown`, `total_python_ms`,
+  `total_sql_ms`.
+- **New site config keys:**
+  - `profiler_sampler_interval_ms` — pyinstrument sample interval (default 1).
+  - `profiler_tree_prune_threshold_pct` — drop frames below N% of action time (default 0.005).
+  - `profiler_tree_node_cap` — max nodes per persisted tree (default 500, hot path always preserved).
+  - `profiler_redundant_doc_threshold` (default 5).
+  - `profiler_redundant_cache_threshold` (default 10).
+  - `profiler_redundant_perm_threshold` (default 10).
+  - `profiler_redundant_high_multiplier` (default 5).
+  - `profiler_safe_extra_allowed_apps` — extra app prefixes whose function names are kept un-redacted in safe mode.
+
+### Changed
+
+- **Per-flow recording overhead** climbs from "10–30% per query" to
+  roughly "1.5–2× wall clock during recording" when `capture_python_tree=True`.
+  Non-recording users on the same site are still unaffected — the
+  activation gate is per-user, and the wraps' hot-path check is a single
+  attribute lookup with **<100ns overhead** measured against an unwrapped
+  baseline.
+- **`health()` `last_24h.analyze_avg_ms`** will rise after this ships.
+  Customers monitoring it will see a step change at upgrade time.
+- **Renderer adds donut + hot frames sections** to both safe and raw
+  reports. Old v0.2.0 sessions render with the old layout (no v0.3.0
+  fields → sections skipped).
+- **R2 redaction policy** — function names in safe-mode reports collapse
+  custom-app frames to `<app>:<top-level-module>` (e.g.
+  `my_acme_app.discounts.pricing.calc_secret` → `my_acme_app:discounts`).
+  Frappe / ERPNext / payments / hrms keep full names.
+
+### Fixed (caught during v0.3.0 development)
+
+- **`pyproject.toml` empty `authors = [{ name = "", email = ""}]`**
+  broke `flit_core` on Python 3.14 with `email.errors.HeaderParseError`.
+  Removed the empty entry.
+- **`__init__.py` `frappe.log_error` fallback** in the
+  `capture.install_wraps` except handler crashed when test code stubs
+  `frappe` with a minimal fake module that lacks `log_error`. Now
+  bulletproofed with a nested try/except.
+- **Best-effort sidecar entry build** — a failure inside `_identify_args`
+  (e.g. an arg with a broken `__str__`) used to propagate out and break
+  the user's `frappe.get_doc` call. Now caught locally; the wrap skips
+  the entry but always calls `orig`.
+
+### Migration notes
+
+Running `bench --site <site> migrate` will:
+
+1. Apply patch `frappe_profiler.patches.v0_3_0.add_call_tree_fields`,
+   which reloads `Profiler Action` and `Profiler Session` to pick up
+   the new nullable columns.
+2. Add 3 new fields to `tabProfiler Action`: `call_tree_json`,
+   `call_tree_size_bytes`, `call_tree_overflow_file`.
+3. Add 4 new fields to `tabProfiler Session`: `total_python_ms`,
+   `total_sql_ms`, `hot_frames_json`, `session_time_breakdown_json`.
+
+No breaking API changes — `start`, `stop`, `status`, `get_active_session`,
+`health`, `export_session`, `retry_analyze` all keep their existing
+signatures (`start` accepts a new optional kwarg with backward-compatible
+default).
+
+Existing v0.2.0 sessions continue to render with the old layout
+(NULL v0.3.0 fields → donut/hot frames sections skipped via the
+backward-compat fallbacks).
+
+To opt out of the new pyinstrument capture per-session, uncheck
+**"Capture Python call tree"** in the start dialog or pass
+`capture_python_tree=False` to `api.start`.
+
+---
+
 ## [0.2.0] — 2026-04-09
 
 Round 2 improvements. 28 items across correctness, operations, UX,
