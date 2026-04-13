@@ -62,15 +62,30 @@ def _require_profiler_user() -> str:
 
 
 @frappe.whitelist()
-def start(label: str = "") -> dict:
+def start(label: str = "", capture_python_tree: bool = True) -> dict:
 	"""Begin a profiling session for the calling user.
 
 	If the user already has an active session, that session is stopped
 	first (its DocType row is marked `Stopping` and its Redis pointer
 	cleared). This makes start() idempotent from the user's perspective:
 	clicking Start twice never produces two parallel sessions.
+
+	Args:
+	    label: Human-readable session label.
+	    capture_python_tree: v0.3.0+. When True (default), pyinstrument
+	        captures a Python call tree per recording and sidecar wraps
+	        capture frappe.get_doc / cache.get_value / has_permission
+	        argument identities. When False, only the existing SQL
+	        recorder runs — same overhead profile as v0.2.0.
 	"""
 	user = _require_profiler_user()
+
+	# v0.3.0: clear any in-flight capture state from a previous request
+	# on this worker BEFORE we look at session state, so leaked state
+	# from a concurrent request doesn't influence the new session.
+	from frappe_profiler import capture
+
+	capture._force_stop_inflight_capture(local_proxy=frappe.local)
 
 	# If the user is already recording, gracefully stop the previous one.
 	previous = session.get_active_session_for(user)
@@ -102,6 +117,7 @@ def start(label: str = "") -> dict:
 			"user": user,
 			"label": title,
 			"started_at": now.isoformat(),
+			"capture_python_tree": bool(capture_python_tree),
 		},
 	)
 
@@ -143,6 +159,14 @@ def _stop_session(user: str, session_uuid: str) -> str | None:
 	row couldn't be found (Redis/MariaDB state drift — e.g. after a
 	Redis flush). Composed from three small helpers for clarity.
 	"""
+	# v0.3.0: stop any in-flight pyinstrument session and clear capture
+	# state on this worker before flipping the active flag, so a previous
+	# in-flight capture from the same worker doesn't leak into a new
+	# session started immediately after.
+	from frappe_profiler import capture
+
+	capture._force_stop_inflight_capture(local_proxy=frappe.local)
+
 	_clear_active(user)
 	docname = _mark_stopping(user, session_uuid)
 	if not docname:
