@@ -221,6 +221,41 @@ def render(
 		)
 	)
 
+	# v0.3.0: load donut + hot frames data from the new fields. Each
+	# helper degrades to empty/None if the field is missing (old session).
+	allowed_prefixes = ()
+	try:
+		import frappe
+
+		allowed_prefixes = tuple(
+			frappe.conf.get("profiler_safe_extra_allowed_apps") or ()
+		)
+	except Exception:
+		pass
+
+	try:
+		_breakdown = json.loads(getattr(session_doc, "session_time_breakdown_json", None) or "{}")
+	except Exception:
+		_breakdown = {}
+	try:
+		_hot_frames_raw = json.loads(getattr(session_doc, "hot_frames_json", None) or "[]")
+	except Exception:
+		_hot_frames_raw = []
+
+	donut_slices = build_donut_data(_breakdown, mode=mode, allowed_prefixes=allowed_prefixes)
+	hot_frames_rows = build_hot_frames_table(
+		_hot_frames_raw, mode=mode, allowed_prefixes=allowed_prefixes,
+	)
+
+	def _redact_for_template(node):
+		return redact_frame_name(node, mode=mode, allowed_prefixes=allowed_prefixes)
+
+	def _from_json(s):
+		try:
+			return json.loads(s) if s else {}
+		except Exception:
+			return {}
+
 	context = {
 		"session": session_doc,
 		"actions": actions,
@@ -237,6 +272,11 @@ def render(
 			"Medium": sum(1 for f in findings if f["severity"] == "Medium"),
 			"Low": sum(1 for f in findings if f["severity"] == "Low"),
 		},
+		# v0.3.0 additions
+		"donut_slices": donut_slices,
+		"hot_frames_rows": hot_frames_rows,
+		"redact_frame_name": _redact_for_template,
+		"from_json": _from_json,
 	}
 
 	return template.render(**context)
@@ -323,3 +363,118 @@ def _get_server_timezone() -> str:
 	except Exception:
 		pass
 	return "UTC"
+
+
+# ---------------------------------------------------------------------------
+# v0.3.0: call tree, donut, and hot frames helpers
+# ---------------------------------------------------------------------------
+
+HARDCODED_ALLOWED_PREFIXES = ("frappe.", "erpnext.", "payments.", "hrms.")
+
+
+def redact_frame_name(node: dict, mode: str, allowed_prefixes: tuple) -> str:
+	"""Apply R2 redaction to a tree node's display name.
+
+	Safe mode:
+	  - Frames in frappe./erpnext./payments./hrms. → full name kept
+	  - Frames in any allowed_prefixes prefix → full name kept
+	  - All other frames → collapsed to "<app>:<top-level-module>"
+
+	Raw mode:
+	  - Full function name + filename + line number, no redaction.
+	"""
+	if not isinstance(node, dict):
+		return "<unknown>"
+
+	function = node.get("function") or "<unknown>"
+	filename = node.get("filename") or ""
+	lineno = node.get("lineno") or 0
+
+	if mode == "raw":
+		short_file = filename.split("/")[-1] if filename else "?"
+		return f"{function} ({short_file}:{lineno})"
+
+	# Special markers — pass through unchanged
+	if function.startswith("[") or function in ("<root>", "<sql>", "<unknown>"):
+		return function
+
+	allowed = HARDCODED_ALLOWED_PREFIXES + tuple(allowed_prefixes or ())
+	for prefix in allowed:
+		if function.startswith(prefix):
+			return function
+
+	# Collapse to <app>:<top-level-module>
+	parts = function.split(".", 2)
+	if len(parts) >= 2:
+		return f"{parts[0]}:{parts[1]}"
+	return function
+
+
+# Donut color palette (8 colors; rolls over for more).
+_DONUT_COLORS = [
+	"#ff6b6b", "#4ecdc4", "#ffd93d", "#6c5ce7",
+	"#a8e6cf", "#ff8b94", "#95e1d3", "#ffaaa5",
+]
+
+
+def build_donut_data(breakdown: dict, mode: str, allowed_prefixes: tuple) -> list:
+	"""Convert session_time_breakdown_json into ordered (label, ms, color) tuples.
+
+	Safe mode collapses non-allowed app names into a single "Python (custom apps)"
+	bucket. Raw mode shows each app by name.
+	"""
+	if not breakdown:
+		return []
+
+	allowed = HARDCODED_ALLOWED_PREFIXES + tuple(allowed_prefixes or ())
+	allowed_app_names = {p.rstrip(".") for p in allowed}
+
+	slices = []
+	sql_ms = breakdown.get("sql_ms", 0)
+	if sql_ms > 0:
+		slices.append(("SQL", sql_ms, _DONUT_COLORS[0]))
+
+	by_app = breakdown.get("by_app", {})
+	if mode == "safe":
+		# Group: each allowed app gets its own slice; everything else
+		# merges into "Python (custom apps)".
+		custom_total = 0.0
+		for app, ms in by_app.items():
+			if app in allowed_app_names:
+				color = _DONUT_COLORS[(len(slices)) % len(_DONUT_COLORS)]
+				slices.append((f"Python ({app})", ms, color))
+			else:
+				custom_total += ms
+		if custom_total > 0:
+			color = _DONUT_COLORS[(len(slices)) % len(_DONUT_COLORS)]
+			slices.append(("Python (custom apps)", custom_total, color))
+	else:
+		# Raw mode: every app named
+		for app, ms in by_app.items():
+			color = _DONUT_COLORS[(len(slices)) % len(_DONUT_COLORS)]
+			slices.append((f"Python ({app})", ms, color))
+
+	return slices
+
+
+def build_hot_frames_table(rows: list, mode: str, allowed_prefixes: tuple) -> list:
+	"""Apply redaction to the hot frames leaderboard rows.
+
+	Returns a list of dicts ready for the template (display_name, total_ms,
+	occurrences, distinct_actions, action_refs).
+	"""
+	out = []
+	for row in rows or []:
+		display = redact_frame_name(
+			{"function": row.get("function"), "filename": "", "lineno": 0},
+			mode=mode,
+			allowed_prefixes=allowed_prefixes,
+		)
+		out.append({
+			"display_name": display,
+			"total_ms": row.get("total_ms", 0),
+			"occurrences": row.get("occurrences", 0),
+			"distinct_actions": row.get("distinct_actions", 0),
+			"action_refs": row.get("action_refs", []),
+		})
+	return out

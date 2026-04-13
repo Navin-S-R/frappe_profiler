@@ -385,6 +385,62 @@
     {% endif %}
   </div>
 
+  {# --------------- v0.3.0: TIME BREAKDOWN DONUT --------------- #}
+  {% if donut_slices %}
+  <div class="section">
+    <h2>Time breakdown</h2>
+    {% set total_ms = donut_slices | map(attribute=1) | sum %}
+    {% if total_ms > 0 %}
+      {% set ns = namespace(offset=0) %}
+      <div style="display: flex; gap: 24px; align-items: center; flex-wrap: wrap;">
+        <div style="width: 160px; height: 160px; border-radius: 50%; flex-shrink: 0;
+                    background: conic-gradient(
+          {%- for label, ms, color in donut_slices -%}
+            {{ color }} {{ ns.offset }}deg {{ ns.offset + (ms / total_ms * 360) }}deg{% if not loop.last %}, {% endif %}
+            {%- set ns.offset = ns.offset + (ms / total_ms * 360) -%}
+          {%- endfor -%}
+          );"></div>
+        <ul style="list-style: none; padding: 0; margin: 0;">
+          {% for label, ms, color in donut_slices %}
+            <li style="display: flex; align-items: center; gap: 8px; padding: 2px 0;">
+              <span style="display: inline-block; width: 12px; height: 12px;
+                           border-radius: 50%; background: {{ color }};"></span>
+              {{ label }} &mdash; {{ ms | round(0) | int }}ms
+            </li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {# --------------- v0.3.0: HOT FRAMES LEADERBOARD --------------- #}
+  {% if hot_frames_rows %}
+  <div class="section">
+    <h2>Hot frames (top {{ hot_frames_rows | length }})</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Function</th>
+          <th class="num">Total ms</th>
+          <th class="num">Occurrences</th>
+          <th class="num">Distinct actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in hot_frames_rows %}
+        <tr>
+          <td><code>{{ row.display_name }}</code></td>
+          <td class="num">{{ row.total_ms | round(0) | int }}</td>
+          <td class="num">{{ row.occurrences }}</td>
+          <td class="num">{{ row.distinct_actions }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
   {# --------------- TOP-N SLOW QUERIES --------------- #}
   <div class="section">
     <h2>Top {{ top_queries|length }} slowest queries</h2>
