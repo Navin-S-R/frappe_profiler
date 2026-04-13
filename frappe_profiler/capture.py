@@ -108,27 +108,35 @@ def _make_wrap(orig, fn_name: str, local_proxy=None):
 		if in_wrap:
 			return orig(*args, **kwargs)
 
-		identifier_raw, identifier_safe = _identify_args(fn_name, args, kwargs)
-		entry = {
-			"fn_name": fn_name,
-			"identifier_raw": identifier_raw,
-			"identifier_safe": identifier_safe,
-		}
-
-		# Set re-entrancy flag BEFORE calling orig so any nested wrapped
-		# call into another wrap returns early.
+		# Set re-entrancy flag BEFORE doing any work so nested wrapped
+		# calls (e.g. has_permission → get_doc) skip recording.
 		local_proxy._profiler_in_wrap = True
+
+		# Build the sidecar entry on a best-effort basis. A failure here
+		# (malformed args, exotic types) MUST NOT prevent the user's call
+		# from running — observability code never breaks the host call.
+		try:
+			identifier_raw, identifier_safe = _identify_args(fn_name, args, kwargs)
+			entry = {
+				"fn_name": fn_name,
+				"identifier_raw": identifier_raw,
+				"identifier_safe": identifier_safe,
+			}
+		except Exception:
+			entry = None
+
 		try:
 			return orig(*args, **kwargs)
 		finally:
 			local_proxy._profiler_in_wrap = False
-			sidecar = getattr(local_proxy, "profiler_sidecar", None)
-			if sidecar is None:
-				local_proxy.profiler_sidecar = [entry]
-			elif len(sidecar) >= SIDECAR_CAP_PER_RECORDING:
-				local_proxy.profiler_sidecar_truncated = True
-			else:
-				sidecar.append(entry)
+			if entry is not None:
+				sidecar = getattr(local_proxy, "profiler_sidecar", None)
+				if sidecar is None:
+					local_proxy.profiler_sidecar = [entry]
+				elif len(sidecar) >= SIDECAR_CAP_PER_RECORDING:
+					local_proxy.profiler_sidecar_truncated = True
+				else:
+					sidecar.append(entry)
 
 	wrapped._profiler_original = orig
 	return wrapped

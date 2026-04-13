@@ -134,3 +134,34 @@ def test_wrap_chains_preexisting_wrap(fake_local):
 	wrapped = capture._make_wrap(existing_wrap, "get_doc", local_proxy=fake_local)
 	# Our _profiler_original points to the existing wrap (not double-deep)
 	assert wrapped._profiler_original is existing_wrap
+
+
+def test_wrap_identify_args_failure_does_not_break_orig_call(fake_local, monkeypatch):
+	"""If _identify_args raises, orig must still be called and return normally.
+
+	Observability code must never break the host call. A bug in the
+	profiler's identifier-builder is logged-and-skipped, not propagated.
+	"""
+	fake_local._profiler_active_session_id = "test-session"
+	fake_local.profiler_sidecar = []
+
+	calls = []
+
+	def orig(doctype, name):
+		calls.append((doctype, name))
+		return "result"
+
+	def broken_identify(fn_name, args, kwargs):
+		raise RuntimeError("boom in identify_args")
+
+	monkeypatch.setattr(capture, "_identify_args", broken_identify)
+
+	wrapped = capture._make_wrap(orig, "get_doc", local_proxy=fake_local)
+	result = wrapped("User", "x@y.com")
+
+	assert result == "result"
+	assert calls == [("User", "x@y.com")]
+	# No sidecar entry recorded (best-effort skipped)
+	assert fake_local.profiler_sidecar == []
+	# Re-entrancy flag must be cleared even on the skip path
+	assert getattr(fake_local, "_profiler_in_wrap", False) is False
