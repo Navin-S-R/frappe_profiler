@@ -36,3 +36,37 @@ def test_start_persists_capture_python_tree_in_meta():
 	assert "capture_python_tree" in src
 	# Specifically: it should appear in the dict passed to set_session_meta
 	assert "set_session_meta" in src
+
+
+def test_require_profiler_user_does_not_recurse(monkeypatch):
+	"""Regression: _require_profiler_user used to call itself instead of
+	_require_user() (pre-existing v0.2.0 typo at line 52). The infinite
+	recursion only fired in production when the widget actually called
+	api.status — never caught by tests because nothing invoked the
+	function. This test calls it directly and asserts it returns within
+	one stack frame."""
+	import frappe
+
+	# Stand-in frappe.session and get_roles so we don't need a real site
+	monkeypatch.setattr(
+		frappe, "session", type("S", (), {"user": "Administrator"})(), raising=False
+	)
+	monkeypatch.setattr(frappe, "get_roles", lambda u: ["Administrator"], raising=False)
+
+	# Should return without recursing
+	result = api._require_profiler_user()
+	assert result == "Administrator"
+
+
+def test_require_profiler_user_throws_for_user_without_role(monkeypatch):
+	import frappe
+
+	monkeypatch.setattr(
+		frappe, "session", type("S", (), {"user": "alice@example.com"})(), raising=False
+	)
+	monkeypatch.setattr(frappe, "get_roles", lambda u: ["Sales User"], raising=False)
+
+	import pytest as _pytest
+
+	with _pytest.raises(Exception):
+		api._require_profiler_user()

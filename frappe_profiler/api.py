@@ -49,7 +49,7 @@ def _require_profiler_user() -> str:
 	themselves — the role check in the widget JS would be purely
 	cosmetic.
 	"""
-	user = _require_profiler_user()
+	user = _require_user()
 	if user == "Administrator":
 		return user
 	roles = set(frappe.get_roles(user))
