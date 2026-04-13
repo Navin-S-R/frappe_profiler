@@ -42,7 +42,14 @@
 	};
 
 	function userHasRole() {
-		const roles = frappe.user_roles || [];
+		// frappe.user_roles is set by Desk.set_globals(). On initial page
+		// load our app_include_js script may run before set_globals, so
+		// fall back to frappe.boot.user.roles which is populated inline
+		// in the Desk HTML before any script executes.
+		const roles =
+			frappe.user_roles
+			|| (frappe.boot && frappe.boot.user && frappe.boot.user.roles)
+			|| [];
 		return REQUIRED_ROLES.some((r) => roles.includes(r));
 	}
 
@@ -303,11 +310,39 @@
 	}
 
 	// Wait until Frappe Desk has finished bootstrapping, then mount.
+	//
+	// Subtle race: our `app_include_js` script tag executes during initial
+	// HTML parse, BEFORE Desk.set_globals() runs (which is what populates
+	// `frappe.user_roles` from `frappe.boot.user.roles` — see desk.js:329).
+	// `frappe.after_ajax` doesn't help because there's no AJAX in flight at
+	// app boot. We need to poll for frappe.user_roles to actually exist.
+	function waitForFrappeReady(callback, attempt) {
+		attempt = attempt || 0;
+		// frappe.user_roles is set by Desk.set_globals; frappe.boot is set
+		// inline in the Desk HTML before any script runs. We accept either
+		// signal — frappe.user_roles takes precedence.
+		var roles = (typeof frappe !== "undefined" && frappe.user_roles) || null;
+		var bootRoles = (typeof frappe !== "undefined"
+			&& frappe.boot
+			&& frappe.boot.user
+			&& frappe.boot.user.roles) || null;
+		if (roles || bootRoles) {
+			callback();
+			return;
+		}
+		if (attempt > 100) {
+			// 100 × 100ms = 10 seconds. Give up; user is likely on a non-Desk
+			// page or Frappe failed to bootstrap.
+			return;
+		}
+		setTimeout(function () { waitForFrappeReady(callback, attempt + 1); }, 100);
+	}
+
 	if (document.readyState === "loading") {
-		document.addEventListener("DOMContentLoaded", () => {
-			frappe.after_ajax(() => init());
+		document.addEventListener("DOMContentLoaded", function () {
+			waitForFrappeReady(init);
 		});
 	} else {
-		frappe.after_ajax(() => init());
+		waitForFrappeReady(init);
 	}
 })();
