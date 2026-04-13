@@ -37,7 +37,9 @@ to be dumped to Redis before we ask the analyze pipeline to fetch it later.
 """
 
 import frappe
+import frappe.recorder  # imported at module top so function-local `import frappe.recorder` doesn't rebind `frappe` as a local variable (Python scope rule: any `import frappe.X` inside a function makes `frappe` a function-local for the entire scope, breaking earlier `frappe.local` reads — caused by Python 3.14 stricter scope detection on a pre-existing pattern)
 
+from frappe_profiler import capture as _capture
 from frappe_profiler import session
 
 
@@ -79,8 +81,7 @@ def before_request(*args, **kwargs):
 		# We pass force=True so the recorder runs regardless of the
 		# global RECORDER_INTERCEPT_FLAG, leaving the standalone
 		# Recorder UI's flag untouched.
-		import frappe.recorder
-
+		# (frappe.recorder is imported at module top — see comment there.)
 		frappe.recorder.record(force=True)
 
 		# v0.3.0: gate the new pyinstrument + sidecar capture on the
@@ -91,14 +92,12 @@ def before_request(*args, **kwargs):
 		meta = session.get_session_meta(session_uuid) or {}
 		if meta.get("capture_python_tree", True):
 			frappe.local._profiler_active_session_id = session_uuid
-			from frappe_profiler import capture as _capture
-
-			interval_ms = int(
-				frappe.conf.get("profiler_sampler_interval_ms")
-				or _capture.DEFAULT_SAMPLER_INTERVAL_MS
-			)
 			_capture._start_pyi_session(
-				local_proxy=frappe.local, interval_ms=interval_ms
+				local_proxy=frappe.local,
+				interval_ms=int(
+					frappe.conf.get("profiler_sampler_interval_ms")
+					or _capture.DEFAULT_SAMPLER_INTERVAL_MS
+				),
 			)
 	except Exception:
 		# Never let a profiler bug break a customer request. Log and move on.
@@ -233,8 +232,7 @@ def before_job(method=None, kwargs=None, **rest):
 		if getattr(frappe.local, "_recorder", None) is not None:
 			return
 
-		import frappe.recorder
-
+		# (frappe.recorder is imported at module top — see comment there.)
 		frappe.recorder.record(force=True)
 
 		# v0.3.0: gate the new pyinstrument + sidecar capture on the
@@ -242,14 +240,12 @@ def before_job(method=None, kwargs=None, **rest):
 		meta = session.get_session_meta(session_uuid) or {}
 		if meta.get("capture_python_tree", True):
 			frappe.local._profiler_active_session_id = session_uuid
-			from frappe_profiler import capture as _capture
-
-			interval_ms = int(
-				frappe.conf.get("profiler_sampler_interval_ms")
-				or _capture.DEFAULT_SAMPLER_INTERVAL_MS
-			)
 			_capture._start_pyi_session(
-				local_proxy=frappe.local, interval_ms=interval_ms
+				local_proxy=frappe.local,
+				interval_ms=int(
+					frappe.conf.get("profiler_sampler_interval_ms")
+					or _capture.DEFAULT_SAMPLER_INTERVAL_MS
+				),
 			)
 	except Exception:
 		frappe.log_error(title="frappe_profiler before_job")
