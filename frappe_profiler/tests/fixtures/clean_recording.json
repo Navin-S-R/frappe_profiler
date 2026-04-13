@@ -1,0 +1,43 @@
+{
+    "uuid": "fixture_clean_001",
+    "path": "/api/method/frappe.client.get_list",
+    "method": "GET",
+    "cmd": "frappe.client.get_list",
+    "event_type": "HTTP Request",
+    "time": "2026-04-09 10:10:00",
+    "duration": 45.0,
+    "queries": 2,
+    "time_queries": 38.0,
+    "headers": {},
+    "form_dict": {"doctype": "Customer"},
+    "calls": [
+        {
+            "query": "SELECT name, customer_name FROM `tabCustomer` WHERE disabled = 0 LIMIT 20",
+            "normalized_query": "SELECT NAME, CUSTOMER_NAME FROM `tabCustomer` WHERE DISABLED = ? LIMIT ?",
+            "duration": 18.0,
+            "index": 0,
+            "exact_copies": 1,
+            "normalized_copies": 1,
+            "explain_result": [
+                {"table": "tabCustomer", "type": "ref", "key": "disabled", "rows": 20, "Extra": ""}
+            ],
+            "stack": [
+                {"filename": "erpnext/selling/page/customer_list.py", "lineno": 45, "function": "get_customers"}
+            ]
+        },
+        {
+            "query": "SELECT COUNT(*) FROM `tabCustomer` WHERE disabled = 0",
+            "normalized_query": "SELECT COUNT(*) FROM `tabCustomer` WHERE DISABLED = ?",
+            "duration": 20.0,
+            "index": 1,
+            "exact_copies": 1,
+            "normalized_copies": 1,
+            "explain_result": [
+                {"table": "tabCustomer", "type": "ref", "key": "disabled", "rows": 150, "Extra": ""}
+            ],
+            "stack": [
+                {"filename": "erpnext/selling/page/customer_list.py", "lineno": 60, "function": "get_count"}
+            ]
+        }
+    ]
+}

@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Profiler Report — {{ session.title or session.session_uuid }}</title>
+<style>
+  /* ---------- Reset & base ---------- */
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: #1f2937;
+    background: #f9fafb;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+
+  h1 { font-size: 1.75rem; margin: 0 0 4px 0; font-weight: 700; color: #111827; }
+  h2 { font-size: 1.25rem; margin: 32px 0 12px 0; font-weight: 700; color: #111827; padding-bottom: 6px; border-bottom: 1px solid #e5e7eb; }
+  h3 { font-size: 1rem; margin: 16px 0 8px 0; font-weight: 600; color: #374151; }
+  p { margin: 8px 0; }
+  code, pre {
+    font-family: "SF Mono", "Monaco", "Cascadia Code", Menlo, Consolas, monospace;
+    font-size: 0.85em;
+  }
+  pre {
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    padding: 12px 14px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 6px 0;
+  }
+  /* Multi-line SQL inside a table cell needs to stay bounded */
+  .sql-inline {
+    max-height: 140px;
+    overflow: auto;
+    margin: 0;
+    padding: 6px 8px;
+    font-size: 0.78rem;
+  }
+  .muted { color: #6b7280; }
+  .small { font-size: 0.85rem; }
+
+  /* ---------- Header card ---------- */
+  .report-header {
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    padding: 24px 28px;
+    margin-bottom: 24px;
+  }
+  .report-header .meta {
+    margin-top: 6px;
+    color: #6b7280;
+    font-size: 0.9rem;
+  }
+  .mode-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+  .mode-badge.safe { background: #d1fae5; color: #065f46; }
+  .mode-badge.raw  { background: #fee2e2; color: #991b1b; }
+
+  /* ---------- Stat cards ---------- */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .stat {
+    background: white;
+    border-radius: 8px;
+    padding: 16px 18px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  }
+  .stat .label { font-size: 0.75rem; text-transform: uppercase; color: #6b7280; letter-spacing: 0.5px; font-weight: 600; }
+  .stat .value { font-size: 1.5rem; font-weight: 700; color: #111827; margin-top: 4px; }
+  .stat .sub   { font-size: 0.8rem; color: #6b7280; margin-top: 2px; }
+
+  /* ---------- Section card ---------- */
+  .section {
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    padding: 20px 24px;
+    margin-bottom: 20px;
+  }
+  .section > h2:first-child { margin-top: 0; }
+
+  /* ---------- Tables ---------- */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+  }
+  th, td {
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 1px solid #e5e7eb;
+    vertical-align: top;
+  }
+  th {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    color: #6b7280;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+    background: #f9fafb;
+  }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  th.num { text-align: right; }
+  tr:hover td { background: #f9fafb; }
+
+  /* ---------- Findings ---------- */
+  .finding {
+    border-left: 4px solid #d1d5db;
+    padding: 14px 18px;
+    margin: 12px 0;
+    background: #f9fafb;
+    border-radius: 0 6px 6px 0;
+  }
+  .finding.severity-high   { border-left-color: #dc2626; background: #fef2f2; }
+  .finding.severity-medium { border-left-color: #d97706; background: #fffbeb; }
+  .finding.severity-low    { border-left-color: #2563eb; background: #eff6ff; }
+
+  .finding-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+  .severity-badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .severity-badge.high   { background: #dc2626; color: white; }
+  .severity-badge.medium { background: #d97706; color: white; }
+  .severity-badge.low    { background: #2563eb; color: white; }
+  .finding-title { font-weight: 600; font-size: 1rem; color: #111827; flex: 1; }
+  .finding-impact { font-size: 0.85rem; color: #6b7280; font-variant-numeric: tabular-nums; }
+  .finding-description { color: #374151; margin: 6px 0 10px 0; }
+  .finding-detail {
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    padding: 10px 12px;
+    margin-top: 10px;
+    font-size: 0.85rem;
+  }
+  .finding-detail .label {
+    text-transform: uppercase;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #6b7280;
+    letter-spacing: 0.5px;
+    display: block;
+    margin-top: 8px;
+    margin-bottom: 2px;
+  }
+  .finding-detail .label:first-child { margin-top: 0; }
+
+  /* ---------- Footer ---------- */
+  .footer {
+    text-align: center;
+    color: #6b7280;
+    font-size: 0.85rem;
+    margin: 32px 0 16px 0;
+    padding-top: 16px;
+    border-top: 1px solid #e5e7eb;
+  }
+
+  .empty {
+    color: #6b7280;
+    font-style: italic;
+    padding: 12px 0;
+  }
+
+  /* Print-friendly */
+  @media print {
+    body { background: white; }
+    .section, .stat, .report-header { box-shadow: none; border: 1px solid #e5e7eb; }
+    .finding { page-break-inside: avoid; }
+  }
+
+  @media (max-width: 700px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .container { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+  {# --------------- HEADER --------------- #}
+  <div class="report-header">
+    <h1>
+      {{ session.title or "Profiler Session" }}
+      <span class="mode-badge {{ mode }}">{{ mode }}</span>
+    </h1>
+    <div class="meta">
+      Recorded by <strong>{{ session.user }}</strong>
+      &middot; Started <time datetime="{{ session.started_at }}">{{ session.started_at }}</time>
+      {% if session.stopped_at %}&middot; Stopped <time datetime="{{ session.stopped_at }}">{{ session.stopped_at }}</time>{% endif %}
+      &middot; Report generated {{ generated_at }}
+      <br><span class="small muted">All times in server timezone ({{ server_tz or "UTC" }})</span>
+    </div>
+    {% if session.notes %}
+      <p style="margin-top: 10px; padding: 8px 12px; background: #eff6ff; border-left: 3px solid #2563eb; border-radius: 4px;">
+        <strong>Notes:</strong> {{ session.notes }}
+      </p>
+    {% endif %}
+    {% if session.analyzer_warnings %}
+      <p class="small muted"><strong>Warnings:</strong> {{ session.analyzer_warnings }}</p>
+    {% endif %}
+  </div>
+
+  {# --------------- STAT CARDS --------------- #}
+  <div class="stats">
+    <div class="stat">
+      <div class="label">Total time</div>
+      <div class="value">{{ "%.0f" | format(session.total_duration_ms or 0) }}<span class="sub" style="font-size:1rem">ms</span></div>
+      <div class="sub">{{ "%.1f" | format((session.total_query_time_ms or 0) / 1000) }}s in DB queries</div>
+    </div>
+    <div class="stat">
+      <div class="label">Queries</div>
+      <div class="value">{{ session.total_queries or 0 }}</div>
+      <div class="sub">across {{ session.total_requests or 0 }} actions</div>
+    </div>
+    <div class="stat">
+      <div class="label">Actions</div>
+      <div class="value">{{ session.total_requests or 0 }}</div>
+      <div class="sub">HTTP requests + jobs</div>
+    </div>
+    <div class="stat">
+      <div class="label">Findings</div>
+      <div class="value">
+        {% if severity_counts.High %}<span style="color:#dc2626">{{ severity_counts.High }}</span>{% else %}{{ findings|length }}{% endif %}
+      </div>
+      <div class="sub">
+        {% if severity_counts.High %}{{ severity_counts.High }} high{% if severity_counts.Medium or severity_counts.Low %},{% endif %}{% endif %}
+        {% if severity_counts.Medium %} {{ severity_counts.Medium }} med{% if severity_counts.Low %},{% endif %}{% endif %}
+        {% if severity_counts.Low %} {{ severity_counts.Low }} low{% endif %}
+        {% if not findings %}none detected{% endif %}
+      </div>
+    </div>
+  </div>
+
+  {# --------------- SUMMARY --------------- #}
+  <div class="section">
+    <h2>Summary</h2>
+    {% if session.summary_html %}
+      {{ session.summary_html | safe }}
+    {% else %}
+      <p class="empty">No summary available.</p>
+    {% endif %}
+  </div>
+
+  {# --------------- PER-ACTION BREAKDOWN --------------- #}
+  <div class="section">
+    <h2>Per-action breakdown</h2>
+    {% if actions %}
+      <p class="small muted">Sorted by duration. Click on the action to drill into its queries.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Action</th>
+            <th>Type</th>
+            <th class="num">Duration</th>
+            <th class="num">Queries</th>
+            <th class="num">DB time</th>
+            <th class="num">Slowest query</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for action in actions | sort(attribute='duration_ms', reverse=True) %}
+          <tr>
+            <td>{{ loop.index }}</td>
+            <td>
+              <strong>{{ action.action_label }}</strong>
+              {% if mode == "raw" and action.path %}
+                <br><span class="small muted">{{ action.http_method }} {{ action.path }}</span>
+              {% endif %}
+            </td>
+            <td><span class="small">{{ action.event_type }}</span></td>
+            <td class="num">{{ "%.0f" | format(action.duration_ms) }}ms</td>
+            <td class="num">{{ action.queries_count }}</td>
+            <td class="num">{{ "%.0f" | format(action.query_time_ms) }}ms</td>
+            <td class="num">{{ "%.0f" | format(action.slowest_query_ms) }}ms</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No actions were recorded in this session.</p>
+    {% endif %}
+  </div>
+
+  {# --------------- FINDINGS --------------- #}
+  <div class="section">
+    <h2>Findings &mdash; what to fix</h2>
+    {% if findings %}
+      <p class="small muted">Sorted by severity, then by impact. Each finding includes a plain-language description for you and a technical detail block for your developer.</p>
+      {% for f in findings %}
+      <div class="finding severity-{{ f.severity | lower }}">
+        <div class="finding-header">
+          <span class="severity-badge {{ f.severity | lower }}">{{ f.severity }}</span>
+          <span class="finding-title">{{ f.title }}</span>
+          <span class="finding-impact">~{{ "%.0f" | format(f.estimated_impact_ms) }}ms{% if f.affected_count > 1 %} &middot; {{ f.affected_count }}×{% endif %}</span>
+        </div>
+        <div class="finding-description">{{ f.customer_description }}</div>
+
+        {% if f.technical_detail %}
+        <div class="finding-detail">
+          {% set detail = f.technical_detail %}
+
+          {% if detail.callsite %}
+            <span class="label">Callsite</span>
+            <code>{{ detail.callsite.filename }}:{{ detail.callsite.lineno }}{% if detail.callsite.function %} <span class="muted">({{ detail.callsite.function }})</span>{% endif %}</code>
+          {% endif %}
+
+          {% if detail.normalized_query %}
+            <span class="label">Query (normalized)</span>
+            <pre>{{ detail.normalized_query }}</pre>
+          {% endif %}
+
+          {% if detail.suggested_ddl %}
+            <span class="label">Suggested DDL</span>
+            <pre>{{ detail.suggested_ddl }}</pre>
+          {% endif %}
+
+          {% if detail.example_queries %}
+            <span class="label">Affected queries (first {{ detail.example_queries|length }})</span>
+            {% for q in detail.example_queries %}
+              <pre>{{ q }}</pre>
+            {% endfor %}
+          {% endif %}
+
+          {% if detail.explain_row %}
+            <span class="label">EXPLAIN row</span>
+            <pre>{{ detail.explain_row }}</pre>
+          {% endif %}
+
+          {% if detail.fix_hint %}
+            <span class="label">How to fix</span>
+            <p>{{ detail.fix_hint }}</p>
+          {% endif %}
+
+          {% if detail.validation_note %}
+            <p class="small muted"><em>{{ detail.validation_note }}</em></p>
+          {% endif %}
+
+          {% if detail.occurrences %}
+            <p class="small muted">
+              {{ detail.occurrences }} occurrences
+              {% if detail.average_time_ms %} &middot; ~{{ "%.1f" | format(detail.average_time_ms) }}ms each{% endif %}
+              {% if detail.total_time_ms %} &middot; {{ "%.0f" | format(detail.total_time_ms) }}ms total{% endif %}
+            </p>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    {% else %}
+      <p class="empty">No significant performance issues detected.</p>
+    {% endif %}
+  </div>
+
+  {# --------------- TOP-N SLOW QUERIES --------------- #}
+  <div class="section">
+    <h2>Top {{ top_queries|length }} slowest queries</h2>
+    {% if top_queries %}
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th class="num">Duration</th>
+            <th>Callsite</th>
+            <th>Query (normalized)</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for q in top_queries %}
+          <tr>
+            <td>{{ loop.index }}</td>
+            <td class="num">{{ "%.0f" | format(q.duration_ms or 0) }}ms</td>
+            <td><code class="small">{{ q.callsite or "" }}</code></td>
+            <td><pre class="sql-inline">{{ (q.normalized_query or "") }}</pre></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No queries were recorded.</p>
+    {% endif %}
+  </div>
+
+  {# --------------- QUERY BREAKDOWN PER ACTION --------------- #}
+  {% if recordings_by_uuid %}
+  <div class="section">
+    <h2>Queries per action</h2>
+    <p class="small muted">
+      The top queries for each action in this session, with callsites so your
+      developer knows where to look. Actions are ordered by total duration.
+    </p>
+
+    {% for action in actions | sort(attribute='duration_ms', reverse=True) %}
+      {% set recording = recordings_by_uuid.get(action.recording_uuid) %}
+      {% if recording and recording.calls %}
+      <details{% if loop.index <= 3 %} open{% endif %} style="margin: 12px 0;">
+        <summary style="cursor: pointer; padding: 8px 12px; background: #f3f4f6; border-radius: 4px; user-select: none;">
+          <strong>{{ loop.index }}. {{ action.action_label }}</strong>
+          <span class="small muted">
+            &middot; {{ "%.0f" | format(action.duration_ms) }}ms
+            &middot; {{ action.queries_count }} queries
+            &middot; {{ "%.0f" | format(action.query_time_ms) }}ms in DB
+          </span>
+        </summary>
+        <div style="padding: 10px 4px;">
+          {# Sort this action's queries by duration desc, take top 10 #}
+          {% set top_in_action = recording.calls | sort(attribute='duration', reverse=True) %}
+          <table>
+            <thead>
+              <tr>
+                <th class="num">Duration</th>
+                <th class="num">Copies</th>
+                <th>Callsite</th>
+                <th>Query (normalized)</th>
+              </tr>
+            </thead>
+            <tbody>
+            {% for call in top_in_action[:10] %}
+              <tr>
+                <td class="num">{{ "%.1f" | format(call.duration or 0) }}ms</td>
+                <td class="num">
+                  {% if call.normalized_copies and call.normalized_copies > 1 %}{{ call.normalized_copies }}×{% endif %}
+                </td>
+                <td>
+                  {% if call.stack %}
+                    {# Use the last frame's filename:lineno as a short callsite hint #}
+                    {% set last_frame = call.stack[-1] if call.stack[-1] is mapping else none %}
+                    {% if last_frame %}
+                      <code class="small">{{ last_frame.filename }}:{{ last_frame.lineno }}</code>
+                    {% endif %}
+                  {% endif %}
+                </td>
+                <td>
+                  <pre class="sql-inline">{{ call.normalized_query or call.query or "" }}</pre>
+                </td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          {% if recording.calls | length > 10 %}
+            <p class="small muted"><em>Showing top 10 of {{ recording.calls | length }} queries for this action.</em></p>
+          {% endif %}
+        </div>
+      </details>
+      {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {# --------------- PER-TABLE BREAKDOWN --------------- #}
+  <div class="section">
+    <h2>Time spent per database table</h2>
+    {% if table_breakdown %}
+      <p class="small muted">Where the time goes. Queries that touch multiple tables are counted against each. Sorted by time desc.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Table</th>
+            <th class="num">Total time</th>
+            <th class="num">Queries</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for t in table_breakdown %}
+          <tr>
+            <td><code>{{ t.table }}</code></td>
+            <td class="num">{{ "%.0f" | format(t.duration_ms) }}ms</td>
+            <td class="num">{{ t.queries }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No table breakdown available.</p>
+    {% endif %}
+  </div>
+
+  {# --------------- RAW MODE: full recordings drill-down --------------- #}
+  {% if mode == "raw" and recordings_by_uuid %}
+  <div class="section">
+    <h2>Full recordings (raw mode)</h2>
+    <p class="small muted">Every action's complete data &mdash; raw SQL with literal values, request headers (sensitive fields redacted), form data (sensitive fields redacted), and full Python stack traces. <strong>This contains potentially sensitive customer data &mdash; do not share externally.</strong></p>
+    <p class="small muted">Each action is collapsed by default. Click to expand.</p>
+
+    {% for action in actions | sort(attribute='duration_ms', reverse=True) %}
+      {% set recording = recordings_by_uuid.get(action.recording_uuid) %}
+      {% if recording %}
+      <details style="margin: 12px 0; padding: 12px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px;">
+        <summary style="cursor: pointer; font-weight: 600; color: #111827;">
+          {{ loop.index }}. {{ action.action_label }}
+          <span class="small muted" style="font-weight: 400;">({{ "%.0f" | format(action.duration_ms) }}ms, {{ action.queries_count }} queries)</span>
+        </summary>
+        <div style="padding-top: 12px;">
+
+          {% if recording.headers %}
+            <p class="small"><strong>Request headers:</strong></p>
+            <pre>{{ recording.headers }}</pre>
+          {% endif %}
+
+          {% if recording.form_dict %}
+            <p class="small"><strong>Form data:</strong></p>
+            <pre>{{ recording.form_dict }}</pre>
+          {% endif %}
+
+          {% if recording.calls %}
+            <p class="small"><strong>SQL queries (in execution order):</strong></p>
+            {% for call in recording.calls[:200] %}
+              <div style="margin: 8px 0; padding: 8px; background: white; border: 1px solid #e5e7eb; border-radius: 4px;">
+                <div class="small muted">
+                  #{{ call.index if call.index is defined else loop.index0 }}
+                  &middot; {{ "%.2f" | format(call.duration or 0) }}ms
+                  {% if call.exact_copies and call.exact_copies > 1 %}&middot; {{ call.exact_copies }} exact copies{% endif %}
+                  {% if call.normalized_copies and call.normalized_copies > call.exact_copies %}&middot; {{ call.normalized_copies }} normalized copies{% endif %}
+                </div>
+                <pre style="margin: 4px 0;">{{ call.query }}</pre>
+                {% if call.stack %}
+                  <details>
+                    <summary class="small muted">Stack ({{ call.stack | length }} frames) &mdash; click to expand</summary>
+                    <pre class="small">{% for frame in call.stack %}{{ frame.filename }}:{{ frame.lineno }} ({{ frame.function }})
+{% endfor %}</pre>
+                  </details>
+                {% endif %}
+              </div>
+            {% endfor %}
+            {% if recording.calls | length > 200 %}
+              <p class="small muted"><em>(+ {{ recording.calls|length - 200 }} more queries truncated for readability)</em></p>
+            {% endif %}
+          {% endif %}
+        </div>
+      </details>
+      {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {# --------------- FOOTER --------------- #}
+  <div class="footer">
+    {% if mode == "safe" %}
+      <p>
+        Generated by <strong>Frappe Profiler</strong> &middot; Safe report (sensitive data redacted)
+      </p>
+      <p style="margin-top: 8px;">
+        Hand this to your Frappe / ERPNext development partner. They have
+        everything they need to start work.
+      </p>
+      <p class="small" style="margin-top: 8px; color: #9ca3af;">
+        This is the safe version of the report. Query literals, request
+        headers, form data, and full stack traces have been stripped.
+        Your internal team has access to a raw version of this report
+        with full details &mdash; ask them if you need more context than
+        this document provides.
+      </p>
+    {% else %}
+      <p>
+        Generated by <strong>Frappe Profiler</strong> &middot;
+        <span style="color:#dc2626">Raw report &mdash; contains sensitive data, internal use only</span>
+      </p>
+      <p class="small" style="margin-top: 8px; color: #9ca3af;">
+        Do NOT email, upload, or share this file externally. The
+        sensitive-field redactor has stripped common credential fields
+        (passwords, tokens, auth headers) but cannot catch everything.
+        If you need to share, use the Safe report instead.
+      </p>
+    {% endif %}
+  </div>
+
+</div>
+
+</body>
+</html>

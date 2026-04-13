@@ -1,0 +1,69 @@
+{
+    "uuid": "fixture_scan_001",
+    "path": "/api/method/erpnext.accounts.reports.gl_report",
+    "method": "GET",
+    "cmd": "erpnext.accounts.reports.gl_report",
+    "event_type": "HTTP Request",
+    "time": "2026-04-09 10:05:00",
+    "duration": 1850.0,
+    "queries": 3,
+    "time_queries": 1820.0,
+    "headers": {},
+    "form_dict": {},
+    "calls": [
+        {
+            "query": "SELECT * FROM `tabGL Entry` WHERE party = 'CUSTOMER-001' ORDER BY posting_date DESC",
+            "normalized_query": "SELECT * FROM `tabGL Entry` WHERE PARTY = ? ORDER BY POSTING_DATE DESC",
+            "duration": 850.0,
+            "index": 0,
+            "exact_copies": 1,
+            "normalized_copies": 1,
+            "explain_result": [
+                {
+                    "table": "tabGL Entry",
+                    "type": "ALL",
+                    "rows": 50000,
+                    "filtered": 5.0,
+                    "Extra": "Using where; Using filesort"
+                }
+            ],
+            "stack": [
+                {"filename": "erpnext/accounts/report/general_ledger/general_ledger.py", "lineno": 120, "function": "execute"}
+            ]
+        },
+        {
+            "query": "SELECT account, SUM(debit) FROM `tabGL Entry` GROUP BY account",
+            "normalized_query": "SELECT ACCOUNT, SUM(DEBIT) FROM `tabGL Entry` GROUP BY ACCOUNT",
+            "duration": 920.0,
+            "index": 1,
+            "exact_copies": 1,
+            "normalized_copies": 1,
+            "explain_result": [
+                {
+                    "table": "tabGL Entry",
+                    "type": "ALL",
+                    "rows": 50000,
+                    "filtered": 100.0,
+                    "Extra": "Using temporary; Using filesort"
+                }
+            ],
+            "stack": [
+                {"filename": "erpnext/accounts/report/general_ledger/general_ledger.py", "lineno": 180, "function": "aggregate"}
+            ]
+        },
+        {
+            "query": "SELECT name FROM `tabAccount` WHERE account_type = 'Asset'",
+            "normalized_query": "SELECT NAME FROM `tabAccount` WHERE ACCOUNT_TYPE = ?",
+            "duration": 50.0,
+            "index": 2,
+            "exact_copies": 1,
+            "normalized_copies": 1,
+            "explain_result": [
+                {"table": "tabAccount", "type": "ref", "key": "account_type", "rows": 25, "Extra": ""}
+            ],
+            "stack": [
+                {"filename": "erpnext/accounts/report/general_ledger/general_ledger.py", "lineno": 90, "function": "get_accounts"}
+            ]
+        }
+    ]
+}

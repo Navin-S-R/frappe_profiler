@@ -1,0 +1,325 @@
+# Copyright (c) 2026, Frappe Profiler contributors
+# For license information, please see license.txt
+
+"""HTML report renderer for a Profiler Session.
+
+Two modes from a single Jinja template:
+
+    safe — Normalized SQL only (literals replaced with `?`), no headers,
+           no form data, no full stack traces. The customer can hand this
+           to a third-party dev shop without leaking PII.
+
+    raw  — Full data: raw SQL with literal values, request headers, form
+           data, and the complete stack trace for every query. Stays on
+           the customer's site only — gated to System Manager + the
+           recording user via Frappe's file permission system.
+
+The template is loaded directly from the file system (not via Frappe's
+Jinja environment) so the renderer is unit-testable in isolation and
+doesn't depend on a running site.
+
+Both modes render from the same template; the `mode` context variable
+toggles redaction-sensitive sections.
+"""
+
+import functools
+import json
+import os
+import re
+from typing import Any
+
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from frappe_profiler.analyzers.base import SEVERITY_ORDER
+
+_TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+
+# ---------------------------------------------------------------------------
+# Sensitive field redaction (Round 2, fix #1)
+# ---------------------------------------------------------------------------
+# Even though the raw report is permission-gated to System Manager + the
+# recording user, once downloaded to local disk it can leak to backup
+# systems, screen shares, email, etc. We redact known-sensitive field
+# names from headers and form_dict BEFORE they hit the template, keeping
+# the field NAME (useful signal for the developer) but replacing the
+# VALUE with "[REDACTED]".
+#
+# Patterns are case-insensitive, matched against the full field name.
+# Add new patterns here when you see leaks in real reports.
+
+_SENSITIVE_FIELD_PATTERNS = [
+	re.compile(p, re.IGNORECASE)
+	for p in (
+		# Auth
+		r"password",
+		r"passwd",
+		r"^pwd$",
+		r"secret",
+		r"token",
+		r"api[-_]?key",
+		r"^authorization$",
+		r"^auth$",
+		r"bearer",
+		# Session / cookies
+		r"^cookie$",
+		r"^set[-_]cookie$",
+		r"^sid$",
+		r"session[-_]?id",
+		r"csrf",
+		r"x[-_]frappe[-_]csrf",
+		# Two-factor / OTP
+		r"otp",
+		r"verification[-_]?code",
+		# Cards / payment
+		r"card[-_]?number",
+		r"cvv",
+		r"ccv",
+		# Personal identifiers (conservative — false positives are fine)
+		r"ssn",
+		r"aadhar",
+		r"aadhaar",
+		r"pan[-_]?number",
+	)
+]
+
+_REDACTED = "[REDACTED]"
+
+
+def _redact_value(key: Any, value: Any, depth: int = 0) -> Any:
+	"""Recursively redact sensitive values in a dict or list.
+
+	Rule: scalar values at sensitive keys are replaced with [REDACTED],
+	but containers (dicts and lists) are always recursed into so nested
+	non-sensitive fields are preserved. This gives the dev shop maximum
+	useful context (e.g. `auth: {username: "alice"}` stays visible even
+	though the parent key is "auth") while still scrubbing credentials.
+
+	Max depth 4 prevents runaway recursion on circular structures (Frappe
+	form_dicts are usually flat or one level deep, so 4 is plenty).
+	"""
+	if depth > 4:
+		return value
+
+	# Recurse into containers regardless of the parent key. Nested
+	# sensitive children will still be caught at their own level.
+	if isinstance(value, dict):
+		return {k: _redact_value(k, v, depth + 1) for k, v in value.items()}
+	if isinstance(value, (list, tuple)):
+		return [_redact_value(key, v, depth + 1) for v in value]
+
+	# For scalar values only: check if the key is sensitive.
+	key_str = str(key).lower()
+	for pattern in _SENSITIVE_FIELD_PATTERNS:
+		if pattern.search(key_str):
+			return _REDACTED
+	return value
+
+
+def redact_sensitive(obj: Any) -> Any:
+	"""Top-level redaction entry point — returns a copy of obj with all
+	sensitive fields blanked out. Used by the renderer to sanitize
+	recording.headers and recording.form_dict before they hit the raw
+	report template.
+	"""
+	if obj is None:
+		return None
+	if isinstance(obj, dict):
+		return {k: _redact_value(k, v) for k, v in obj.items()}
+	return obj
+
+
+@functools.lru_cache(maxsize=1)
+def _get_jinja_env() -> Environment:
+	"""Build and cache the Jinja environment.
+
+	Autoescape is on for HTML so user-provided strings (action labels,
+	finding titles, etc.) can never inject markup into the report.
+	"""
+	return Environment(
+		loader=FileSystemLoader(_TEMPLATES_DIR),
+		autoescape=select_autoescape(["html"]),
+		trim_blocks=True,
+		lstrip_blocks=True,
+	)
+
+
+def render(
+	session_doc: Any,
+	recordings: list[dict] | None = None,
+	*,
+	mode: str = "safe",
+	generated_at: str | None = None,
+) -> str:
+	"""Render a Profiler Session to standalone HTML.
+
+	Args:
+	    session_doc: The Profiler Session DocType row (loaded via
+	        frappe.get_doc). Provides totals, summary_html, and the
+	        actions/findings child rows.
+	    recordings: The in-memory recordings list. Used by BOTH modes for
+	        the per-action query drill-down (safe mode shows normalized
+	        queries; raw mode shows raw SQL + headers + form_dict +
+	        stacks). Can be None in safe mode if you only want the summary
+	        view, but the per-action breakdown will be omitted.
+	    mode: "safe" or "raw". Raw mode requires recordings.
+	    generated_at: ISO timestamp of when this report was generated;
+	        defaults to now() if not provided.
+
+	Returns:
+	    Standalone HTML as a string. Inline CSS, no external assets, no
+	    JavaScript. Self-contained for emailing or attaching to a ticket.
+	"""
+	if mode not in ("safe", "raw"):
+		raise ValueError(f"Invalid renderer mode: {mode!r} (expected 'safe' or 'raw')")
+
+	if mode == "raw" and recordings is None:
+		raise ValueError("raw mode requires the recordings list")
+
+	template = _get_jinja_env().get_template("report.html")
+
+	# Build the per-action drill-down structure. We pair each Profiler
+	# Action child row with its source recording so the template can show
+	# full SQL / headers / form_dict for that action.
+	#
+	# CRITICAL: Even though the raw report is permission-gated, we still
+	# run the sensitive-field redactor on headers and form_dict before
+	# they hit the template. This is defense-in-depth — once the HTML is
+	# downloaded, Frappe's permission system no longer protects it.
+	# See _SENSITIVE_FIELD_PATTERNS at the top of this file for what's
+	# redacted.
+	recordings_by_uuid: dict[str, dict] = {}
+	if recordings:
+		for r in recordings:
+			uid = r.get("uuid")
+			if not uid:
+				continue
+			# Shallow copy so we don't mutate the caller's recording dict.
+			# (The analyze pipeline may still use the un-redacted data
+			# after rendering completes.)
+			redacted = dict(r)
+			redacted["headers"] = redact_sensitive(r.get("headers"))
+			redacted["form_dict"] = redact_sensitive(r.get("form_dict"))
+			recordings_by_uuid[uid] = redacted
+
+	actions = [_action_to_dict(a) for a in (session_doc.actions or [])]
+	findings = [_finding_to_dict(f) for f in (session_doc.findings or [])]
+
+	try:
+		top_queries = json.loads(session_doc.top_queries_json or "[]")
+	except Exception:
+		top_queries = []
+	try:
+		table_breakdown = json.loads(session_doc.table_breakdown_json or "[]")
+	except Exception:
+		table_breakdown = []
+
+	# Sort findings: highest severity first, then highest impact
+	findings.sort(
+		key=lambda f: (
+			SEVERITY_ORDER.get(f["severity"], 3),
+			-(f["estimated_impact_ms"] or 0),
+		)
+	)
+
+	context = {
+		"session": session_doc,
+		"actions": actions,
+		"findings": findings,
+		"top_queries": top_queries,
+		"table_breakdown": table_breakdown,
+		"recordings_by_uuid": recordings_by_uuid,
+		"mode": mode,
+		"generated_at": generated_at or _now_iso(),
+		"server_tz": _get_server_timezone(),
+		# Severity counts for the summary
+		"severity_counts": {
+			"High": sum(1 for f in findings if f["severity"] == "High"),
+			"Medium": sum(1 for f in findings if f["severity"] == "Medium"),
+			"Low": sum(1 for f in findings if f["severity"] == "Low"),
+		},
+	}
+
+	return template.render(**context)
+
+
+def render_safe(session_doc: Any, recordings: list[dict] | None = None) -> str:
+	"""Render the safe (shareable) version of the report."""
+	return render(session_doc, recordings, mode="safe")
+
+
+def render_raw(session_doc: Any, recordings: list[dict]) -> str:
+	"""Render the raw (internal) version of the report.
+
+	Requires the in-memory recordings list — raw SQL, headers, form_dict,
+	and full stack traces are NOT stored on the DocType.
+	"""
+	return render(session_doc, recordings, mode="raw")
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _action_to_dict(child: Any) -> dict:
+	"""Flatten a Profiler Action child row to a plain dict."""
+	return {
+		"action_label": child.action_label or "",
+		"event_type": child.event_type or "",
+		"http_method": child.http_method or "",
+		"path": child.path or "",
+		"recording_uuid": child.recording_uuid or "",
+		"duration_ms": child.duration_ms or 0,
+		"queries_count": child.queries_count or 0,
+		"query_time_ms": child.query_time_ms or 0,
+		"slowest_query_ms": child.slowest_query_ms or 0,
+	}
+
+
+def _finding_to_dict(child: Any) -> dict:
+	"""Flatten a Profiler Finding child row, parsing the JSON detail blob."""
+	try:
+		detail = json.loads(child.technical_detail_json or "{}")
+	except Exception:
+		detail = {}
+	return {
+		"finding_type": child.finding_type or "",
+		"severity": child.severity or "Low",
+		"title": child.title or "",
+		"customer_description": child.customer_description or "",
+		"estimated_impact_ms": child.estimated_impact_ms or 0,
+		"affected_count": child.affected_count or 0,
+		"action_ref": child.action_ref or "",
+		"technical_detail": detail,
+	}
+
+
+def _now_iso() -> str:
+	from datetime import datetime
+
+	return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _get_server_timezone() -> str:
+	"""Return a human-readable server timezone label.
+
+	Tries frappe's system settings first (more accurate than Python's
+	local tz guess). Falls back to the Python datetime tzname.
+	"""
+	try:
+		import frappe
+
+		tz = frappe.db.get_single_value("System Settings", "time_zone")
+		if tz:
+			return str(tz)
+	except Exception:
+		pass
+	try:
+		from datetime import datetime
+
+		name = datetime.now().astimezone().tzname()
+		if name:
+			return name
+	except Exception:
+		pass
+	return "UTC"

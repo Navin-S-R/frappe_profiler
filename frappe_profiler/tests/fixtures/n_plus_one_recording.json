@@ -1,0 +1,192 @@
+{
+    "uuid": "fixture_n1_001",
+    "path": "/api/method/frappe.client.save",
+    "method": "POST",
+    "cmd": "frappe.client.save",
+    "event_type": "HTTP Request",
+    "time": "2026-04-09 10:00:00",
+    "duration": 420.5,
+    "queries": 31,
+    "time_queries": 285.0,
+    "headers": {"User-Agent": "test"},
+    "form_dict": {"doctype": "Sales Invoice"},
+    "calls": [
+        {
+            "query": "SELECT name FROM `tabSales Invoice` WHERE name = 'SINV-001'",
+            "normalized_query": "SELECT NAME FROM `tabSales Invoice` WHERE NAME = ?",
+            "duration": 1.5,
+            "index": 0,
+            "exact_copies": 1,
+            "normalized_copies": 1,
+            "explain_result": [{"table": "tabSales Invoice", "type": "const", "rows": 1}],
+            "stack": [
+                {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
+                {"filename": "frappe/client.py", "lineno": 200, "function": "save"},
+                {"filename": "frappe/model/document.py", "lineno": 400, "function": "save"},
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 120, "function": "validate"}
+            ]
+        },
+        {
+            "query": "SELECT tax_rate FROM `tabItem Tax` WHERE item_code = 'ITEM-A'",
+            "normalized_query": "SELECT TAX_RATE FROM `tabItem Tax` WHERE ITEM_CODE = ?",
+            "duration": 8.2,
+            "index": 1,
+            "exact_copies": 1,
+            "normalized_copies": 25,
+            "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
+            "stack": [
+                {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
+                {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
+            ]
+        },
+        {
+            "query": "SELECT tax_rate FROM `tabItem Tax` WHERE item_code = 'ITEM-B'",
+            "normalized_query": "SELECT TAX_RATE FROM `tabItem Tax` WHERE ITEM_CODE = ?",
+            "duration": 9.1,
+            "index": 2,
+            "exact_copies": 1,
+            "normalized_copies": 25,
+            "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
+            "stack": [
+                {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
+                {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
+            ]
+        },
+        {
+            "query": "SELECT tax_rate FROM `tabItem Tax` WHERE item_code = 'ITEM-C'",
+            "normalized_query": "SELECT TAX_RATE FROM `tabItem Tax` WHERE ITEM_CODE = ?",
+            "duration": 11.4,
+            "index": 3,
+            "exact_copies": 1,
+            "normalized_copies": 25,
+            "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
+            "stack": [
+                {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
+                {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
+            ]
+        },
+        {
+            "query": "SELECT tax_rate FROM `tabItem Tax` WHERE item_code = 'ITEM-D'",
+            "normalized_query": "SELECT TAX_RATE FROM `tabItem Tax` WHERE ITEM_CODE = ?",
+            "duration": 7.8,
+            "index": 4,
+            "exact_copies": 1,
+            "normalized_copies": 25,
+            "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
+            "stack": [
+                {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
+                {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
+            ]
+        },
+        {
+            "query": "SELECT tax_rate FROM `tabItem Tax` WHERE item_code = 'ITEM-E'",
+            "normalized_query": "SELECT TAX_RATE FROM `tabItem Tax` WHERE ITEM_CODE = ?",
+            "duration": 10.3,
+            "index": 5,
+            "exact_copies": 1,
+            "normalized_copies": 25,
+            "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
+            "stack": [
+                {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
+                {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
+            ]
+        },
+        {
+            "query": "SELECT tax_rate FROM `tabItem Tax` WHERE item_code = 'ITEM-F'",
+            "normalized_query": "SELECT TAX_RATE FROM `tabItem Tax` WHERE ITEM_CODE = ?",
+            "duration": 8.9,
+            "index": 6,
+            "exact_copies": 1,
+            "normalized_copies": 25,
+            "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
+            "stack": [
+                {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
+                {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
+            ]
+        },
+        {
+            "query": "SELECT tax_rate FROM `tabItem Tax` WHERE item_code = 'ITEM-G'",
+            "normalized_query": "SELECT TAX_RATE FROM `tabItem Tax` WHERE ITEM_CODE = ?",
+            "duration": 9.0,
+            "index": 7,
+            "exact_copies": 1,
+            "normalized_copies": 25,
+            "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
+            "stack": [
+                {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
+                {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
+            ]
+        },
+        {
+            "query": "SELECT tax_rate FROM `tabItem Tax` WHERE item_code = 'ITEM-H'",
+            "normalized_query": "SELECT TAX_RATE FROM `tabItem Tax` WHERE ITEM_CODE = ?",
+            "duration": 10.7,
+            "index": 8,
+            "exact_copies": 1,
+            "normalized_copies": 25,
+            "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
+            "stack": [
+                {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
+                {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
+            ]
+        },
+        {
+            "query": "SELECT tax_rate FROM `tabItem Tax` WHERE item_code = 'ITEM-I'",
+            "normalized_query": "SELECT TAX_RATE FROM `tabItem Tax` WHERE ITEM_CODE = ?",
+            "duration": 8.5,
+            "index": 9,
+            "exact_copies": 1,
+            "normalized_copies": 25,
+            "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
+            "stack": [
+                {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
+                {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
+            ]
+        },
+        {
+            "query": "SELECT tax_rate FROM `tabItem Tax` WHERE item_code = 'ITEM-J'",
+            "normalized_query": "SELECT TAX_RATE FROM `tabItem Tax` WHERE ITEM_CODE = ?",
+            "duration": 9.2,
+            "index": 10,
+            "exact_copies": 1,
+            "normalized_copies": 25,
+            "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
+            "stack": [
+                {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
+                {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
+            ]
+        },
+        {
+            "query": "UPDATE `tabSales Invoice` SET modified = NOW() WHERE name = 'SINV-001'",
+            "normalized_query": "UPDATE `tabSales Invoice` SET MODIFIED = NOW() WHERE NAME = ?",
+            "duration": 2.1,
+            "index": 11,
+            "exact_copies": 1,
+            "normalized_copies": 1,
+            "explain_result": [{"table": "tabSales Invoice", "type": "range", "rows": 1, "Extra": ""}],
+            "stack": [
+                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 350, "function": "on_save"}
+            ]
+        }
+    ]
+}
