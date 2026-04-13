@@ -176,11 +176,19 @@
 						"Give this session a name you'll recognize later — e.g. 'Sales Invoice flow with 50 items'.",
 				},
 				{
+					fieldname: "capture_python_tree",
+					fieldtype: "Check",
+					label: "Capture Python call tree (recommended)",
+					default: 1,
+					description:
+						"Adds ~5–15% overhead but enables hot path detection, hook bottleneck findings, and redundant call detection. Disable for SQL-only capture (v0.2.0 behavior).",
+				},
+				{
 					fieldname: "warning_html",
 					fieldtype: "HTML",
 					options: `
 						<div style="background: #fffbeb; border: 1px solid #fbbf24; border-radius: 4px; padding: 10px 12px; margin-top: 10px; font-size: 0.85rem; color: #92400e;">
-							<strong>Note:</strong> Recording adds 10–30% overhead per database query.
+							<strong>Note:</strong> Recording adds 10–30% overhead per database query (1.5–2× wall clock with Python tree capture).
 							Only your traffic will be captured — other users on this site are not affected.
 							The session auto-stops after 10 minutes.
 						</div>
@@ -192,7 +200,10 @@
 				d.hide();
 				frappe.call({
 					method: "frappe_profiler.api.start",
-					args: { label: values.label || "" },
+					args: {
+						label: values.label || "",
+						capture_python_tree: values.capture_python_tree ? 1 : 0,
+					},
 					callback: (r) => {
 						const data = r.message || {};
 						if (data.session_uuid) {

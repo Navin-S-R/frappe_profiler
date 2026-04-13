@@ -376,6 +376,9 @@ def export_session(session_uuid: str) -> dict:
 			"analyze_duration_ms": getattr(doc, "analyze_duration_ms", None),
 			"top_severity": getattr(doc, "top_severity", None),
 			"analyzer_warnings": doc.analyzer_warnings,
+			# v0.3.0 fields
+			"total_python_ms": getattr(doc, "total_python_ms", None),
+			"total_sql_ms": getattr(doc, "total_sql_ms", None),
 		},
 		"actions": [
 			{
@@ -389,6 +392,8 @@ def export_session(session_uuid: str) -> dict:
 				"queries_count": a.queries_count,
 				"query_time_ms": a.query_time_ms,
 				"slowest_query_ms": a.slowest_query_ms,
+				# v0.3.0: include the call tree (or its overflow marker)
+				"call_tree": _parse_json_field(getattr(a, "call_tree_json", None)),
 			}
 			for a in (doc.actions or [])
 		],
@@ -408,6 +413,11 @@ def export_session(session_uuid: str) -> dict:
 		],
 		"top_queries": _parse_json_field(doc.top_queries_json),
 		"table_breakdown": _parse_json_field(doc.table_breakdown_json),
+		# v0.3.0 top-level aggregates
+		"hot_frames": _parse_json_field(getattr(doc, "hot_frames_json", None)),
+		"session_time_breakdown": _parse_json_field(
+			getattr(doc, "session_time_breakdown_json", None)
+		),
 	}
 
 

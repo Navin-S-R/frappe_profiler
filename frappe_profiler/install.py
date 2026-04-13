@@ -33,18 +33,29 @@ def before_uninstall():
 	"""Best-effort cleanup on uninstall.
 
 	Clears any profiler:* keys from Redis so a reinstall starts with a
-	clean state. Does NOT delete:
+	clean state. Also restores the v0.3.0 monkey-patched wraps on
+	frappe.get_doc / RedisWrapper.get_value / frappe.permissions.has_permission
+	so subsequent code on this worker uses the originals.
+
+	Does NOT delete:
 	- The `Profiler User` role (users may still be assigned to it; a
 	  re-install would lose those assignments).
 	- The `Profiler Session` MariaDB rows (frappe's uninstall flow
 	  drops the DocType tables naturally).
 	- The attached report files (same — frappe's File doctype cleanup
 	  handles these).
-
-	Uses SCAN with a small batch size so large profiler:* keyspaces
-	don't block Redis. Safe to run on a site that never installed or
-	already uninstalled the profiler (no keys → no-op).
 	"""
+	# v0.3.0: restore the three monkey-patched functions on uninstall.
+	try:
+		from frappe_profiler import capture
+
+		capture.uninstall_wraps()
+	except Exception:
+		try:
+			frappe.log_error(title="frappe_profiler before_uninstall capture")
+		except Exception:
+			pass
+
 	try:
 		_clear_redis_state()
 	except Exception:
