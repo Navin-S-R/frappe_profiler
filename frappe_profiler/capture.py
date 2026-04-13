@@ -72,3 +72,63 @@ def _identify_args(fn_name: str, args: tuple, kwargs: dict):
 
 	# Unknown — return raw passthrough; should not happen in practice.
 	return (args, kwargs), (args, kwargs)
+
+
+# Maximum entries per recording's sidecar list. Above this, additional
+# wraps drop their entries silently and set a truncation flag on the
+# request-local context. The analyze pipeline surfaces this as a warning.
+SIDECAR_CAP_PER_RECORDING = 50_000
+
+
+def _make_wrap(orig, fn_name: str, local_proxy=None):
+	"""Build a sidecar-recording wrapper around `orig`.
+
+	`local_proxy` is the request-local namespace where we read the
+	activation flag and append entries. In production this is `frappe.local`;
+	tests pass a stand-in object so the wrap can be exercised without a
+	Frappe runtime.
+
+	Properties:
+	  - Passthrough when no active session (single attribute lookup).
+	  - Records entries on success AND on exception (try/finally).
+	  - Re-entrant call into another wrap from inside one wrap is a
+	    passthrough (prevents double-counting `has_permission` → `get_doc`).
+	  - Drops entries past SIDECAR_CAP_PER_RECORDING and flags truncation.
+	  - Stores the original on `wrapped._profiler_original` so uninstall
+	    can restore it. If `orig` is itself an already-wrapped function
+	    (has `_profiler_original`), our wrap chains through `orig` —
+	    we never double-wrap.
+	"""
+	def wrapped(*args, **kwargs):
+		active = getattr(local_proxy, "_profiler_active_session_id", None)
+		if not active:
+			return orig(*args, **kwargs)
+
+		in_wrap = getattr(local_proxy, "_profiler_in_wrap", False)
+		if in_wrap:
+			return orig(*args, **kwargs)
+
+		identifier_raw, identifier_safe = _identify_args(fn_name, args, kwargs)
+		entry = {
+			"fn_name": fn_name,
+			"identifier_raw": identifier_raw,
+			"identifier_safe": identifier_safe,
+		}
+
+		# Set re-entrancy flag BEFORE calling orig so any nested wrapped
+		# call into another wrap returns early.
+		local_proxy._profiler_in_wrap = True
+		try:
+			return orig(*args, **kwargs)
+		finally:
+			local_proxy._profiler_in_wrap = False
+			sidecar = getattr(local_proxy, "profiler_sidecar", None)
+			if sidecar is None:
+				local_proxy.profiler_sidecar = [entry]
+			elif len(sidecar) >= SIDECAR_CAP_PER_RECORDING:
+				local_proxy.profiler_sidecar_truncated = True
+			else:
+				sidecar.append(entry)
+
+	wrapped._profiler_original = orig
+	return wrapped
