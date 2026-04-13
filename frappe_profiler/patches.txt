@@ -1,3 +1,5 @@
+[pre_model_sync]
+
 [post_model_sync]
 frappe_profiler.patches.v0_2_0.remove_version_tracking
 frappe_profiler.patches.v0_3_0.add_call_tree_fields
