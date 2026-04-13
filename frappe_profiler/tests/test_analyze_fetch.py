@@ -97,3 +97,40 @@ def test_fetch_recordings_is_a_generator():
 	import inspect
 
 	assert inspect.isgeneratorfunction(analyze._fetch_recordings)
+
+
+def test_cleanup_redis_deletes_tree_and_sidecar_keys(monkeypatch):
+	import frappe
+	from frappe.recorder import RECORDER_REQUEST_HASH, RECORDER_REQUEST_SPARSE_HASH
+
+	uuids = ["rec-a", "rec-b"]
+	store = {
+		(RECORDER_REQUEST_HASH, "rec-a"): {"uuid": "rec-a"},
+		(RECORDER_REQUEST_HASH, "rec-b"): {"uuid": "rec-b"},
+		(RECORDER_REQUEST_SPARSE_HASH, "rec-a"): {},
+		(RECORDER_REQUEST_SPARSE_HASH, "rec-b"): {},
+		"profiler:tree:rec-a": b"blob-a",
+		"profiler:tree:rec-b": b"blob-b",
+		"profiler:sidecar:rec-a": [],
+		"profiler:sidecar:rec-b": [],
+	}
+	cache = FakeCache(store)
+	monkeypatch.setattr(frappe, "cache", cache, raising=False)
+	# session.delete_session_state inside _cleanup_redis touches more keys;
+	# stub it so the test stays focused on the per-recording cleanup.
+	from frappe_profiler import session as ps_session
+
+	monkeypatch.setattr(
+		ps_session, "delete_session_state", lambda uuid: None, raising=True
+	)
+	# log_error is monkey-patched to a no-op so the test doesn't need a site
+	monkeypatch.setattr(frappe, "log_error", lambda **kw: None, raising=False)
+
+	analyze._cleanup_redis("test-session", uuids)
+
+	# All four per-recording keys are gone
+	for uuid in uuids:
+		assert (RECORDER_REQUEST_HASH, uuid) not in cache.store
+		assert (RECORDER_REQUEST_SPARSE_HASH, uuid) not in cache.store
+		assert f"profiler:tree:{uuid}" not in cache.store
+		assert f"profiler:sidecar:{uuid}" not in cache.store

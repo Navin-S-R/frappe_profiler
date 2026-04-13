@@ -43,6 +43,17 @@ from frappe_profiler.analyzers import (
 )
 from frappe_profiler.analyzers.base import AnalyzeContext
 
+# v0.3.0: per-analyzer wall-clock budget. If the cumulative analyze
+# elapsed time crosses this threshold, remaining analyzers are skipped
+# and the session is finalized as Ready with a partial-completion
+# warning. 5 minutes of headroom under the RQ long-queue 25-min timeout.
+ANALYZE_TOTAL_BUDGET_SECONDS = 20 * 60
+
+# Per-individual-analyzer soft cap: an analyzer that exceeds this is
+# logged as a warning but doesn't halt the pipeline.
+ANALYZE_PER_ANALYZER_SOFT_CAP_SECONDS = 60
+
+
 # per_action is first because it builds the Profiler Action rows that the
 # rest of the analyzers reference via action_ref. The remainder are
 # independent and could in principle be parallelized.
@@ -173,13 +184,33 @@ def run(session_uuid: str):
 		_publish_progress(50, "Running analyzers", session_uuid)
 		analyzers = _get_analyzers()
 		for i, analyzer in enumerate(analyzers):
+			# v0.3.0: total wall-clock budget check. If we're over budget,
+			# skip remaining analyzers and finalize partial.
+			if time.monotonic() - analyze_start > ANALYZE_TOTAL_BUDGET_SECONDS:
+				skipped = len(analyzers) - i
+				context.warnings.append(
+					f"Analyze partially completed (timeout) — "
+					f"{skipped} analyzer(s) skipped"
+				)
+				break
+
 			analyzer_name = getattr(analyzer, "__module__", "<unknown>")
+			analyzer_start = time.monotonic()
 			try:
 				result = analyzer(recordings, context)
 				context.merge(result)
 			except Exception:
 				context.warnings.append(f"Analyzer {analyzer_name} failed (see error log)")
 				frappe.log_error(title=f"frappe_profiler analyzer {analyzer_name}")
+
+			# v0.3.0: per-analyzer soft cap warning (logged, not fatal)
+			analyzer_elapsed = time.monotonic() - analyzer_start
+			if analyzer_elapsed > ANALYZE_PER_ANALYZER_SOFT_CAP_SECONDS:
+				context.warnings.append(
+					f"Analyzer {analyzer_name} took {analyzer_elapsed:.0f}s "
+					f"(soft cap is {ANALYZE_PER_ANALYZER_SOFT_CAP_SECONDS}s)"
+				)
+
 			# Progress between 50-75% spread across analyzers
 			pct = 50 + (25 * (i + 1) / len(analyzers))
 			_publish_progress(pct, f"Ran {analyzer_name.split('.')[-1]}", session_uuid)
@@ -717,5 +748,14 @@ def _cleanup_redis(session_uuid: str, recording_uuids: list[str]) -> None:
 			pass
 		try:
 			frappe.cache.hdel(RECORDER_REQUEST_SPARSE_HASH, uuid)
+		except Exception:
+			pass
+		# v0.3.0: also delete the per-recording tree and sidecar keys.
+		try:
+			frappe.cache.delete_value(f"profiler:tree:{uuid}")
+		except Exception:
+			pass
+		try:
+			frappe.cache.delete_value(f"profiler:sidecar:{uuid}")
 		except Exception:
 			pass
