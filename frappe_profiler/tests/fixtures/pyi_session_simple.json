@@ -1,0 +1,28 @@
+{
+  "root": {
+    "function": "<root>",
+    "filename": "",
+    "lineno": 0,
+    "self_ms": 0,
+    "cumulative_ms": 100,
+    "children": [
+      {
+        "function": "erpnext.selling.doctype.sales_invoice.sales_invoice.validate",
+        "filename": "apps/erpnext/erpnext/selling/doctype/sales_invoice/sales_invoice.py",
+        "lineno": 142,
+        "self_ms": 20,
+        "cumulative_ms": 80,
+        "children": [
+          {
+            "function": "frappe.db.sql",
+            "filename": "apps/frappe/frappe/database/database.py",
+            "lineno": 234,
+            "self_ms": 10,
+            "cumulative_ms": 60,
+            "children": []
+          }
+        ]
+      }
+    ]
+  }
+}
