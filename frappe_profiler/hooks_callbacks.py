@@ -143,6 +143,14 @@ def after_request(*args, **kwargs):
 	except Exception:
 		frappe.log_error(title="frappe_profiler after_request")
 	finally:
+		# v0.3.0: dump pyinstrument session and sidecar log to Redis under
+		# per-recording-UUID keys. Best-effort — failures here log but
+		# never break the request.
+		_dump_capture_state_to_redis(
+			recording_uuid=getattr(
+				getattr(frappe.local, "_recorder", None), "uuid", None
+			)
+		)
 		# Clear the per-request marker so it doesn't leak across requests
 		# (frappe.local is per-request anyway, but explicit is good).
 		if hasattr(frappe.local, "profiler_session_id"):
@@ -274,5 +282,82 @@ def after_job(method=None, kwargs=None, result=None, **rest):
 	except Exception:
 		frappe.log_error(title="frappe_profiler after_job")
 	finally:
+		_dump_capture_state_to_redis(
+			recording_uuid=getattr(
+				getattr(frappe.local, "_recorder", None), "uuid", None
+			)
+		)
 		if hasattr(frappe.local, "profiler_session_id"):
 			del frappe.local.profiler_session_id
+
+
+def _dump_capture_state_to_redis(recording_uuid: str | None) -> None:
+	"""Serialize the in-flight pyinstrument session and sidecar list to Redis.
+
+	Called from after_request / after_job after the recorder has dumped
+	its own SQL recording. The two new Redis keys are:
+
+	  profiler:tree:<recording_uuid>      → pickle.dumps(pyi.last_session)
+	  profiler:sidecar:<recording_uuid>   → list[dict]
+
+	Both inherit the same TTL semantics as RECORDER_REQUEST_HASH (cleaned
+	up at the end of analyze, or expire naturally if analyze never runs).
+
+	Best-effort: failures here log but never break the request.
+	"""
+	import pickle
+
+	from frappe_profiler.session import SESSION_TTL_SECONDS
+
+	if not recording_uuid:
+		# No recorder ran on this request — nothing to dump.
+		_clear_capture_locals()
+		return
+
+	prof = getattr(frappe.local, "profiler_pyinstrument", None)
+	if prof is not None:
+		try:
+			prof.stop()
+			tree_blob = pickle.dumps(prof.last_session)
+			frappe.cache.set_value(
+				f"profiler:tree:{recording_uuid}",
+				tree_blob,
+				expires_in_sec=SESSION_TTL_SECONDS,
+			)
+		except Exception:
+			frappe.log_error(title="frappe_profiler pyi dump")
+
+	sidecar = getattr(frappe.local, "profiler_sidecar", None)
+	if sidecar:
+		try:
+			# If the sidecar was truncated, append a marker entry so the
+			# analyze pipeline can surface a warning even if the
+			# truncation flag itself is lost across the Redis hop.
+			payload = list(sidecar)
+			if getattr(frappe.local, "profiler_sidecar_truncated", False):
+				payload.append({"_truncated": True})
+			frappe.cache.set_value(
+				f"profiler:sidecar:{recording_uuid}",
+				payload,
+				expires_in_sec=SESSION_TTL_SECONDS,
+			)
+		except Exception:
+			frappe.log_error(title="frappe_profiler sidecar dump")
+
+	_clear_capture_locals()
+
+
+def _clear_capture_locals() -> None:
+	"""Clear all v0.3.0 capture state from frappe.local. Idempotent."""
+	for attr in (
+		"profiler_pyinstrument",
+		"profiler_sidecar",
+		"profiler_sidecar_truncated",
+		"_profiler_active_session_id",
+		"_profiler_in_wrap",
+	):
+		if hasattr(frappe.local, attr):
+			try:
+				delattr(frappe.local, attr)
+			except AttributeError:
+				pass
