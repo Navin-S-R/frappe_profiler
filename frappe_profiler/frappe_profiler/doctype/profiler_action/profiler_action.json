@@ -14,7 +14,10 @@
   "duration_ms",
   "queries_count",
   "query_time_ms",
-  "slowest_query_ms"
+  "slowest_query_ms",
+  "call_tree_json",
+  "call_tree_size_bytes",
+  "call_tree_overflow_file"
  ],
  "fields": [
   {
@@ -78,6 +81,27 @@
    "fieldtype": "Float",
    "label": "Slowest Query (ms)",
    "precision": "2",
+   "read_only": 1
+  },
+  {
+   "fieldname": "call_tree_json",
+   "fieldtype": "Long Text",
+   "hidden": 1,
+   "label": "Call Tree (JSON)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "call_tree_size_bytes",
+   "fieldtype": "Int",
+   "hidden": 1,
+   "label": "Call Tree Size (bytes)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "call_tree_overflow_file",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Call Tree Overflow File URL",
    "read_only": 1
   }
  ],

@@ -33,6 +33,10 @@
   "raw_report_file",
   "internal_section",
   "top_queries_json",
+  "total_python_ms",
+  "total_sql_ms",
+  "hot_frames_json",
+  "session_time_breakdown_json",
   "table_breakdown_json",
   "analyzer_warnings"
  ],
@@ -212,6 +216,32 @@
    "fieldtype": "Long Text",
    "hidden": 1,
    "label": "Top Queries (JSON)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "total_python_ms",
+   "fieldtype": "Float",
+   "label": "Total Python Time (ms)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "total_sql_ms",
+   "fieldtype": "Float",
+   "label": "Total SQL Time (ms)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "hot_frames_json",
+   "fieldtype": "Long Text",
+   "hidden": 1,
+   "label": "Hot Frames (JSON)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "session_time_breakdown_json",
+   "fieldtype": "Long Text",
+   "hidden": 1,
+   "label": "Session Time Breakdown (JSON)",
    "read_only": 1
   },
   {
