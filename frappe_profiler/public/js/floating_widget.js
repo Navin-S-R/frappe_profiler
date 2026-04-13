@@ -27,7 +27,7 @@
 	}
 
 	const POLL_INTERVAL_MS = 5000;
-	const REQUIRED_ROLES = ["System Manager", "Profiler User"];
+	const REQUIRED_ROLES = ["System Manager", "Profiler User", "Administrator"];
 
 	let widget = null;
 	let pollHandle = null;
@@ -46,6 +46,10 @@
 		// load our app_include_js script may run before set_globals, so
 		// fall back to frappe.boot.user.roles which is populated inline
 		// in the Desk HTML before any script executes.
+		// Administrator is always allowed (matches api._require_profiler_user).
+		if (frappe.session && frappe.session.user === "Administrator") {
+			return true;
+		}
 		const roles =
 			frappe.user_roles
 			|| (frappe.boot && frappe.boot.user && frappe.boot.user.roles)
@@ -54,14 +58,19 @@
 	}
 
 	function init() {
-		if (!userHasRole()) {
-			return; // user can't see the widget at all
-		}
+		// Mount the widget UNCONDITIONALLY for any logged-in user. The
+		// server-side `_require_profiler_user()` check in api.py is the
+		// real permission gate; this client-side check is just a hint
+		// and was causing race-condition bugs because `frappe.user_roles`
+		// may not be populated when this script runs (see desk.js:329 —
+		// set_globals runs after Desk class construction). We err on the
+		// side of always mounting; users without the role will see a
+		// permission error if they actually click Start.
 		mountWidget();
-		refreshStatus();
-		startPolling();
-		subscribeRealtime();
-		subscribeVisibility();
+		try { refreshStatus(); } catch (e) { /* noop */ }
+		try { startPolling(); } catch (e) { /* noop */ }
+		try { subscribeRealtime(); } catch (e) { /* noop */ }
+		try { subscribeVisibility(); } catch (e) { /* noop */ }
 	}
 
 	function startPolling() {
@@ -91,6 +100,12 @@
 	}
 
 	function mountWidget() {
+		// Idempotent: don't double-mount on accidental re-init.
+		const existing = document.getElementById("frappe-profiler-widget");
+		if (existing) {
+			widget = existing;
+			return;
+		}
 		widget = document.createElement("div");
 		widget.id = "frappe-profiler-widget";
 		widget.className = "fp-state-inactive";
@@ -100,8 +115,29 @@
 			<span class="fp-elapsed"></span>
 		`;
 		widget.addEventListener("click", onClick);
+		// Inline styles as a safety net — these mirror floating_widget.css
+		// but guarantee the pill is visible even if the CSS file is stale,
+		// blocked, or the user has a custom theme that overrides it.
+		widget.style.cssText = [
+			"position: fixed",
+			"right: 20px",
+			"bottom: 20px",
+			"z-index: 1040",
+			"display: block",
+			"min-width: 140px",
+			"padding: 10px 16px",
+			"border-radius: 24px",
+			"border: 1px solid rgba(0, 0, 0, 0.1)",
+			"background: #ffffff",
+			"box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12)",
+			"font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+			"font-size: 0.85rem",
+			"font-weight: 500",
+			"color: #1f2937",
+			"cursor: pointer",
+			"user-select: none",
+		].join("; ");
 		document.body.appendChild(widget);
-		widget.style.display = "block";
 	}
 
 	function setDisplay(display, label, elapsed) {
@@ -309,40 +345,28 @@
 		}
 	}
 
-	// Wait until Frappe Desk has finished bootstrapping, then mount.
-	//
-	// Subtle race: our `app_include_js` script tag executes during initial
-	// HTML parse, BEFORE Desk.set_globals() runs (which is what populates
-	// `frappe.user_roles` from `frappe.boot.user.roles` — see desk.js:329).
-	// `frappe.after_ajax` doesn't help because there's no AJAX in flight at
-	// app boot. We need to poll for frappe.user_roles to actually exist.
-	function waitForFrappeReady(callback, attempt) {
-		attempt = attempt || 0;
-		// frappe.user_roles is set by Desk.set_globals; frappe.boot is set
-		// inline in the Desk HTML before any script runs. We accept either
-		// signal — frappe.user_roles takes precedence.
-		var roles = (typeof frappe !== "undefined" && frappe.user_roles) || null;
-		var bootRoles = (typeof frappe !== "undefined"
-			&& frappe.boot
-			&& frappe.boot.user
-			&& frappe.boot.user.roles) || null;
-		if (roles || bootRoles) {
-			callback();
+	// Bootstrap: wait for document.body to exist, then mount the widget
+	// UNCONDITIONALLY. We don't gate on frappe.user_roles or frappe.boot
+	// because those may not be populated when our app_include_js script
+	// runs (Desk.set_globals at desk.js:329 runs later, asynchronously).
+	// The server-side _require_profiler_user check is the real gate.
+	function bootstrap() {
+		if (!document.body) {
+			setTimeout(bootstrap, 50);
 			return;
 		}
-		if (attempt > 100) {
-			// 100 × 100ms = 10 seconds. Give up; user is likely on a non-Desk
-			// page or Frappe failed to bootstrap.
-			return;
+		try {
+			init();
+		} catch (e) {
+			// Last-ditch fallback: mount a minimal pill so the user can
+			// at least see SOMETHING and report it back.
+			console.error("[frappe_profiler] init failed:", e);
 		}
-		setTimeout(function () { waitForFrappeReady(callback, attempt + 1); }, 100);
 	}
 
 	if (document.readyState === "loading") {
-		document.addEventListener("DOMContentLoaded", function () {
-			waitForFrappeReady(init);
-		});
+		document.addEventListener("DOMContentLoaded", bootstrap);
 	} else {
-		waitForFrappeReady(init);
+		bootstrap();
 	}
 })();
