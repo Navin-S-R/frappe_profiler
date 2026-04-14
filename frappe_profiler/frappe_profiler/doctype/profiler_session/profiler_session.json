@@ -38,6 +38,7 @@
   "hot_frames_json",
   "session_time_breakdown_json",
   "table_breakdown_json",
+  "v5_aggregate_json",
   "analyzer_warnings",
   "compared_to_session",
   "is_baseline",
@@ -253,6 +254,14 @@
    "hidden": 1,
    "label": "Table Breakdown (JSON)",
    "read_only": 1
+  },
+  {
+   "fieldname": "v5_aggregate_json",
+   "fieldtype": "Long Text",
+   "hidden": 1,
+   "label": "v0.5.0 Aggregates (JSON)",
+   "read_only": 1,
+   "description": "v0.5.0+: JSON dict holding infra_pressure and frontend_timings aggregates — infra_timeline, infra_summary, frontend_xhr_matched, frontend_vitals_by_page, frontend_orphans, frontend_summary. Consumed by the Server Resource and Frontend panels in the report template."
   },
   {
    "fieldname": "analyzer_warnings",

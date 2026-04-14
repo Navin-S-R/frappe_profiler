@@ -545,6 +545,193 @@
     {% endif %}
   </div>
 
+  {# --------------- v0.5.0: SERVER RESOURCE PANEL --------------- #}
+  {% if infra_timeline %}
+  <div class="section">
+    <h2>Server Resource</h2>
+    <p class="small muted">
+      CPU, memory, load average, DB and Redis pressure, and background
+      queue depth sampled at each action boundary. Use this to tell code-slow
+      from server-slow.
+    </p>
+    <div class="stats" style="margin-bottom: 12px;">
+      <div class="stat">
+        <div class="label">CPU avg / peak</div>
+        <div class="value">
+          {{ "%.0f" | format(infra_summary.cpu_avg or 0) }}%
+          <span class="sub" style="font-size: 1rem">/ {{ "%.0f" | format(infra_summary.cpu_peak or 0) }}%</span>
+        </div>
+      </div>
+      <div class="stat">
+        <div class="label">Worker RSS delta</div>
+        <div class="value">
+          {{ ((infra_summary.rss_delta or 0) / 1000000) | round(0) | int }}<span class="sub" style="font-size: 1rem">MB</span>
+        </div>
+      </div>
+      <div class="stat">
+        <div class="label">Load peak</div>
+        <div class="value">{{ "%.2f" | format(infra_summary.load_peak or 0) }}</div>
+      </div>
+      <div class="stat">
+        <div class="label">Swap peak</div>
+        <div class="value">
+          {{ infra_summary.swap_peak_mb or 0 }}<span class="sub" style="font-size: 1rem">MB</span>
+        </div>
+      </div>
+    </div>
+    <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+      <thead>
+        <tr style="background: #f3f4f6; border-bottom: 1px solid #e5e7eb;">
+          <th style="padding: 6px 8px; text-align: left;">#</th>
+          <th style="padding: 6px 8px; text-align: left;">Action</th>
+          <th style="padding: 6px 8px; text-align: right;">CPU</th>
+          <th style="padding: 6px 8px; text-align: right;">RSS</th>
+          <th style="padding: 6px 8px; text-align: right;">Load</th>
+          <th style="padding: 6px 8px; text-align: right;">DB run/conn</th>
+          <th style="padding: 6px 8px; text-align: right;">RQ def/short/long</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in infra_timeline %}
+        <tr style="border-bottom: 1px solid #f3f4f6;">
+          <td style="padding: 4px 8px;">{{ row.action_idx }}</td>
+          <td style="padding: 4px 8px;">{{ row.action_label }}</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ "%.0f" | format(row.cpu or 0) }}%</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ ((row.rss or 0) / 1000000) | round(0) | int }}MB</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ "%.2f" | format(row.load_1min or 0) }}</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ (row.db_threads_running or 0) | int }}/{{ (row.db_threads_connected or 0) | int }}</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ (row.rq_default or 0) | int }}/{{ (row.rq_short or 0) | int }}/{{ (row.rq_long or 0) | int }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {# --------------- v0.5.0: FRONTEND PANEL --------------- #}
+  {% if frontend_xhr_matched or frontend_vitals_by_page %}
+  <div class="section">
+    <h2>Frontend</h2>
+    <p class="small muted">
+      Per-XHR timings from the browser joined to the matching server recording,
+      plus Web Vitals (FCP, LCP, CLS) per page. Shows what the user actually
+      felt — network overhead and page paint time that the server alone can't see.
+    </p>
+    <div class="stats" style="margin-bottom: 12px;">
+      <div class="stat">
+        <div class="label">Total XHRs</div>
+        <div class="value">{{ frontend_summary.total_xhrs or 0 }}</div>
+      </div>
+      <div class="stat">
+        <div class="label">Browser wall time</div>
+        <div class="value">
+          {{ (frontend_summary.total_xhr_ms or 0) | int }}<span class="sub" style="font-size: 1rem">ms</span>
+        </div>
+      </div>
+      <div class="stat">
+        <div class="label">Backend time</div>
+        <div class="value">
+          {{ (frontend_summary.total_backend_ms or 0) | int }}<span class="sub" style="font-size: 1rem">ms</span>
+        </div>
+      </div>
+      <div class="stat">
+        <div class="label">Network overhead</div>
+        <div class="value">
+          {{ (frontend_summary.network_overhead_ms or 0) | int }}<span class="sub" style="font-size: 1rem">ms</span>
+        </div>
+      </div>
+    </div>
+
+    {% if frontend_xhr_matched %}
+    <h3 style="margin-bottom: 8px;">Per-action XHR timing</h3>
+    <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+      <thead>
+        <tr style="background: #f3f4f6; border-bottom: 1px solid #e5e7eb;">
+          <th style="padding: 6px 8px; text-align: left;">Action</th>
+          <th style="padding: 6px 8px; text-align: right;">Backend</th>
+          <th style="padding: 6px 8px; text-align: right;">Browser</th>
+          <th style="padding: 6px 8px; text-align: right;">Network Δ</th>
+          <th style="padding: 6px 8px; text-align: right;">Status</th>
+          <th style="padding: 6px 8px; text-align: right;">Size</th>
+          <th style="padding: 6px 8px; text-align: left;">URL</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in frontend_xhr_matched %}
+        <tr style="border-bottom: 1px solid #f3f4f6;">
+          <td style="padding: 4px 8px;">{{ m.action_label }}</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ m.backend_ms | int }}ms</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ m.xhr_ms | int }}ms</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ m.network_delta_ms | int }}ms</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ m.status }}</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ ((m.response_size_bytes or 0) / 1024) | round(1) }}KB</td>
+          <td style="padding: 4px 8px;">
+            <code style="font-size: 0.75rem;">{% if mode == "safe" %}{{ safe_url(m.url) }}{% else %}{{ m.url }}{% endif %}</code>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    {% if frontend_vitals_by_page %}
+    <h3 style="margin-top: 16px; margin-bottom: 8px;">Web Vitals by page</h3>
+    <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+      <thead>
+        <tr style="background: #f3f4f6; border-bottom: 1px solid #e5e7eb;">
+          <th style="padding: 6px 8px; text-align: left;">Page</th>
+          <th style="padding: 6px 8px; text-align: right;">FCP</th>
+          <th style="padding: 6px 8px; text-align: right;">LCP</th>
+          <th style="padding: 6px 8px; text-align: right;">CLS</th>
+          <th style="padding: 6px 8px; text-align: right;">TTFB</th>
+          <th style="padding: 6px 8px; text-align: right;">DCL</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for page, v in frontend_vitals_by_page.items() %}
+        <tr style="border-bottom: 1px solid #f3f4f6;">
+          <td style="padding: 4px 8px;">
+            <code style="font-size: 0.75rem;">{% if mode == "safe" %}{{ safe_url(page) }}{% else %}{{ page }}{% endif %}</code>
+          </td>
+          <td style="padding: 4px 8px; text-align: right;">{{ (v.fcp_ms or 0) | int }}ms</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ (v.lcp_ms or 0) | int }}ms</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ "%.3f" | format(v.cls or 0) }}</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ (v.ttfb_ms or 0) | int }}ms</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ (v.dom_content_loaded_ms or 0) | int }}ms</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    {% if mode != "safe" and frontend_orphans %}
+    <details style="margin-top: 16px;">
+      <summary class="small muted" style="cursor: pointer;">
+        Orphaned XHRs ({{ frontend_orphans | length }}) — no matching server recording
+      </summary>
+      <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 8px;">
+        <thead>
+          <tr style="background: #f3f4f6; border-bottom: 1px solid #e5e7eb;">
+            <th style="padding: 6px 8px; text-align: left;">URL</th>
+            <th style="padding: 6px 8px; text-align: right;">Duration</th>
+            <th style="padding: 6px 8px; text-align: left;">Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for o in frontend_orphans %}
+          <tr style="border-bottom: 1px solid #f3f4f6;">
+            <td style="padding: 4px 8px;"><code style="font-size: 0.75rem;">{{ o.url }}</code></td>
+            <td style="padding: 4px 8px; text-align: right;">{{ (o.duration_ms or 0) | int }}ms</td>
+            <td style="padding: 4px 8px;">{{ o.reason }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </details>
+    {% endif %}
+  </div>
+  {% endif %}
+
   {# --------------- v0.3.0: TIME BREAKDOWN DONUT --------------- #}
   {% if donut_slices %}
   <div class="section">

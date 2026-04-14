@@ -654,6 +654,18 @@ def _persist(
 	doc.table_breakdown_json = json.dumps(
 		context.aggregate.get("table_breakdown", []), default=str
 	)
+	# v0.5.0: infra_pressure and frontend_timings aggregates.
+	doc.v5_aggregate_json = json.dumps(
+		{
+			"infra_timeline": context.aggregate.get("infra_timeline", []),
+			"infra_summary": context.aggregate.get("infra_summary", {}),
+			"frontend_xhr_matched": context.aggregate.get("frontend_xhr_matched", []),
+			"frontend_vitals_by_page": context.aggregate.get("frontend_vitals_by_page", {}),
+			"frontend_orphans": context.aggregate.get("frontend_orphans", []),
+			"frontend_summary": context.aggregate.get("frontend_summary", {}),
+		},
+		default=str,
+	)
 	# v0.3.0: call_tree analyzer outputs
 	doc.hot_frames_json = json.dumps(
 		context.aggregate.get("hot_frames", []), default=str

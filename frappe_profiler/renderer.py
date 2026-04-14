@@ -346,6 +346,14 @@ def render(
 				pass
 			comparison_data = None
 
+	# v0.5.0: infra_pressure + frontend_timings aggregates. One JSON field
+	# holds both. Empty fallbacks let sessions captured before v0.5.0
+	# render cleanly after the upgrade — the new panels just don't appear.
+	try:
+		v5 = json.loads(getattr(session_doc, "v5_aggregate_json", None) or "{}")
+	except Exception:
+		v5 = {}
+
 	context = {
 		"session": session_doc,
 		"actions": actions,
@@ -370,6 +378,14 @@ def render(
 		# v0.4.0 additions
 		"comparison": comparison_data,
 		"donut_svg": donut_svg,
+		# v0.5.0 additions
+		"infra_timeline": v5.get("infra_timeline") or [],
+		"infra_summary": v5.get("infra_summary") or {},
+		"frontend_xhr_matched": v5.get("frontend_xhr_matched") or [],
+		"frontend_vitals_by_page": v5.get("frontend_vitals_by_page") or {},
+		"frontend_orphans": v5.get("frontend_orphans") or [],
+		"frontend_summary": v5.get("frontend_summary") or {},
+		"safe_url": _safe_url,
 	}
 
 	return template.render(**context)
