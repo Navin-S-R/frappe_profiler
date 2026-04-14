@@ -35,7 +35,17 @@ def test_stop_session_honors_inline_analyze_limit():
 
 def test_enqueue_analyze_passes_now_when_scheduler_disabled(monkeypatch):
     """Full-stack check: when is_scheduler_disabled() is True, frappe.enqueue
-    should be called with now=True."""
+    should be called with now=True.
+
+    Assumes _enqueue_analyze does NOT import `is_scheduler_disabled` at
+    module-level in api.py. The sys.modules monkeypatch below is applied
+    inside the test body, so a name bound at api.py import time would
+    bypass it. If that pattern changes, update this test to use
+    monkeypatch.setattr on the bound symbol instead.
+    """
+    import sys
+    import types
+
     import frappe_profiler.api as api_mod
 
     captured = {}
@@ -47,7 +57,6 @@ def test_enqueue_analyze_passes_now_when_scheduler_disabled(monkeypatch):
     def fake_is_disabled():
         return True
 
-    import sys, types
     fake_mod = types.ModuleType("frappe.utils.scheduler")
     fake_mod.is_scheduler_disabled = fake_is_disabled
     monkeypatch.setitem(sys.modules, "frappe.utils.scheduler", fake_mod)
@@ -59,7 +68,19 @@ def test_enqueue_analyze_passes_now_when_scheduler_disabled(monkeypatch):
     # Patch the frappe.enqueue that the module will call
     import frappe
     monkeypatch.setattr(frappe, "enqueue", fake_enqueue)
-    monkeypatch.setattr(frappe, "logger", lambda: types.SimpleNamespace(warning=lambda *a, **k: None))
+    # Defensive stub: cover every logger level the implementation might
+    # reach for, not just .warning, so an unexpected .info/.debug call
+    # doesn't mask the real assertion failure.
+    monkeypatch.setattr(
+        frappe,
+        "logger",
+        lambda: types.SimpleNamespace(
+            warning=lambda *a, **k: None,
+            info=lambda *a, **k: None,
+            debug=lambda *a, **k: None,
+            error=lambda *a, **k: None,
+        ),
+    )
 
     ran_inline = api_mod._enqueue_analyze("test-uuid-123")
 
@@ -93,7 +114,14 @@ def test_stop_session_blocks_huge_inline_analyze(monkeypatch):
     fake_frappe_utils.scheduler = fake_sched_mod
     monkeypatch.setitem(sys.modules, "frappe.utils", fake_frappe_utils)
 
-    # Stub frappe.conf, frappe.db, frappe.cache, session helpers
+    # Stub frappe.conf, frappe.db, frappe.cache, session helpers.
+    #
+    # NOTE: FakeConf implements .get() because the planned production
+    # code accesses the cap via `frappe.conf.get("profiler_inline_analyze_limit")`.
+    # If the implementation ever switches to attribute access
+    # (e.g. `frappe.conf.profiler_inline_analyze_limit`), this stub must
+    # be updated to expose the same attribute — otherwise the cap check
+    # would silently fall through to a hardcoded default.
     class FakeConf:
         def get(self, key, default=None):
             return {"profiler_inline_analyze_limit": 50}.get(key, default)
