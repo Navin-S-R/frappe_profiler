@@ -177,8 +177,21 @@ def after_request(*args, **kwargs):
 		# v0.5.0: correlation header for profiler_frontend.js. Must set
 		# Access-Control-Expose-Headers or browsers will refuse to surface
 		# the custom header to JavaScript, even for same-origin requests.
+		#
+		# Gated on `profiler_session_id` specifically (not just the
+		# recorder UUID) — the standalone Frappe Recorder UI may be
+		# activated globally on this site, which sets frappe.local._recorder
+		# and gives us a recording UUID, but THAT recording doesn't belong
+		# to any profiler session. Injecting the header for non-session
+		# traffic would:
+		#   1. Pollute every response across the site with a useless header
+		#   2. Cause profiler_frontend.js to buffer XHR timings tagged to
+		#      a recording UUID that has no session to flush them to
 		try:
-			if recording_uuid_for_dump:
+			profiler_session_id = getattr(
+				frappe.local, "profiler_session_id", None
+			)
+			if recording_uuid_for_dump and profiler_session_id:
 				_inject_correlation_header(recording_uuid_for_dump)
 		except Exception:
 			frappe.log_error(title="frappe_profiler header injection")

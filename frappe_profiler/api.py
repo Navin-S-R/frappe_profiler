@@ -1004,10 +1004,30 @@ def retry_analyze(session_uuid: str) -> dict:
 	except Exception:
 		pass
 
-	frappe.enqueue(
-		"frappe_profiler.analyze.run",
-		queue="long",
-		session_uuid=session_uuid,
-	)
+	# v0.5.0: use the scheduler-aware enqueue helper so retry also works
+	# on sites where bench disable-scheduler is in effect. Earlier
+	# versions called frappe.enqueue directly here, which on scheduler-
+	# disabled sites would re-hit the exact hung-forever bug that the
+	# v0.5.0 scheduler fallback was designed to fix — Retry would push
+	# to a queue no worker consumes and the session would stay stuck
+	# in Stopping forever.
+	ran_inline = _enqueue_analyze(session_uuid)
 
-	return {"retried": True, "session_uuid": session_uuid, "docname": doc["name"]}
+	# Read back the final status if inline analyze ran, so the client
+	# can show the right terminal state (same contract as stop()).
+	final_status = None
+	if ran_inline:
+		try:
+			final_status = frappe.db.get_value(
+				"Profiler Session", doc["name"], "status"
+			)
+		except Exception:
+			final_status = None
+
+	return {
+		"retried": True,
+		"session_uuid": session_uuid,
+		"docname": doc["name"],
+		"ran_inline": ran_inline,
+		"status": final_status,
+	}

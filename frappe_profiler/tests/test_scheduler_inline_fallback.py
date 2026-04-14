@@ -89,6 +89,27 @@ def test_enqueue_analyze_passes_now_when_scheduler_disabled(monkeypatch):
     assert ran_inline is True
 
 
+def test_retry_analyze_uses_scheduler_aware_enqueue():
+	"""Pass-5 regression guard: retry_analyze used to call
+	frappe.enqueue directly, bypassing the v0.5.0 scheduler-aware
+	fallback. On sites with bench disable-scheduler, clicking 'Retry
+	Analyze' on a Failed session would re-hit the exact hung-forever
+	bug the v0.5.0 fix was designed to prevent.
+
+	Source-inspection check: retry_analyze must use _enqueue_analyze,
+	not a bare frappe.enqueue call with the analyze.run method string.
+	"""
+	import inspect
+	from frappe_profiler import api
+
+	src = inspect.getsource(api.retry_analyze)
+	# Must reference the scheduler-aware helper.
+	assert "_enqueue_analyze" in src, (
+		"retry_analyze must call _enqueue_analyze (not frappe.enqueue "
+		"directly) or it won't honor the scheduler-disabled fallback"
+	)
+
+
 def test_enqueue_analyze_swallows_inline_failure(monkeypatch):
 	"""Regression guard (v0.5.1 architect review pass 3): when analyze
 	runs inline and raises (analyze.run catches its own exception, marks

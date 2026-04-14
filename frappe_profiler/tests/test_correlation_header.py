@@ -93,6 +93,37 @@ def test_inject_correlation_header_tokenwise_match_not_substring():
     assert "X-Profiler-Recording-Id" in tokens
 
 
+def test_correlation_header_gated_on_profiler_session_id():
+    """Pass-5 regression guard: the correlation header must only be
+    injected when an active profiler session is present — not merely
+    when there's a recording UUID. The standalone Frappe Recorder UI
+    sets frappe.local._recorder for non-session traffic, and leaking
+    X-Profiler-Recording-Id onto those responses would cause
+    profiler_frontend.js to buffer XHR timings tagged to a recording
+    UUID that has no session to flush them to.
+
+    Source-inspection check on the after_request hook's correlation
+    header block.
+    """
+    import inspect
+    from frappe_profiler import hooks_callbacks
+
+    src = inspect.getsource(hooks_callbacks.after_request)
+    # The correlation header injection must check profiler_session_id
+    # (from frappe.local), not just the recording UUID.
+    assert "profiler_session_id" in src
+    # And the check must guard _inject_correlation_header.
+    correlation_idx = src.find("_inject_correlation_header")
+    assert correlation_idx > 0
+    # Look for profiler_session_id reference within ~30 lines before
+    # the correlation header call.
+    preamble = src[:correlation_idx]
+    assert "profiler_session_id" in preamble, (
+        "_inject_correlation_header must be gated on profiler_session_id, "
+        "not just recording_uuid_for_dump — otherwise non-session "
+        "traffic (e.g. from the standalone Recorder UI) leaks the header"
+    )
+
 def test_inject_correlation_header_case_insensitive_idempotency():
     """HTTP header names are case-insensitive. The token check must
     be too — if another app set the expose header in lowercase, we

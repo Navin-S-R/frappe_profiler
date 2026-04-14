@@ -70,7 +70,10 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 
     for idx, rec in enumerate(recordings):
         infra = rec.get("infra") or {}
-        if not infra:
+        # Defensive: a truthy non-dict value (e.g. corrupt Redis data
+        # returning a list or string) would pass the falsy check but
+        # then crash on .get(). Skip non-dicts cleanly.
+        if not infra or not isinstance(infra, dict):
             continue
         actions_with_infra += 1
 

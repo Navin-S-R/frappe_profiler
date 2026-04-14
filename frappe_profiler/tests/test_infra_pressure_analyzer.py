@@ -225,6 +225,30 @@ def test_empty_recordings_is_safe():
     assert result.aggregate["infra_timeline"] == []
 
 
+def test_recordings_with_non_dict_infra_are_skipped():
+    """Pass-5 regression guard: a corrupt Redis blob or unexpected
+    data type that ends up as rec['infra'] as a list/string (instead
+    of dict) would pass the falsy check but then crash on .get(),
+    breaking analyze.run for the whole session.
+    """
+    from frappe_profiler.analyzers import infra_pressure
+
+    recordings = [
+        # Non-dict truthy values that the old code would have crashed on.
+        {"uuid": "r1", "action_label": "a", "infra": ["not", "a", "dict"]},
+        {"uuid": "r2", "action_label": "b", "infra": "definitely not a dict"},
+        {"uuid": "r3", "action_label": "c", "infra": _synth_infra(sys_cpu_percent=95)},
+    ]
+    # Must NOT raise.
+    result = infra_pressure.analyze(recordings, _empty_context())
+    # Only the one valid recording made it into the timeline.
+    assert len(result.aggregate["infra_timeline"]) == 1
+    # And no Resource Contention because only one action breached
+    # (MIN_ACTIONS_AFFECTED = 2).
+    rc = [f for f in result.findings if f["finding_type"] == "Resource Contention"]
+    assert rc == []
+
+
 def test_recordings_without_infra_are_ignored():
     """Not every recording has an infra dict (e.g. if the session was
     started before v0.5.0 rolled out). The analyzer should skip them
