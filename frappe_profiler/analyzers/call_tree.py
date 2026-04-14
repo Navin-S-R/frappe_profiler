@@ -555,11 +555,37 @@ HOT_FRAMES_LEADERBOARD_SIZE = 20
 HOT_FRAMES_INTERMEDIATE_CAP = 1000
 
 
-def _redacted_module_key(function: str) -> str:
-	"""Build the dedup key for cross-action aggregation."""
+def _redacted_module_key(function: str, filename: str = "") -> str | None:
+	"""Build the dedup key for cross-action aggregation.
+
+	v0.5.1: includes the filename so different functions that share a
+	name (e.g. 35 different ``wrapper`` decorators across unrelated
+	modules, or 20 different ``handle`` methods) don't all collapse
+	into one bucket. Pre-v0.5.1 used the bare function name, which
+	produced misleading 'Repeated Hot Frame' findings blaming generic
+	decorator wrappers that the user cannot optimize — every functools
+	wrapper, werkzeug wrapper, and frappe.whitelist wrapper in the
+	session would roll up under a single 'wrapper' key.
+
+	Returns None for synthetic / skipped nodes.
+	"""
 	if not function or function.startswith("[") or function == "<root>" or function == "<sql>":
 		return None
-	return function  # full name; renderer collapses at display time
+
+	# Compact filename: keep the last 2 path segments so the key stays
+	# readable (e.g. "erpnext/accounts/sales_invoice.py") without
+	# leaking absolute paths from the worker's filesystem.
+	if filename:
+		short = (filename or "").replace("\\", "/")
+		parts = [p for p in short.split("/") if p]
+		if len(parts) > 2:
+			short = "/".join(parts[-2:])
+		else:
+			short = "/".join(parts)
+		if short:
+			return f"{short}::{function}"
+
+	return function
 
 
 def _aggregate_hot_frames(per_action_trees: list):
@@ -635,9 +661,22 @@ def _aggregate_hot_frames(per_action_trees: list):
 
 def _walk_for_aggregation(node: dict, action_idx: int, occurrences: dict) -> None:
 	if node.get("kind") == "python":
-		key = _redacted_module_key(node.get("function", ""))
-		if key:
-			occurrences[key].append((action_idx, node.get("cumulative_ms", 0)))
+		# v0.5.1: skip framework frames entirely. Repeated Hot Frame is
+		# a user-actionable finding ("optimize this function") — framework
+		# wrappers (frappe/*, frappe_profiler/*, werkzeug, gunicorn) can't
+		# be optimized by the user, and previously cluttered the top of
+		# the hot-frames leaderboard with noise like "wrapper" (35
+		# different decorator functions sharing a name) and "handle"
+		# (20 different handler methods sharing a name).
+		if not _is_framework_frame(node):
+			key = _redacted_module_key(
+				node.get("function", ""),
+				node.get("filename", ""),
+			)
+			if key:
+				occurrences[key].append(
+					(action_idx, node.get("cumulative_ms", 0))
+				)
 	for child in node.get("children", []):
 		_walk_for_aggregation(child, action_idx, occurrences)
 

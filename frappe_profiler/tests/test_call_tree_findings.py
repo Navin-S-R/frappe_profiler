@@ -193,6 +193,100 @@ def test_repeated_hot_frame_no_finding_when_below_thresholds():
 	assert findings == []
 
 
+def test_repeated_hot_frame_does_not_collapse_same_named_wrappers():
+	"""Pass-7 architect-review regression guard: the dedup key must include
+	filename so different functions sharing a name (35 different ``wrapper``
+	decorators, 20 different ``handle`` methods) don't all collapse into one
+	misleading 'Repeated Hot Frame' finding.
+
+	Real-world failure: a user's session captured this finding:
+	    'High — wrapper appeared in 11 actions and consumed 3534ms total'
+	Every one of those 11 was a DIFFERENT decorator wrapper from a
+	different module (functools, werkzeug, cached_property, etc.). The
+	finding was actionable only in the sense of 'optimize... something
+	called wrapper?' — which is nothing the user can actually do.
+	"""
+	per_action_trees = []
+	# Four different 'wrapper' functions in four different files.
+	# Each appears across enough actions and ms to trigger aggregation,
+	# but only WITHIN its own file. No cross-file collapse.
+	for i in range(4):
+		per_action_trees.append(_node("<root>", "", 500, [
+			_node("wrapper", "my_app/a.py", 50, []),
+			_node("wrapper", "my_app/b.py", 50, []),
+			_node("wrapper", "my_app/c.py", 50, []),
+			_node("wrapper", "my_app/d.py", 50, []),
+		]))
+
+	findings, leaderboard = call_tree._aggregate_hot_frames(per_action_trees)
+
+	# The leaderboard must have 4 separate entries for the 4 different
+	# wrappers, not a single collapsed 'wrapper' entry.
+	wrapper_entries = [r for r in leaderboard if "wrapper" in r["function"]]
+	assert len(wrapper_entries) == 4, (
+		f"Expected 4 distinct wrapper entries (one per file), got "
+		f"{len(wrapper_entries)}. Keys: {[r['function'] for r in leaderboard]}"
+	)
+	# Each entry's total_ms must be 200 (4 actions × 50ms), NOT 800
+	# (which would indicate collapsed aggregation).
+	for entry in wrapper_entries:
+		assert entry["total_ms"] == 200, (
+			f"Each wrapper's per-file total should be 200ms; got "
+			f"{entry['total_ms']} for key {entry['function']}"
+		)
+
+
+def test_repeated_hot_frame_skips_framework_frames():
+	"""Pass-7 regression guard: framework frames (frappe/*, frappe_profiler/*)
+	must NOT appear in the hot-frames leaderboard or generate findings.
+	Repeated Hot Frame is 'optimize this function in your code' — framework
+	wrappers aren't user code and the user can't act on them. Previously
+	the analyzer happily aggregated every 'handle' and 'wrapper' it saw,
+	including deep Frappe internals like frappe.handler.handle.
+	"""
+	# Same function name, 5 actions, 250ms each — would normally fire
+	# BOTH thresholds (>= 3 actions, >= 500ms). But since it's inside
+	# apps/frappe/, the framework-frame filter must suppress it.
+	per_action_trees = []
+	for _ in range(5):
+		per_action_trees.append(_node("<root>", "", 500, [
+			_node("handle", "apps/frappe/handler.py", 250, []),
+		]))
+
+	findings, leaderboard = call_tree._aggregate_hot_frames(per_action_trees)
+
+	# No Repeated Hot Frame finding from the framework frame.
+	repeated = [f for f in findings if f["finding_type"] == "Repeated Hot Frame"]
+	assert repeated == [], (
+		f"framework 'handle' should be suppressed from Repeated Hot "
+		f"Frame findings; got {[f['title'] for f in repeated]}"
+	)
+	# And the leaderboard must not list it either.
+	for row in leaderboard:
+		assert "handle" not in row["function"], (
+			f"framework 'handle' leaked into hot-frames leaderboard: "
+			f"{row}"
+		)
+
+
+def test_repeated_hot_frame_keeps_user_code_finding():
+	"""Companion positive test to the two above: user-code frames are
+	still aggregated correctly and still fire findings.
+	"""
+	per_action_trees = []
+	for _ in range(5):
+		per_action_trees.append(_node("<root>", "", 1000, [
+			_node("compute_taxes", "erpnext/accounts/tax.py", 200, []),
+		]))
+
+	findings, _ = call_tree._aggregate_hot_frames(per_action_trees)
+	repeated = [f for f in findings if f["finding_type"] == "Repeated Hot Frame"]
+	assert len(repeated) == 1
+	# The finding key now includes the filename prefix.
+	assert "compute_taxes" in repeated[0]["title"]
+	assert "tax.py" in repeated[0]["title"] or "accounts/tax" in repeated[0]["title"]
+
+
 def test_hot_frames_leaderboard_top_20_sorted_desc():
 	per_action_trees = []
 	for i in range(25):
