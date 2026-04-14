@@ -184,7 +184,10 @@ def _sweep_old_sessions():
 			"status": ["in", ["Ready", "Failed"]],
 			"started_at": ["<", cutoff],
 		},
-		fields=["name", "safe_report_file", "raw_report_file"],
+		fields=[
+			"name", "title", "is_baseline",
+			"safe_report_file", "raw_report_file", "safe_report_pdf_file",
+		],
 		limit=MAX_DELETIONS_PER_RUN,
 		order_by="started_at asc",
 	)
@@ -192,9 +195,24 @@ def _sweep_old_sessions():
 	deleted = 0
 	for row in old:
 		try:
+			# v0.4.0: clear baseline cache key before deleting if this session
+			# is the active baseline for its label, to prevent dangling pointers.
+			if row.get("is_baseline"):
+				try:
+					from frappe_profiler.api import _baseline_key
+
+					frappe.cache.delete_value(_baseline_key(row.get("title") or ""))
+				except Exception:
+					pass
+
 			# Delete attached report files first so we don't leave
-			# orphaned File docs behind.
-			for file_url in (row.get("safe_report_file"), row.get("raw_report_file")):
+			# orphaned File docs behind. v0.4.0 adds safe_report_pdf_file
+			# to this cleanup.
+			for file_url in (
+				row.get("safe_report_file"),
+				row.get("raw_report_file"),
+				row.get("safe_report_pdf_file"),
+			):
 				if not file_url:
 					continue
 				try:
