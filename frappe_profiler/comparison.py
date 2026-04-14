@@ -84,3 +84,79 @@ def _extract_callsite_key(finding_type: str, technical_detail_json):
 
 	# Unknown finding type — return None
 	return None
+
+
+def _finding_match_key(finding):
+	"""Composite match key: (type, action_ref_str, callsite_key)."""
+	return (
+		finding.get("finding_type"),
+		str(finding.get("action_ref")) if finding.get("action_ref") is not None else None,
+		_extract_callsite_key(
+			finding.get("finding_type"),
+			finding.get("technical_detail_json"),
+		),
+	)
+
+
+def _severity_delta_string(baseline_sev, new_sev):
+	"""Build a 'High → Medium' style delta string, or None if unchanged."""
+	if baseline_sev == new_sev:
+		return None
+	return f"{baseline_sev} → {new_sev}"
+
+
+def match_findings(new_findings: list, baseline_findings: list) -> dict:
+	"""Bucket findings into fixed / new / unchanged.
+
+	Match key: (finding_type, action_ref_str, callsite_key). Two findings
+	are "the same finding" if they share all three.
+
+	Returns:
+	    {
+	        "fixed":     [<finding dicts in baseline, gone in new>],
+	        "new":       [<finding dicts in new, absent in baseline>],
+	        "unchanged": [<finding dicts present in both, with delta fields>],
+	    }
+	Unchanged items are augmented with:
+	  - delta_impact_ms: new.estimated_impact_ms - baseline.estimated_impact_ms
+	  - delta_impact_pct: percentage of baseline (negative = improved)
+	  - delta_severity:   "High → Medium" or None
+	  - baseline:         the baseline finding dict (for reference)
+	"""
+	baseline_by_key = {}
+	for f in (baseline_findings or []):
+		key = _finding_match_key(f)
+		baseline_by_key.setdefault(key, []).append(f)
+
+	fixed = []
+	new = []
+	unchanged = []
+
+	for f in (new_findings or []):
+		key = _finding_match_key(f)
+		bucket = baseline_by_key.get(key, [])
+		if not bucket:
+			new.append(dict(f))
+			continue
+		baseline_finding = bucket.pop(0)
+		new_impact = f.get("estimated_impact_ms") or 0
+		baseline_impact = baseline_finding.get("estimated_impact_ms") or 0
+		delta = new_impact - baseline_impact
+		pct = 0
+		if baseline_impact:
+			pct = round((delta / baseline_impact) * 100)
+		augmented = dict(f)
+		augmented["delta_impact_ms"] = round(delta, 2)
+		augmented["delta_impact_pct"] = pct
+		augmented["delta_severity"] = _severity_delta_string(
+			baseline_finding.get("severity"),
+			f.get("severity"),
+		)
+		augmented["baseline"] = baseline_finding
+		unchanged.append(augmented)
+
+	# Anything left in baseline_by_key was not matched → fixed
+	for remaining in baseline_by_key.values():
+		fixed.extend(dict(f) for f in remaining)
+
+	return {"fixed": fixed, "new": new, "unchanged": unchanged}
