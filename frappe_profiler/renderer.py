@@ -243,6 +243,7 @@ def render(
 		_hot_frames_raw = []
 
 	donut_slices = build_donut_data(_breakdown, mode=mode, allowed_prefixes=allowed_prefixes)
+	donut_svg = build_donut_svg(donut_slices)  # v0.4.0: PDF fallback
 	hot_frames_rows = build_hot_frames_table(
 		_hot_frames_raw, mode=mode, allowed_prefixes=allowed_prefixes,
 	)
@@ -304,6 +305,7 @@ def render(
 		"from_json": _from_json,
 		# v0.4.0 additions
 		"comparison": comparison_data,
+		"donut_svg": donut_svg,
 	}
 
 	return template.render(**context)
@@ -482,6 +484,42 @@ def build_donut_data(breakdown: dict, mode: str, allowed_prefixes: tuple) -> lis
 			slices.append((f"Python ({app})", ms, color))
 
 	return slices
+
+
+def build_donut_svg(slices: list) -> str:
+	"""Render the donut as an inline SVG pie for PDF mode.
+
+	wkhtmltopdf does not handle conic-gradient reliably; this SVG
+	fallback always renders correctly. Each slice becomes a <path>
+	element with a precomputed arc.
+	"""
+	if not slices:
+		return ""
+	import math
+
+	total = sum(s[1] for s in slices) or 1
+	cx, cy, r = 80, 80, 70
+	parts = ['<svg width="160" height="160" xmlns="http://www.w3.org/2000/svg">']
+	angle_start = -math.pi / 2  # start at 12 o'clock
+
+	for label, ms, color in slices:
+		fraction = ms / total
+		angle_end = angle_start + fraction * 2 * math.pi
+		x1 = cx + r * math.cos(angle_start)
+		y1 = cy + r * math.sin(angle_start)
+		x2 = cx + r * math.cos(angle_end)
+		y2 = cy + r * math.sin(angle_end)
+		large_arc = 1 if fraction > 0.5 else 0
+		path = (
+			f'<path d="M {cx} {cy} L {x1:.1f} {y1:.1f} '
+			f'A {r} {r} 0 {large_arc} 1 {x2:.1f} {y2:.1f} Z" '
+			f'fill="{color}" stroke="#fff" stroke-width="1"/>'
+		)
+		parts.append(path)
+		angle_start = angle_end
+
+	parts.append("</svg>")
+	return "".join(parts)
 
 
 def build_hot_frames_table(rows: list, mode: str, allowed_prefixes: tuple) -> list:

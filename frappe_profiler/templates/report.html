@@ -205,6 +205,13 @@
     .container { padding: 12px; }
   }
 
+  /* v0.4.0 — donut: SVG for print, conic-gradient for screen */
+  .svg-donut { display: none; }
+  @media print {
+    .conic-donut { display: none !important; }
+    .svg-donut { display: block !important; }
+  }
+
   /* v0.4.0 — comparison sections */
   .comparison-card { background: #f8fafc; padding: 16px 20px; border-radius: 8px;
                      border-left: 4px solid #2563eb; margin-bottom: 20px; }
@@ -537,13 +544,15 @@
     {% if total_ms > 0 %}
       {% set ns = namespace(offset=0) %}
       <div style="display: flex; gap: 24px; align-items: center; flex-wrap: wrap;">
-        <div style="width: 160px; height: 160px; border-radius: 50%; flex-shrink: 0;
+        <div class="conic-donut" style="width: 160px; height: 160px; border-radius: 50%; flex-shrink: 0;
                     background: conic-gradient(
           {%- for label, ms, color in donut_slices -%}
             {{ color }} {{ ns.offset }}deg {{ ns.offset + (ms / total_ms * 360) }}deg{% if not loop.last %}, {% endif %}
             {%- set ns.offset = ns.offset + (ms / total_ms * 360) -%}
           {%- endfor -%}
           );"></div>
+        {# v0.4.0: SVG fallback for PDF mode (wkhtmltopdf does not handle conic-gradient) #}
+        <div class="svg-donut">{{ donut_svg | safe }}</div>
         <ul style="list-style: none; padding: 0; margin: 0;">
           {% for label, ms, color in donut_slices %}
             <li style="display: flex; align-items: center; gap: 8px; padding: 2px 0;">
