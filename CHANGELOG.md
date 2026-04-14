@@ -8,6 +8,266 @@ versions may contain breaking changes — see migration notes below).
 
 ---
 
+## [0.5.0] — 2026-04-14
+
+The "Is it my code or my server?" release. Closes two competitive gaps
+with other profilers: there's no way to tell *code-slow* from
+*server-slow*, and there's no way to tell *backend-slow* from
+*network-slow* or *page-paint-slow*. v0.5.0 captures the server-side
+resource state at every action boundary and the browser-side transport
+timing for every XHR, joins them to the matching recording, and
+renders them as two new report panels alongside the existing findings.
+Also bundles a scheduler-disabled safety fix that affected v0.4.0 and
+earlier.
+
+### Added
+
+- **Server infrastructure capture** — new `infra_capture.py` module
+  snapshots CPU, worker RSS, system memory, swap, load average, MariaDB
+  thread counts and slow-query counter, Redis ops/sec, and RQ queue
+  depths at the start and end of every recorded action. Balanced tier
+  (14 metrics, ~0.8ms per snapshot). Runs in-line on the request path
+  — no background sampler thread. Every source is wrapped in its own
+  try/except so a broken source degrades to `None` rather than
+  breaking recording.
+- **`infra_pressure` analyzer** — emits four new finding types:
+  - **Resource Contention** — sustained system CPU > 85% across ≥2
+    actions. Severity escalates to High if any sample hits 95% or if
+    >50% of actions are affected. Distinguishes "your own flow is
+    CPU-bound" from "something else on the box is hogging CPU."
+  - **Memory Pressure** — worker RSS grew by > 200MB during the
+    session OR swap > 100MB during any action. High severity if
+    delta > 500MB or swap is active.
+  - **DB Pool Saturation** — `threads_running / threads_connected`
+    > 0.9 across ≥2 actions. Points at gunicorn worker count vs.
+    MariaDB `max_connections` mismatch.
+  - **Background Queue Backlog** — any RQ queue (`default`, `short`,
+    `long`) peaked above 50 during the session. Signals that the
+    flow enqueued work that's waiting behind other jobs.
+- **Browser-side metrics shim** — new `profiler_frontend.js` wraps
+  `window.fetch` and `XMLHttpRequest.prototype.open/send` to capture
+  per-XHR timings (URL, method, duration, status, response size)
+  whenever the server returns an `X-Profiler-Recording-Id` response
+  header. Uses `PerformanceObserver` with `buffered: true` to capture
+  Web Vitals (FCP, LCP, CLS, navigation timing). Wraps WHATWG
+  primitives instead of application-level APIs so instrumentation
+  survives future Frappe upgrades — jQuery `$.ajax` is caught via XHR
+  automatically. This is the approach every production APM library
+  uses (OpenTelemetry JS, Sentry Browser, Datadog RUM).
+- **`X-Profiler-Recording-Id` correlation header** — `after_request`
+  injects the recording UUID as a custom response header AND appends
+  it to `Access-Control-Expose-Headers` so browsers actually surface
+  it to JavaScript. The expose header is load-bearing: without it,
+  `xhr.getResponseHeader("X-Profiler-Recording-Id")` returns `null`
+  even for same-origin requests.
+- **`frappe_profiler.api.submit_frontend_metrics` endpoint** —
+  receives batched XHR + Web Vitals payloads from the browser shim
+  at stop time (via `frappe.call`) or at `beforeunload` (via
+  `navigator.sendBeacon`). Accepts a JSON string payload because
+  sendBeacon sends raw `Blob`, not form-encoded. Validates session
+  ownership so a cross-user write is rejected. Soft caps (1000 XHRs,
+  200 vitals) with tail-preferring truncation so end-of-flow data
+  wins on overflow. Idempotent — multiple submits merge into one
+  Redis blob.
+- **`frontend_timings` analyzer** — joins XHR timings to Profiler
+  Actions by recording UUID, dedupes multi-fire LCP per page (last
+  value before next navigation, matching the Web Vitals library
+  convention), and emits three finding types:
+  - **Slow Frontend Render** — LCP > 2500ms → Medium, > 4000ms → High.
+  - **Network Overhead** — `xhr_duration - backend_duration > 500ms`
+    AND `> backend * 1.5`. The multiplier is the key insight: a 500ms
+    delta is disproportionate on a 1ms backend call but proportional
+    on a 5s one. Only the disproportionate case flags.
+  - **Heavy Response** — single response > 500KB (Low, informational).
+- **Server Resource panel in the report template** — renders the
+  `infra_timeline` + `infra_summary` aggregates from `infra_pressure`
+  as stat cards (CPU avg/peak, RSS delta, load peak, swap peak) and
+  a per-action timeline table (CPU, RSS, load, DB pool ratio, RQ
+  queue depths).
+- **Frontend panel in the report template** — renders the
+  `frontend_xhr_matched`, `frontend_vitals_by_page`, `frontend_orphans`,
+  and `frontend_summary` aggregates from `frontend_timings`. Per-action
+  XHR table with backend/browser/network-delta/status/size columns,
+  Web Vitals table by page (FCP, LCP, CLS, TTFB, DCL), and a
+  collapsed orphans section for diagnostic use (hidden entirely in
+  Safe mode).
+- **`_safe_url` helper in `renderer.py`** — strips docname segments
+  from `/app/<doctype>/<name>/...` paths and redacts PII query string
+  keys (`source_name`, `filters`, `name`, `doctype`, `reference_name`,
+  `parent`, `customer`, `supplier`) to `?`. Method URLs
+  (`/api/method/frappe.client.save`) pass through — method names are
+  code identifiers, not PII. Applied to every URL rendered in the
+  Frontend panel when `mode == "safe"`. Mirrors SQL normalization:
+  full text stored, redacted form emitted.
+- **Seven new `Profiler Finding.finding_type` Select options**:
+  Resource Contention, Memory Pressure, DB Pool Saturation,
+  Background Queue Backlog, Slow Frontend Render, Network Overhead,
+  Heavy Response.
+- **Upgraded `notes` field on Profiler Session** from plain `Text` to
+  `Text Editor` (rich HTML), relabeled as **"Steps to Reproduce /
+  Notes"**. Rendered at the top of the report above findings so any
+  reviewer reads the reproduction context before the technical
+  detail. Also added to the floating widget's Start dialog as an
+  optional Text Editor field so users can document "what I'm about
+  to do" at the moment they start. The existing `notes` field already
+  covered this use case (its description literally said "reproduction
+  steps"); v0.5.0 upgrades it in place rather than adding a duplicate
+  `steps_to_reproduce` field, avoiding DB schema bloat and data
+  migration.
+- **`v5_aggregate_json` field on Profiler Session** — hidden Long
+  Text field that serializes the v0.5.0 `infra_pressure` and
+  `frontend_timings` aggregates as a single JSON dict. Persisted by
+  `_persist` alongside the existing `top_queries_json` and
+  `table_breakdown_json`, read by `renderer.render()`.
+- **`data-session-uuid` attribute on the floating widget DOM element**
+  — set when a session is active, cleared when it ends. Read by
+  `profiler_frontend.js` to tag its flush payloads, keeping the two
+  modules loosely coupled without a shared global.
+- **Test coverage:** 65+ new tests across:
+  - `test_scheduler_inline_fallback.py` — 5 tests
+  - `test_infra_capture.py` — 6 tests (snapshot, diff, force_stop,
+    psutil defensive behavior, getloadavg fallback, idempotency)
+  - `test_correlation_header.py` — 7 tests
+  - `test_submit_frontend_metrics.py` — 7 tests
+  - `test_infra_pressure_analyzer.py` — 10 tests
+  - `test_frontend_timings_analyzer.py` — 11 tests
+  - `test_safe_url.py` — 9 tests
+  - `test_steps_to_reproduce.py` — 5 tests
+  - `test_v5_panels_render.py` — 5 end-to-end panel render tests
+  - `test_end_to_end_metrics.py` — 2 full-chain integration tests
+  - Two new fixture files (`infra_pressure_session.json`,
+    `frontend_metrics_session.json`)
+  - Full suite: **277 tests passing**, zero regressions against v0.4.0.
+
+### Changed
+
+- **Scheduler-aware `_enqueue_analyze` fallback (also fixes a latent
+  v0.4.x bug).** When `bench disable-scheduler` is in effect —
+  common on dev, demo, and Frappe Cloud trial instances — no
+  `bench worker` process consumes the RQ queue on many deployments,
+  so an enqueued analyze job would sit forever and the session would
+  hang in the **"Stopping"** state. v0.5.0 detects
+  `is_scheduler_disabled()` and passes `now=True` to `frappe.enqueue`
+  so analyze runs synchronously inside the stop request. A new
+  `profiler_inline_analyze_limit` site config (default 50) hard-caps
+  the recording count for inline analyze — sessions above the cap
+  are marked Failed with an actionable error directing the user to
+  `bench enable-scheduler` and the **Retry Analyze** button. Prevents
+  gunicorn's 120s worker timeout from killing a 200-recording inline
+  analyze mid-flight.
+- **`api.stop()` response now includes `ran_inline: bool`** — the
+  floating widget reads this to decide whether to transition through
+  the "Analyzing…" state or jump straight to "Ready" (when analyze
+  already completed inline, the report is attached by the time stop
+  returns).
+- **`api.start()` accepts an optional `notes` kwarg** (default `""`)
+  and persists it into the new Profiler Session row. Backward
+  compatible with callers that don't pass notes.
+- **`floating_widget.js:confirmAndStop`** now calls
+  `window.frappe_profiler_frontend.flush()` before firing the stop
+  API so buffered browser metrics land in Redis before analyze runs.
+  Best-effort — a failed flush never blocks stop.
+- **`_stop_session` signature changed** from `(user, session_uuid) -> str | None`
+  to `(user, session_uuid) -> tuple[str | None, bool]`. Callers
+  that discarded the return value still work; the only other
+  internal caller (`start()`'s idempotent restart path) also
+  discards it.
+- **`before_request` / `before_job` / `after_request` / `after_job`
+  hooks** now take an infra snapshot into
+  `frappe.local.profiler_infra_start` at the start of the action and
+  diff it against an end snapshot in the `finally` block, writing
+  the result under `profiler:infra:<recording_uuid>` with the same
+  TTL as other session keys. All work happens inside the existing
+  try/except blocks — a broken snapshot logs and falls through but
+  never breaks the customer's request.
+- **`capture._force_stop_inflight_capture`** is now accompanied by
+  `infra_capture._force_stop_inflight` in both `api.start()` and
+  `api._stop_session()` so leaked state from a previous session on
+  the same worker can't poison the next one.
+- **`session.delete_session_state`** now also removes
+  `profiler:frontend:<session_uuid>`. Per-recording
+  `profiler:infra:<recording_uuid>` keys are cleaned up alongside
+  `RECORDER_REQUEST_HASH` entries when analyze walks the recording
+  list.
+- **`hooks.py:app_include_js`** converted from a string to a list
+  and now includes `profiler_frontend.js` alongside `floating_widget.js`.
+  Both entries carry the version cache-buster.
+- **`analyze.run`** now loads `profiler:frontend:<session_uuid>`
+  into `context.frontend_data` and attaches per-recording infra
+  dicts as `rec["infra"]` before the analyzer loop runs, so
+  `infra_pressure` and `frontend_timings` can read them inline
+  without a Redis hop inside each analyzer. Also appends the two
+  new analyzers to `_BUILTIN_ANALYZERS`. Order is irrelevant — both
+  are independent of every existing analyzer.
+
+### Fixed
+
+- **Widget stop-button race condition** (backported to v0.4.0
+  `handoff-ux` branch as `e620a57`). `confirmAndStop()` set the DOM
+  display to "Stopping…" but left `currentState.display` as
+  `"recording"`, so the 5-second polling guard in `refreshStatus()`
+  — which checks `currentState.display` — never tripped. If polling
+  raced the stop API and the status call returned `active=true`
+  (because the server hadn't processed stop yet), the widget would
+  flip back to "Recording" mid-stop. Also added an `error` callback
+  on the stop `frappe.call` so a failed stop reverts to "Recording"
+  with a red toast instead of stranding the user on "Stopping…"
+  forever.
+
+### Migration notes
+
+Running `bench --site <site> migrate` will:
+
+1. Apply `frappe_profiler.patches.v0_5_0.add_metrics_finding_types`
+   which reloads the Profiler Finding DocType so the seven new
+   `finding_type` Select options become available. Idempotent.
+2. Apply `frappe_profiler.patches.v0_5_0.upgrade_notes_to_text_editor`
+   which reloads the Profiler Session DocType to pick up the
+   upgraded `notes` field (now Text Editor) and the new
+   `v5_aggregate_json` Long Text field. Existing `notes` values
+   carry over unchanged because plain-text content is valid Text
+   Editor input — no data migration needed, only the metadata
+   changes.
+
+No breaking API changes:
+
+- `api.start` accepts a new optional `notes` kwarg with a
+  backward-compatible default (`""`).
+- `api.stop` adds a new `ran_inline` key to its return dict;
+  existing consumers that ignore unknown keys work unchanged.
+- `_stop_session` signature changed internally but is not part of
+  the public API surface.
+
+Existing v0.4.0 sessions render unchanged in v0.5.0 because
+`v5_aggregate_json` is NULL for pre-v0.5.0 rows and the renderer
+skips the Server Resource and Frontend panels when the aggregates
+are empty.
+
+**Known v0.5.0 operational notes:**
+
+- On sites where the scheduler is disabled, the stop API will block
+  for the full analyze duration (typically 2–20s). Widget transitions
+  through "Stopping…" → "Ready" directly (no intermediate "Analyzing…"
+  state) because the report is already attached when stop returns.
+- If `navigator.sendBeacon` is rejected by Frappe v16's CSRF
+  middleware (unverified), the `beforeunload` flush path will fail
+  silently and the user loses their frontend metrics for that
+  session. The server-side recording is unaffected. Mitigation: the
+  stop-time flush path uses `frappe.call` (standard cookie auth)
+  and is the primary delivery path. The beacon is a best-effort
+  hedge for tab-close scenarios.
+- `navigator.sendBeacon` calls made from *other* apps are not
+  captured (beacons can't return response headers, so our shim
+  can't see the `X-Profiler-Recording-Id`).
+
+To disable the new pyinstrument + infra capture for a specific
+session, uncheck **"Capture Python call tree"** in the start
+dialog as before — the v0.3.0 flag continues to gate the heaviest
+capture paths. Infra capture is unconditional because it costs
+~0.8ms per action and runs only while the user's session is active.
+
+---
+
 ## [0.4.0] — 2026-04-14
 
 The "Make it usable" release. Sands down the rough edges between
