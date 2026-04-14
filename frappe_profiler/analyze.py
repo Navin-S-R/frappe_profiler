@@ -36,7 +36,9 @@ from frappe_profiler import renderer, session
 from frappe_profiler.analyzers import (
 	call_tree,
 	explain_flags,
+	frontend_timings,  # v0.5.0
 	index_suggestions,
+	infra_pressure,  # v0.5.0
 	n_plus_one,
 	per_action,
 	redundant_calls,
@@ -73,6 +75,8 @@ _BUILTIN_ANALYZERS = [
 	table_breakdown.analyze,
 	call_tree.analyze,        # v0.3.0 — must run after per_action
 	redundant_calls.analyze,  # v0.3.0 — independent
+	infra_pressure.analyze,   # v0.5.0 — reads rec["infra"]
+	frontend_timings.analyze, # v0.5.0 — reads context.frontend_data
 ]
 
 # Backward-compat alias: the old name is still the public-facing list
@@ -189,6 +193,23 @@ def run(session_uuid: str):
 		meta = session.get_session_meta(session_uuid) or {}
 		if meta.get("cap_warning"):
 			context.warnings.append(meta["cap_warning"])
+
+		# v0.5.0: load the frontend metrics blob posted by profiler_frontend.js
+		# for consumption by the frontend_timings analyzer.
+		context.frontend_data = frappe.cache.get_value(
+			f"profiler:frontend:{session_uuid}"
+		) or {"xhr": [], "vitals": []}
+
+		# v0.5.0: attach per-recording infra dicts from profiler:infra:<uuid>
+		# so infra_pressure.analyze can read them as rec["infra"] without a
+		# Redis hop inside the analyzer.
+		for rec in recordings:
+			rec_uuid = rec.get("uuid")
+			if not rec_uuid:
+				continue
+			infra_blob = frappe.cache.get_value(f"profiler:infra:{rec_uuid}")
+			if infra_blob:
+				rec["infra"] = infra_blob
 
 		_publish_progress(50, "Running analyzers", session_uuid)
 		analyzers = _get_analyzers()
