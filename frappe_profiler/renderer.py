@@ -27,12 +27,76 @@ import json
 import os
 import re
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from frappe_profiler.analyzers.base import SEVERITY_ORDER
 
 _TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+
+
+# ---------------------------------------------------------------------------
+# v0.5.0: URL redaction for Safe Report mode
+# ---------------------------------------------------------------------------
+# Mirrors how SQL normalization works in top_queries.py: full text in Raw,
+# redacted form in Safe, both derived from the same stored blob. Applied
+# to frontend XHR URLs and page paths in the Frontend panel.
+
+_DOCNAME_PATH_RE = re.compile(r"^/app/([^/]+)/([^/?#]+)")
+_QS_REDACT_KEYS = {
+	"source_name",
+	"filters",
+	"name",
+	"doctype",
+	"reference_name",
+	"parent",
+	"customer",
+	"supplier",
+}
+
+
+def _safe_url(url: str | None) -> str:
+	"""Redact PII from a captured URL for Safe Report mode.
+
+	Redaction rules:
+	  /app/<doctype>/<name>/...   ->  /app/<doctype>/<name>/...  (strip docname)
+	  ?source_name=X              ->  ?source_name=?
+	  ?filters=[...]              ->  ?filters=?
+	  ?name=X, ?doctype=X, ...    ->  ?<key>=?   (for _QS_REDACT_KEYS)
+
+	Method URLs (/api/method/frappe.client.save) pass through because
+	method names are code identifiers, not PII — same status as SQL
+	table names after normalization.
+
+	Non-string / None inputs return "" rather than raising.
+	"""
+	if not url:
+		return "" if url != 0 else url  # None / "" → ""
+	if not isinstance(url, str):
+		return ""
+
+	parsed = urlparse(url)
+	path = _DOCNAME_PATH_RE.sub(r"/app/\1/<name>", parsed.path)
+
+	if parsed.query:
+		pairs = parse_qsl(parsed.query, keep_blank_values=True)
+		redacted_pairs = [
+			(key, "?" if key in _QS_REDACT_KEYS else value)
+			for key, value in pairs
+		]
+		query = urlencode(redacted_pairs, doseq=True)
+	else:
+		query = ""
+
+	return urlunparse((
+		parsed.scheme,
+		parsed.netloc,
+		path,
+		parsed.params,
+		query,
+		parsed.fragment,
+	))
 
 # ---------------------------------------------------------------------------
 # Sensitive field redaction (Round 2, fix #1)
