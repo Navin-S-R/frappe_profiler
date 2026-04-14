@@ -170,6 +170,39 @@ function render_download_buttons(frm) {
 			},
 			__("Reports"),
 		);
+
+		// v0.4.0: PDF download via lazy api.download_pdf
+		frm.add_custom_button(
+			__("Download Safe Report (PDF)"),
+			() => {
+				frappe.show_alert({
+					message: __("Generating PDF..."),
+					indicator: "blue",
+				});
+				frappe.call({
+					method: "frappe_profiler.api.download_pdf",
+					args: { session_uuid: frm.doc.session_uuid },
+					callback: (r) => {
+						const data = (r && r.message) || {};
+						if (data.file_url) {
+							window.open(data.file_url, "_blank");
+						} else {
+							frappe.show_alert({
+								message: __("PDF generation failed; download the HTML version instead"),
+								indicator: "red",
+							});
+						}
+					},
+					error: () => {
+						frappe.show_alert({
+							message: __("PDF generation failed"),
+							indicator: "red",
+						});
+					},
+				});
+			},
+			__("Reports"),
+		);
 	}
 
 	// Raw report is gated: only System Manager and the recording user can
