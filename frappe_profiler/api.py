@@ -355,6 +355,131 @@ def mark_onboarding_seen() -> dict:
 	return {"seen": True}
 
 
+# v0.4.0: baseline-pinning cache key prefix.
+BASELINE_CACHE_PREFIX = "profiler:baseline:"
+
+
+def _baseline_key(label: str) -> str:
+	return f"{BASELINE_CACHE_PREFIX}{label}"
+
+
+def _require_session_owner_or_sysmanager(session_uuid: str) -> dict:
+	"""Permission gate shared by all v0.4.0 baseline / pdf endpoints.
+
+	Returns the session row dict on success; throws on failure.
+	"""
+	user = _require_profiler_user()
+	if not session_uuid:
+		frappe.throw("session_uuid is required")
+	row = frappe.db.get_value(
+		"Profiler Session",
+		{"session_uuid": session_uuid},
+		["name", "user", "status", "title"],
+		as_dict=True,
+	)
+	if not row:
+		frappe.throw(f"No Profiler Session found for uuid {session_uuid}")
+	roles = set(frappe.get_roles(user))
+	if (
+		row["user"] != user
+		and "System Manager" not in roles
+		and user != "Administrator"
+	):
+		frappe.throw(
+			"You can only modify your own sessions.", frappe.PermissionError
+		)
+	return row
+
+
+@frappe.whitelist()
+def pin_baseline(session_uuid: str) -> dict:
+	"""Pin this session as the baseline for its label.
+
+	Writes the docname to a site-level cache key
+	`profiler:baseline:<label>`. Clears the is_baseline flag on any
+	previously-pinned session for the same label. Sets is_baseline=1 on
+	the target.
+	"""
+	row = _require_session_owner_or_sysmanager(session_uuid)
+	if row["status"] != "Ready":
+		frappe.throw(f"Cannot pin session in '{row['status']}' state")
+
+	label = row["title"] or ""
+	key = _baseline_key(label)
+
+	# Clear flag on any previously-pinned session for the same label
+	previous = frappe.cache.get_value(key)
+	if previous and previous != row["name"]:
+		try:
+			frappe.db.set_value("Profiler Session", previous, "is_baseline", 0)
+		except Exception:
+			pass
+
+	# Set the new baseline
+	frappe.cache.set_value(key, row["name"])
+	frappe.db.set_value("Profiler Session", row["name"], "is_baseline", 1)
+	frappe.db.commit()
+
+	# Re-render any dependent sessions in the background (best-effort)
+	try:
+		frappe.enqueue(
+			"frappe_profiler.api._rerender_dependents",
+			queue="short",
+			label=label,
+			baseline_docname=row["name"],
+		)
+	except Exception:
+		pass
+
+	return {"pinned": True, "session_uuid": session_uuid, "docname": row["name"]}
+
+
+@frappe.whitelist()
+def unpin_baseline(session_uuid: str) -> dict:
+	"""Clear the baseline flag for this session and remove cache entry if active."""
+	row = _require_session_owner_or_sysmanager(session_uuid)
+
+	label = row["title"] or ""
+	key = _baseline_key(label)
+
+	current = frappe.cache.get_value(key)
+	if current == row["name"]:
+		frappe.cache.delete_value(key)
+	frappe.db.set_value("Profiler Session", row["name"], "is_baseline", 0)
+	frappe.db.commit()
+
+	return {"unpinned": True, "session_uuid": session_uuid}
+
+
+def _rerender_dependents(label: str, baseline_docname: str) -> None:
+	"""Re-render reports for any Ready sessions whose label matches AND whose
+	compared_to_session is NULL or matches the new baseline.
+
+	Background job triggered by pin_baseline. Best-effort.
+	"""
+	try:
+		dependent_names = frappe.get_all(
+			"Profiler Session",
+			filters={"title": label, "status": "Ready"},
+			pluck="name",
+		)
+	except Exception:
+		return
+
+	for name in dependent_names:
+		if name == baseline_docname:
+			continue
+		try:
+			doc = frappe.get_doc("Profiler Session", name)
+			if not doc.compared_to_session:
+				doc.db_set("compared_to_session", baseline_docname, update_modified=False)
+			from frappe_profiler.analyze import _render_and_attach_reports
+
+			_render_and_attach_reports(name, recordings=[])
+		except Exception:
+			frappe.log_error(title=f"frappe_profiler rerender {name}")
+
+
 @frappe.whitelist()
 def export_session(session_uuid: str) -> dict:
 	"""Export a Profiler Session as a structured JSON blob.
