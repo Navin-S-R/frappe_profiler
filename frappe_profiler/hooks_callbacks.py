@@ -99,6 +99,15 @@ def before_request(*args, **kwargs):
 					or _capture.DEFAULT_SAMPLER_INTERVAL_MS
 				),
 			)
+
+		# v0.5.0: snapshot infra metrics at the start of the request.
+		# The matching after_request snapshot diffs against this and
+		# stores the result under profiler:infra:<recording_uuid>.
+		try:
+			from frappe_profiler import infra_capture
+			frappe.local.profiler_infra_start = infra_capture.snapshot()
+		except Exception:
+			frappe.log_error(title="frappe_profiler infra start snapshot")
 	except Exception:
 		# Never let a profiler bug break a customer request. Log and move on.
 		frappe.log_error(title="frappe_profiler before_request")
@@ -145,15 +154,44 @@ def after_request(*args, **kwargs):
 		# v0.3.0: dump pyinstrument session and sidecar log to Redis under
 		# per-recording-UUID keys. Best-effort — failures here log but
 		# never break the request.
-		_dump_capture_state_to_redis(
-			recording_uuid=getattr(
-				getattr(frappe.local, "_recorder", None), "uuid", None
-			)
+		recording_uuid_for_dump = getattr(
+			getattr(frappe.local, "_recorder", None), "uuid", None
 		)
-		# Clear the per-request marker so it doesn't leak across requests
+		_dump_capture_state_to_redis(recording_uuid=recording_uuid_for_dump)
+
+		# v0.5.0: write the infra diff to Redis for this recording.
+		# Consumed by the infra_pressure analyzer at analyze time.
+		try:
+			start_snap = getattr(frappe.local, "profiler_infra_start", None)
+			if start_snap and recording_uuid_for_dump:
+				from frappe_profiler import infra_capture
+				end_snap = infra_capture.snapshot()
+				frappe.cache.set_value(
+					f"profiler:infra:{recording_uuid_for_dump}",
+					infra_capture.diff(start_snap, end_snap),
+					expires_in_sec=session.SESSION_TTL_SECONDS,
+				)
+		except Exception:
+			frappe.log_error(title="frappe_profiler infra end snapshot")
+
+		# v0.5.0: correlation header for profiler_frontend.js. Must set
+		# Access-Control-Expose-Headers or browsers will refuse to surface
+		# the custom header to JavaScript, even for same-origin requests.
+		try:
+			if recording_uuid_for_dump:
+				_inject_correlation_header(recording_uuid_for_dump)
+		except Exception:
+			frappe.log_error(title="frappe_profiler header injection")
+
+		# Clear the per-request markers so they don't leak across requests
 		# (frappe.local is per-request anyway, but explicit is good).
 		if hasattr(frappe.local, "profiler_session_id"):
 			del frappe.local.profiler_session_id
+		if hasattr(frappe.local, "profiler_infra_start"):
+			try:
+				delattr(frappe.local, "profiler_infra_start")
+			except AttributeError:
+				pass
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +285,13 @@ def before_job(method=None, kwargs=None, **rest):
 					or _capture.DEFAULT_SAMPLER_INTERVAL_MS
 				),
 			)
+
+		# v0.5.0: snapshot infra metrics at job start. Mirrors before_request.
+		try:
+			from frappe_profiler import infra_capture
+			frappe.local.profiler_infra_start = infra_capture.snapshot()
+		except Exception:
+			frappe.log_error(title="frappe_profiler infra start snapshot (job)")
 	except Exception:
 		frappe.log_error(title="frappe_profiler before_job")
 
@@ -278,13 +323,34 @@ def after_job(method=None, kwargs=None, result=None, **rest):
 	except Exception:
 		frappe.log_error(title="frappe_profiler after_job")
 	finally:
-		_dump_capture_state_to_redis(
-			recording_uuid=getattr(
-				getattr(frappe.local, "_recorder", None), "uuid", None
-			)
+		recording_uuid_for_dump = getattr(
+			getattr(frappe.local, "_recorder", None), "uuid", None
 		)
+		_dump_capture_state_to_redis(recording_uuid=recording_uuid_for_dump)
+
+		# v0.5.0: write the infra diff to Redis for this job's recording.
+		# No correlation header to inject — background jobs have no HTTP
+		# response, and no browser to correlate with.
+		try:
+			start_snap = getattr(frappe.local, "profiler_infra_start", None)
+			if start_snap and recording_uuid_for_dump:
+				from frappe_profiler import infra_capture
+				end_snap = infra_capture.snapshot()
+				frappe.cache.set_value(
+					f"profiler:infra:{recording_uuid_for_dump}",
+					infra_capture.diff(start_snap, end_snap),
+					expires_in_sec=session.SESSION_TTL_SECONDS,
+				)
+		except Exception:
+			frappe.log_error(title="frappe_profiler infra end snapshot (job)")
+
 		if hasattr(frappe.local, "profiler_session_id"):
 			del frappe.local.profiler_session_id
+		if hasattr(frappe.local, "profiler_infra_start"):
+			try:
+				delattr(frappe.local, "profiler_infra_start")
+			except AttributeError:
+				pass
 
 
 def _dump_capture_state_to_redis(recording_uuid: str | None) -> None:
@@ -357,3 +423,38 @@ def _clear_capture_locals() -> None:
 				delattr(frappe.local, attr)
 			except AttributeError:
 				pass
+
+
+# ---------------------------------------------------------------------------
+# v0.5.0: correlation header for frontend metrics
+# ---------------------------------------------------------------------------
+# The X-Profiler-Recording-Id header is read by the browser-side
+# profiler_frontend.js shim to tie each XHR timing back to a specific
+# server recording. Without the Access-Control-Expose-Headers entry,
+# browsers refuse to surface custom response headers to JavaScript
+# even for same-origin requests — it's the most common frontend
+# instrumentation failure mode.
+
+
+def _inject_correlation_header(recording_uuid: str) -> None:
+	"""Attach X-Profiler-Recording-Id to the outgoing response + expose it
+	via Access-Control-Expose-Headers. Called from after_request during
+	an active profiler session. Idempotent and safe to call in non-HTTP
+	contexts (no-op if frappe.local has no response_headers)."""
+	headers = getattr(frappe.local, "response_headers", None)
+	if headers is None:
+		return
+
+	headers["X-Profiler-Recording-Id"] = recording_uuid
+
+	try:
+		existing = headers.get("Access-Control-Expose-Headers") or ""
+	except Exception:
+		existing = ""
+	if "X-Profiler-Recording-Id" not in existing:
+		merged = (
+			existing + ", X-Profiler-Recording-Id"
+			if existing
+			else "X-Profiler-Recording-Id"
+		)
+		headers["Access-Control-Expose-Headers"] = merged

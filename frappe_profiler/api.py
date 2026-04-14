@@ -87,6 +87,11 @@ def start(label: str = "", capture_python_tree: bool = True) -> dict:
 
 	capture._force_stop_inflight_capture(local_proxy=frappe.local)
 
+	# v0.5.0: mirror for infra capture.
+	from frappe_profiler import infra_capture
+
+	infra_capture._force_stop_inflight(frappe.local)
+
 	# If the user is already recording, gracefully stop the previous one.
 	previous = session.get_active_session_for(user)
 	if previous:
@@ -192,6 +197,12 @@ def _stop_session(user: str, session_uuid: str) -> tuple[str | None, bool]:
 	from frappe_profiler import capture
 
 	capture._force_stop_inflight_capture(local_proxy=frappe.local)
+
+	# v0.5.0: clear any leaked infra start snapshot from a previous
+	# session on the same worker.
+	from frappe_profiler import infra_capture
+
+	infra_capture._force_stop_inflight(frappe.local)
 
 	_clear_active(user)
 	docname = _mark_stopping(user, session_uuid)
