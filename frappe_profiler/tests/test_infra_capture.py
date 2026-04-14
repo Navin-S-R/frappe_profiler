@@ -7,6 +7,77 @@ import sys
 import types
 
 
+def test_redis_source_uses_frappe_cache_directly():
+	"""Regression guard (v0.5.1 architect review): frappe.cache IS a
+	redis.Redis subclass (RedisWrapper), not a wrapper with a .redis
+	child attribute. An earlier version of _read_redis used
+	getattr(frappe.cache, 'redis', None) which silently returned None
+	in production, disabling Redis metrics entirely. The production
+	code must call .info() directly on frappe.cache.
+
+	We check by actually running _read_redis against a stub that
+	rejects the broken access pattern — more robust than source-string
+	matching which can match explanatory comments.
+	"""
+	import frappe
+	from frappe_profiler import infra_capture
+
+	class Tripwire:
+		"""A stand-in for frappe.cache that records info() being called
+		on the root object (good) and fires on .redis access (broken)."""
+		info_called_on_root = False
+
+		def info(self, section=None):
+			Tripwire.info_called_on_root = True
+			return {"instantaneous_ops_per_sec": 99}
+
+		def __getattr__(self, name):
+			if name == "redis":
+				raise AssertionError(
+					"_read_redis must not access frappe.cache.redis — "
+					"frappe.cache IS the redis.Redis instance. Call "
+					"frappe.cache.info() directly."
+				)
+			raise AttributeError(name)
+
+	original_cache = getattr(frappe, "cache", None)
+	try:
+		frappe.cache = Tripwire()
+		out = {"redis_instantaneous_ops_per_sec": None}
+		infra_capture._read_redis(out)
+		assert Tripwire.info_called_on_root, (
+			"_read_redis never called frappe.cache.info() — the metric "
+			"is silently missing from every production snapshot"
+		)
+		assert out["redis_instantaneous_ops_per_sec"] == 99
+	finally:
+		if original_cache is not None:
+			frappe.cache = original_cache
+		elif hasattr(frappe, "cache"):
+			delattr(frappe, "cache")
+
+
+def test_rq_source_uses_frappe_cache_directly():
+	"""Companion guard for _read_rq — it must pass frappe.cache as the
+	rq.Queue connection, not getattr(frappe.cache, 'redis', None) which
+	would pass None and fall through to rq's default connection logic."""
+	import inspect
+	from frappe_profiler import infra_capture
+
+	read_rq_src = inspect.getsource(infra_capture._read_rq)
+	# Strip docstring + comments for a more robust code-only check.
+	code_lines = [
+		ln for ln in read_rq_src.splitlines()
+		if ln.strip() and not ln.strip().startswith("#")
+	]
+	code_only = "\n".join(code_lines)
+
+	# Must pass frappe.cache directly as the connection arg.
+	assert "connection=frappe.cache" in code_only, (
+		"_read_rq must pass frappe.cache as rq.Queue(connection=...)"
+	)
+
+
 def test_snapshot_returns_expected_keys(monkeypatch):
     """snapshot() should return a dict with every Balanced-tier metric key,
     each with a numeric or None value. Missing values (e.g. getloadavg on
@@ -197,12 +268,12 @@ def _install_infra_stubs(monkeypatch, break_psutil=False):
                 return [("max_connections", "151")]
             return []
 
-    class FakeRedisClient:
+    # frappe.cache IS a redis.Redis subclass in production (RedisWrapper),
+    # not a wrapper with a .redis child. The stub mirrors this — info()
+    # is a method directly on the cache instance, not on a child object.
+    class FakeCache:
         def info(self, section=None):
             return {"instantaneous_ops_per_sec": 120}
-
-    class FakeCache:
-        redis = FakeRedisClient()
 
     monkeypatch.setattr(frappe, "db", FakeDB(), raising=False)
     monkeypatch.setattr(frappe, "cache", FakeCache(), raising=False)

@@ -108,7 +108,8 @@ def test_notes_are_bleach_sanitized_before_render():
 	"""XSS regression guard: a notes field containing <script> must NOT
 	produce an executable <script> in the rendered report. This test
 	loads the sanitize function directly (not a full render) because
-	the test environment doesn't have a real Frappe site."""
+	the test environment doesn't have a real Frappe site. MUST call
+	with always_sanitize=True so the JSON/no-tag fast-paths don't bypass."""
 	try:
 		from frappe.utils.html_utils import sanitize_html
 	except Exception:
@@ -120,11 +121,55 @@ def test_notes_are_bleach_sanitized_before_render():
 		return
 
 	malicious = '<p>ok</p><script>alert(1)</script>'
-	cleaned = sanitize_html(malicious)
+	cleaned = sanitize_html(malicious, always_sanitize=True)
 	# Harmless tags preserved:
 	assert "<p>" in cleaned
-	# Script tags removed (bleach strips or escapes):
+	# Script tags removed (nh3/bleach strips or escapes):
 	assert "<script>" not in cleaned
+
+
+def test_json_shaped_xss_payload_is_sanitized():
+	"""Architect-review finding: sanitize_html has a fast-path that
+	skips bleach for input detected as valid JSON. An attacker could
+	set notes = '{"x": "<script>alert(1)</script>"}' — which IS valid
+	JSON (a JSON dict literal with a string value containing the
+	script) — and sanitize_html without always_sanitize=True returns
+	it unchanged. The template's |safe then renders the script as
+	a live <script> tag. always_sanitize=True closes this bypass.
+	"""
+	try:
+		from frappe.utils.html_utils import sanitize_html
+	except Exception:
+		import html as html_mod
+		cleaned = html_mod.escape('{"x": "<script>alert(1)</script>"}')
+		assert "<script>" not in cleaned
+		return
+
+	json_payload = '{"x": "<script>alert(1)</script>"}'
+
+	# Without always_sanitize=True the JSON fast-path would kick in.
+	# With always_sanitize=True the script tag must be neutralized.
+	cleaned = sanitize_html(json_payload, always_sanitize=True)
+	assert "<script>" not in cleaned, (
+		"sanitize_html(always_sanitize=True) must strip script tags "
+		"from JSON-shaped input. If this fails, the renderer's |safe "
+		"render path leaks XSS to anyone viewing a Profiler Session report."
+	)
+
+
+def test_renderer_passes_always_sanitize_true():
+	"""Source-inspection guard: the renderer must pass always_sanitize=True
+	to sanitize_html, or the JSON / no-tag fast-paths will bypass bleach
+	and leak XSS through |safe in the template."""
+	import inspect
+	from frappe_profiler import renderer
+
+	src = inspect.getsource(renderer.render)
+	assert "always_sanitize=True" in src, (
+		"renderer.render must call sanitize_html(..., always_sanitize=True). "
+		"Without it, valid JSON or no-tag input bypasses sanitization "
+		"entirely — stored XSS regression."
+	)
 
 
 def test_renderer_sanitizes_notes_before_template_context():

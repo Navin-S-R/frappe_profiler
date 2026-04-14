@@ -400,17 +400,24 @@ def render(
 	# The field was upgraded from plain Text to Text Editor in v0.5.0,
 	# which means `{{ session.notes | safe }}` would render stored HTML
 	# verbatim — a stored-XSS sink if any existing row has script content
-	# (plain-text before, live HTML after). bleach-sanitize via Frappe's
-	# helper so harmless rich-text (p, ul, li, a, strong, etc.) still
-	# renders while <script>/onclick/javascript: URLs are stripped.
+	# (plain-text before, live HTML after).
+	#
+	# CRITICAL: pass always_sanitize=True. Without it, Frappe's
+	# sanitize_html has TWO fast-paths that skip bleach:
+	#   1. if is_json(html) → returns unchanged  (bypassable with
+	#      notes = '{"x":"<script>alert(1)</script>"}' — valid JSON
+	#      containing a script tag)
+	#   2. if BeautifulSoup.find() returns nothing → returns unchanged
+	# Both paths would leak raw input to |safe in the template.
+	# always_sanitize=True forces nh3/bleach to run on every input.
 	notes_html = getattr(session_doc, "notes", None) or ""
 	if notes_html:
 		try:
 			from frappe.utils.html_utils import sanitize_html
-			notes_html = sanitize_html(notes_html)
+			notes_html = sanitize_html(notes_html, always_sanitize=True)
 		except Exception:
 			# If sanitize_html blows up for any reason (unexpected input
-			# type, bleach internal error), fall back to HTML-escaping
+			# type, nh3/bleach internal error), fall back to HTML-escaping
 			# via html.escape so the report NEVER renders unsanitized
 			# user input — safe by default.
 			import html as html_mod

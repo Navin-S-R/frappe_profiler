@@ -198,10 +198,13 @@ def _read_db(out: dict) -> None:
 
 
 def _read_redis(out: dict) -> None:
-    client = getattr(frappe.cache, "redis", None)
-    if client is None:
-        return
-    info = client.info("stats") or {}
+    # frappe.cache IS a redis.Redis subclass (RedisWrapper at
+    # frappe/utils/redis_wrapper.py:38). There is no `.redis` child
+    # attribute — call info() directly on frappe.cache. An earlier
+    # v0.5.0 version used `getattr(frappe.cache, "redis", None)` which
+    # silently returned None in production (tests masked the bug
+    # because the FakeCache mock matched the broken code exactly).
+    info = frappe.cache.info("stats") or {}
     ops = info.get("instantaneous_ops_per_sec")
     if ops is not None:
         out["redis_instantaneous_ops_per_sec"] = int(ops)
@@ -210,10 +213,11 @@ def _read_redis(out: dict) -> None:
 def _read_rq(out: dict) -> None:
     import rq
 
-    client = getattr(frappe.cache, "redis", None)
+    # frappe.cache is the redis client directly (see _read_redis comment).
+    # rq.Queue accepts a redis.Redis instance as its `connection` arg.
     for name in ("default", "short", "long"):
         try:
-            q = rq.Queue(name, connection=client)
+            q = rq.Queue(name, connection=frappe.cache)
             out[f"rq_queue_{name}"] = int(q.count)
         except Exception:
             out[f"rq_queue_{name}"] = None
