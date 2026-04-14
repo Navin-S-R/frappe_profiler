@@ -84,3 +84,12 @@ scheduler_events = {
 has_permission = {
 	"File": "frappe_profiler.permissions.file_has_permission",
 }
+
+# v0.4.0: doc_events hooks.
+# - User.validate auto-grants Profiler User to any user that has
+#   System Manager. See install.on_user_role_change for the logic.
+doc_events = {
+	"User": {
+		"validate": "frappe_profiler.install.on_user_role_change",
+	},
+}
