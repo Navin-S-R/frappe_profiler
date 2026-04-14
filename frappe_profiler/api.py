@@ -166,9 +166,14 @@ def stop() -> dict:
 	(v0.5.0: scheduler-aware fallback — see ``_enqueue_analyze``).
 
 	Returns:
-	    dict with ``stopped``, ``session_uuid``, ``docname``, and
-	    ``ran_inline``. The widget reads ``ran_inline`` to decide whether
-	    to transition through "Analyzing…" or jump straight to "Ready".
+	    dict with ``stopped``, ``session_uuid``, ``docname``,
+	    ``ran_inline``, and — only when ran_inline is True — the final
+	    ``status`` from the Profiler Session row (``Ready`` or ``Failed``).
+
+	    The widget uses both flags to decide its terminal state:
+	      ran_inline=False          → transition to "Analyzing…"
+	      ran_inline=True, Ready    → transition directly to "Report ready"
+	      ran_inline=True, Failed   → transition to "Analyze failed"
 	"""
 	user = _require_profiler_user()
 	active = session.get_active_session_for(user)
@@ -176,11 +181,27 @@ def stop() -> dict:
 		return {"stopped": False, "reason": "no active session"}
 
 	docname, ran_inline = _stop_session(user, active)
+
+	# v0.5.0: when analyze runs inline, the session is already finalized
+	# by the time we return. Read the actual status so the widget can
+	# transition to the right terminal state — otherwise a failed
+	# inline analyze would show "Report ready" to the user despite the
+	# session being marked Failed server-side.
+	final_status = None
+	if ran_inline and docname:
+		try:
+			final_status = frappe.db.get_value(
+				"Profiler Session", docname, "status"
+			)
+		except Exception:
+			final_status = None
+
 	return {
 		"stopped": True,
 		"session_uuid": active,
 		"docname": docname,
 		"ran_inline": ran_inline,
+		"status": final_status,
 	}
 
 
@@ -302,6 +323,15 @@ def _enqueue_analyze(session_uuid: str) -> bool:
 	to the client via ``ran_inline: True`` so the UI can skip the
 	"Analyzing…" state). Returns False if the job was pushed to the
 	queue as usual.
+
+	Inline execution can fail — analyze.run catches its own exceptions
+	and marks the session as Failed via frappe.db.set_value, then
+	re-raises. We catch the re-raise here so the stop API response
+	isn't a 500 error (which would hit the widget's error callback
+	and show "Failed to stop profiler — try again" — wrong, the
+	stop did work; what failed was analyze). Returning True with the
+	session already marked Failed lets stop() read the final status
+	and transition the widget to a correct terminal state.
 	"""
 	from frappe.utils.scheduler import is_scheduler_disabled
 
@@ -317,14 +347,30 @@ def _enqueue_analyze(session_uuid: str) -> bool:
 			f"inline for session {session_uuid}. Stop API will block "
 			f"until analyze completes."
 		)
+		try:
+			frappe.enqueue(
+				"frappe_profiler.analyze.run",
+				queue="long",
+				session_uuid=session_uuid,
+				now=True,
+			)
+		except Exception:
+			# analyze.run already marked the session Failed and
+			# re-raised. Swallow here so stop() returns 200 — the
+			# caller reads the final status off the doc and reports
+			# it to the widget.
+			frappe.log_error(
+				title=f"frappe_profiler inline analyze {session_uuid}"
+			)
+		return True
 
 	frappe.enqueue(
 		"frappe_profiler.analyze.run",
 		queue="long",
 		session_uuid=session_uuid,
-		now=run_inline,
+		now=False,
 	)
-	return run_inline
+	return False
 
 
 @frappe.whitelist()

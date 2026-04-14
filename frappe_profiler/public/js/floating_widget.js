@@ -396,16 +396,28 @@
 				const data = (r && r.message) || {};
 				if (data.ran_inline) {
 					// v0.5.0: scheduler was disabled and analyze ran
-					// synchronously inside the stop request. Skip the
-					// "Analyzing…" state because the report is already
-					// attached to the session.
+					// synchronously inside the stop request. The session
+					// is already finalized (Ready or Failed) by the time
+					// we get here — branch on data.status so a failed
+					// inline analyze doesn't show "Report ready" to the
+					// user. In both branches we transition to "ready"
+					// state so the user can click the pill and land on
+					// the session form (which shows Ready/Failed clearly).
 					currentState.display = "ready";
 					currentState.docname = data.docname;
-					setDisplay("ready", "Report ready", "click to view");
-					frappe.show_alert({
-						message: __("Profiler report ready"),
-						indicator: "blue",
-					});
+					if (data.status === "Failed") {
+						setDisplay("ready", "Analyze failed", "click to view");
+						frappe.show_alert({
+							message: __("Profiler analyze failed — click the pill to see details"),
+							indicator: "red",
+						});
+					} else {
+						setDisplay("ready", "Report ready", "click to view");
+						frappe.show_alert({
+							message: __("Profiler report ready"),
+							indicator: "blue",
+						});
+					}
 				} else {
 					setDisplay("analyzing", "Analyzing…", "");
 					currentState.display = "analyzing";

@@ -89,6 +89,71 @@ def test_enqueue_analyze_passes_now_when_scheduler_disabled(monkeypatch):
     assert ran_inline is True
 
 
+def test_enqueue_analyze_swallows_inline_failure(monkeypatch):
+	"""Regression guard (v0.5.1 architect review pass 3): when analyze
+	runs inline and raises (analyze.run catches its own exception, marks
+	the session Failed, and re-raises), _enqueue_analyze must catch the
+	re-raise and return True.
+
+	If we let the exception propagate up to stop(), the stop API
+	returns a 500 and the widget shows "Failed to stop profiler —
+	try again" — which is wrong, because the stop DID work; only
+	analyze failed. The session is already marked Failed in the DB.
+	"""
+	import sys
+	import types
+
+	import frappe
+	from frappe_profiler import api as api_mod
+
+	# Stub is_scheduler_disabled → True so we take the inline branch.
+	fake_sched_mod = types.ModuleType("frappe.utils.scheduler")
+	fake_sched_mod.is_scheduler_disabled = lambda: True
+	monkeypatch.setitem(sys.modules, "frappe.utils.scheduler", fake_sched_mod)
+	fake_frappe_utils = types.ModuleType("frappe.utils")
+	fake_frappe_utils.scheduler = fake_sched_mod
+	monkeypatch.setitem(sys.modules, "frappe.utils", fake_frappe_utils)
+
+	# frappe.enqueue(..., now=True) raises, simulating analyze.run's
+	# re-raise after it marked the session Failed.
+	def raising_enqueue(*args, **kwargs):
+		if kwargs.get("now") is True:
+			raise RuntimeError("analyze.run marked session Failed and re-raised")
+		raise AssertionError("should not reach the async path")
+
+	monkeypatch.setattr(frappe, "enqueue", raising_enqueue)
+	monkeypatch.setattr(
+		frappe, "logger",
+		lambda: types.SimpleNamespace(warning=lambda *a, **k: None),
+	)
+	monkeypatch.setattr(
+		frappe, "log_error",
+		lambda *a, **k: None,
+		raising=False,
+	)
+
+	# Must NOT raise — the failure has been absorbed so stop() can
+	# return 200 and report the Failed status to the widget.
+	ran_inline = api_mod._enqueue_analyze("test-uuid-fail")
+	assert ran_inline is True
+
+
+def test_stop_returns_final_status_when_inline(monkeypatch):
+	"""Source-inspection guard: stop() must read the final status off
+	the Profiler Session doc after inline analyze runs, so a failed
+	inline analyze doesn't report Ready to the widget."""
+	import inspect
+	from frappe_profiler import api
+
+	src = inspect.getsource(api.stop)
+	assert "final_status" in src or "\"status\"" in src
+	# Must read the status from the doc via frappe.db.get_value.
+	assert "get_value" in src
+	assert "ran_inline" in src
+	# And the response dict must include "status"
+	assert '"status"' in src
+
+
 def test_stop_session_blocks_huge_inline_analyze(monkeypatch):
     """Behavioral test for the inline-analyze recording cap.
 

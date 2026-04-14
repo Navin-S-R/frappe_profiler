@@ -7,7 +7,7 @@ import sys
 import types
 
 
-def test_redis_source_uses_frappe_cache_directly():
+def test_redis_source_uses_frappe_cache_directly(monkeypatch):
 	"""Regression guard (v0.5.1 architect review): frappe.cache IS a
 	redis.Redis subclass (RedisWrapper), not a wrapper with a .redis
 	child attribute. An earlier version of _read_redis used
@@ -22,13 +22,17 @@ def test_redis_source_uses_frappe_cache_directly():
 	import frappe
 	from frappe_profiler import infra_capture
 
+	# Use instance state (not a class attribute) so parallel or
+	# repeated test runs don't leak state through the class.
 	class Tripwire:
 		"""A stand-in for frappe.cache that records info() being called
 		on the root object (good) and fires on .redis access (broken)."""
-		info_called_on_root = False
+
+		def __init__(self):
+			self.info_called_on_root = False
 
 		def info(self, section=None):
-			Tripwire.info_called_on_root = True
+			self.info_called_on_root = True
 			return {"instantaneous_ops_per_sec": 99}
 
 		def __getattr__(self, name):
@@ -40,21 +44,18 @@ def test_redis_source_uses_frappe_cache_directly():
 				)
 			raise AttributeError(name)
 
-	original_cache = getattr(frappe, "cache", None)
-	try:
-		frappe.cache = Tripwire()
-		out = {"redis_instantaneous_ops_per_sec": None}
-		infra_capture._read_redis(out)
-		assert Tripwire.info_called_on_root, (
-			"_read_redis never called frappe.cache.info() — the metric "
-			"is silently missing from every production snapshot"
-		)
-		assert out["redis_instantaneous_ops_per_sec"] == 99
-	finally:
-		if original_cache is not None:
-			frappe.cache = original_cache
-		elif hasattr(frappe, "cache"):
-			delattr(frappe, "cache")
+	# Use monkeypatch for automatic cleanup even on interpreter
+	# errors or keyboard interrupts mid-test.
+	tripwire = Tripwire()
+	monkeypatch.setattr(frappe, "cache", tripwire, raising=False)
+
+	out = {"redis_instantaneous_ops_per_sec": None}
+	infra_capture._read_redis(out)
+	assert tripwire.info_called_on_root, (
+		"_read_redis never called frappe.cache.info() — the metric "
+		"is silently missing from every production snapshot"
+	)
+	assert out["redis_instantaneous_ops_per_sec"] == 99
 
 
 def test_rq_source_uses_frappe_cache_directly():
