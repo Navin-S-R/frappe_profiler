@@ -190,6 +190,70 @@ After install and migrate, verify in this order:
    every 5 minutes. Check `tabError Log` for any errors with title
    `frappe_profiler janitor*`.
 
+7. **Onboarding toast appears on first Desk visit** (v0.4.0+) — log
+   in as a fresh System Manager who has never used the profiler;
+   verify a green dismissible toast appears in the top-right
+   pointing at the Profiler pill.
+
+8. **Pin as baseline works** (v0.4.0+) — record a session, wait for
+   Ready, click "Pin as baseline" on the form. Verify the button
+   flips to "Unpin baseline" and `is_baseline` is set on the doc.
+
+9. **Comparison sections render** (v0.4.0+) — pin a session as
+   baseline, record a second session with the same title, open the
+   second session's safe report HTML. Verify three new sections
+   appear at the top: "Compared to baseline", "Per-action
+   comparison", and "Findings compared to baseline".
+
+10. **PDF download works** (v0.4.0+) — open any Ready Profiler
+    Session form. Click "Download Safe Report (PDF)". Verify a
+    spinner appears for ~2 seconds on the first click, then the PDF
+    downloads. Click again — verify it downloads instantly (cache hit).
+
+---
+
+## Customer-to-dev-shop handoff (v0.4.0+)
+
+The whole point of the safe report is that you can hand it to any
+software company without leaking PII or requiring them to log in to
+your bench. v0.4.0 makes the handoff a one-button affair:
+
+1. **Record a session** capturing the slow flow you want diagnosed.
+2. Open the resulting Profiler Session in Desk; wait for Status:
+   Ready (usually a few seconds after Stop).
+3. **Click Download Safe Report** — file downloads instantly.
+   Or **Download Safe Report (PDF)** — first click takes ~2 seconds
+   to generate; subsequent clicks are instant from cache.
+4. Email, attach to a ticket, upload to a shared drive, hand on a
+   USB stick — whatever channel suits the recipient.
+5. The recipient opens the file locally on their laptop with no
+   network connection. The report is fully self-contained: no CDN
+   fonts, no external scripts, no `@import`. Print, search, share
+   at will.
+
+### Comparing two recordings (proving the fix worked)
+
+After the dev shop ships a fix:
+
+1. Re-record the same flow on the now-patched system.
+2. Pin the original (slow) session as the baseline:
+   - Open the original session in Desk
+   - Click **Pin as baseline**
+3. The new session auto-renders comparison sections at the top of
+   its safe report:
+   - **Session delta**: total wall time, query count, SQL/Python ms
+     — old vs new with deltas and percentages.
+   - **Per-action comparison**: matched action pairs (by
+     `action_label`, fallback to path) showing before/after stats.
+   - **Findings compared to baseline**: which findings were FIXED,
+     which are NEW (regressions), which are UNCHANGED with delta.
+4. Download the new safe report and hand it to whoever signed off
+   on the fix.
+
+You can also do a one-off comparison without pinning: open any
+Profiler Session form, click **Compare with...**, pick a session
+from the dropdown.
+
 ---
 
 ## Configuration
