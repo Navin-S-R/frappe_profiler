@@ -77,6 +77,72 @@
 		try { startPolling(); } catch (e) { /* noop */ }
 		try { subscribeRealtime(); } catch (e) { /* noop */ }
 		try { subscribeVisibility(); } catch (e) { /* noop */ }
+		try { maybeShowOnboardingToast(); } catch (e) { /* noop */ }
+	}
+
+	function maybeShowOnboardingToast() {
+		// v0.4.0: one-time dismissible toast on first Desk visit after install.
+		// Server decides whether to show (via api.check_onboarding_seen),
+		// which suppresses for experienced users automatically.
+		frappe.call({
+			method: "frappe_profiler.api.check_onboarding_seen",
+			callback: function (r) {
+				var data = (r && r.message) || {};
+				if (data.seen) return;
+				renderOnboardingToast();
+			},
+		});
+	}
+
+	function renderOnboardingToast() {
+		// Avoid double-rendering if init runs twice
+		if (document.getElementById("frappe-profiler-onboarding-toast")) return;
+		var toast = document.createElement("div");
+		toast.id = "frappe-profiler-onboarding-toast";
+		toast.style.cssText = [
+			"position: fixed",
+			"top: 20px",
+			"right: 20px",
+			"z-index: 2147483647",
+			"max-width: 360px",
+			"padding: 14px 18px",
+			"border-radius: 10px",
+			"border: 1px solid #16a34a",
+			"background: #f0fdf4",
+			"color: #166534",
+			"font-family: -apple-system, BlinkMacSystemFont, sans-serif",
+			"font-size: 0.9rem",
+			"line-height: 1.4",
+			"box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18)",
+			"cursor: default",
+		].join("; ");
+		toast.innerHTML = [
+			'<div style="margin-bottom: 8px; font-weight: 700;">Frappe Profiler is installed</div>',
+			'<div style="margin-bottom: 12px;">',
+			"Click the <strong>Profiler</strong> pill in the bottom-right corner ",
+			"to record your first slow flow.",
+			"</div>",
+			'<button id="frappe-profiler-onboarding-dismiss" ',
+			'style="background: #16a34a; color: #fff; border: none; padding: 6px 14px; ',
+			'border-radius: 6px; cursor: pointer; font-weight: 600;">Got it</button>',
+		].join("");
+		document.body.appendChild(toast);
+
+		var dismissed = false;
+		function dismiss() {
+			if (dismissed) return;
+			dismissed = true;
+			try {
+				toast.remove();
+			} catch (e) { /* noop */ }
+			try {
+				frappe.call({ method: "frappe_profiler.api.mark_onboarding_seen" });
+			} catch (e) { /* noop */ }
+		}
+		var btn = document.getElementById("frappe-profiler-onboarding-dismiss");
+		if (btn) btn.addEventListener("click", dismiss);
+		// Auto-dismiss after 15 seconds
+		setTimeout(dismiss, 15000);
 	}
 
 	function startPolling() {
