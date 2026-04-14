@@ -256,6 +256,31 @@ def render(
 		except Exception:
 			return {}
 
+	# v0.4.0: compute comparison data if a baseline is set
+	comparison_data = None
+	baseline_uuid = getattr(session_doc, "compared_to_session", None)
+	if baseline_uuid:
+		try:
+			import frappe
+
+			baseline = frappe.get_doc("Profiler Session", baseline_uuid)
+			if getattr(baseline, "status", None) == "Ready":
+				from frappe_profiler import comparison as _cmp
+
+				comparison_data = _cmp.compute_comparison(
+					new_session=session_doc, baseline_session=baseline,
+				)
+		except Exception:
+			# Baseline deleted, in Failed state, or comparison computation
+			# failed — log and render without comparison sections.
+			try:
+				import frappe
+
+				frappe.log_error(title="frappe_profiler comparison render")
+			except Exception:
+				pass
+			comparison_data = None
+
 	context = {
 		"session": session_doc,
 		"actions": actions,
@@ -277,6 +302,8 @@ def render(
 		"hot_frames_rows": hot_frames_rows,
 		"redact_frame_name": _redact_for_template,
 		"from_json": _from_json,
+		# v0.4.0 additions
+		"comparison": comparison_data,
 	}
 
 	return template.render(**context)
