@@ -21,7 +21,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Type",
-   "options": "N+1 Query\nFull Table Scan\nFilesort\nTemporary Table\nLow Filter Ratio\nMissing Index\nSlow Query\nSlow Hot Path\nHook Bottleneck\nRepeated Hot Frame\nRedundant Call",
+   "options": "N+1 Query\nFull Table Scan\nFilesort\nTemporary Table\nLow Filter Ratio\nMissing Index\nSlow Query\nSlow Hot Path\nHook Bottleneck\nRepeated Hot Frame\nRedundant Call\nResource Contention\nMemory Pressure\nDB Pool Saturation\nBackground Queue Backlog\nSlow Frontend Render\nNetwork Overhead\nHeavy Response",
    "read_only": 1
   },
   {

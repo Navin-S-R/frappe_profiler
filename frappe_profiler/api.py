@@ -62,7 +62,11 @@ def _require_profiler_user() -> str:
 
 
 @frappe.whitelist()
-def start(label: str = "", capture_python_tree: bool = True) -> dict:
+def start(
+	label: str = "",
+	capture_python_tree: bool = True,
+	notes: str = "",
+) -> dict:
 	"""Begin a profiling session for the calling user.
 
 	If the user already has an active session, that session is stopped
@@ -77,6 +81,9 @@ def start(label: str = "", capture_python_tree: bool = True) -> dict:
 	        capture frappe.get_doc / cache.get_value / has_permission
 	        argument identities. When False, only the existing SQL
 	        recorder runs — same overhead profile as v0.2.0.
+	    notes: v0.5.0+. Free-form "steps to reproduce" / context text
+	        rendered at the top of the report. Can also be edited on
+	        the Profiler Session form after the session completes.
 	"""
 	user = _require_profiler_user()
 
@@ -119,6 +126,10 @@ def start(label: str = "", capture_python_tree: bool = True) -> dict:
 	}
 	if auto_baseline:
 		doc_fields["compared_to_session"] = auto_baseline
+	# v0.5.0: persist steps-to-reproduce / notes captured at start time.
+	notes_clean = (notes or "").strip()
+	if notes_clean:
+		doc_fields["notes"] = notes_clean
 	doc = frappe.get_doc(doc_fields).insert(ignore_permissions=True)
 
 	# Store metadata in Redis (used by the analyze pipeline later).

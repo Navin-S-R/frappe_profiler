@@ -316,6 +316,13 @@
 						"Adds ~5–15% overhead but enables hot path detection, hook bottleneck findings, and redundant call detection. Disable for SQL-only capture (v0.2.0 behavior).",
 				},
 				{
+					fieldname: "notes",
+					fieldtype: "Text Editor",
+					label: "Steps to reproduce (optional)",
+					description:
+						"Describe what you're about to do. Renders at the top of the report so reviewers have full context alongside the technical findings. You can also edit this later from the Profiler Session form.",
+				},
+				{
 					fieldname: "warning_html",
 					fieldtype: "HTML",
 					options: `
@@ -335,6 +342,7 @@
 					args: {
 						label: values.label || "",
 						capture_python_tree: values.capture_python_tree ? 1 : 0,
+						notes: values.notes || "",
 					},
 					callback: (r) => {
 						const data = r.message || {};
