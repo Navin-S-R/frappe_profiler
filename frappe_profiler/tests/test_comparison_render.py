@@ -94,3 +94,14 @@ def test_render_baseline_in_failed_state_skips(monkeypatch):
 
 	html = renderer.render_safe(new, recordings=[])
 	assert "Compared to baseline" not in html
+
+
+def test_render_v0_3_0_session_with_no_compared_to_session_field():
+	"""A session predating v0.4.0 won't have compared_to_session set;
+	getattr() returns None and renderer skips comparison."""
+	doc = _fake_doc()
+	# Explicitly remove the field to simulate an old-shape doc
+	if hasattr(doc, "compared_to_session"):
+		del doc.compared_to_session
+	html = renderer.render_safe(doc, recordings=[])
+	assert "Compared to baseline" not in html
