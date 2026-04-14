@@ -145,27 +145,45 @@ def start(label: str = "", capture_python_tree: bool = True) -> dict:
 def stop() -> dict:
 	"""End the calling user's active profiling session.
 
-	Phase 1 behavior: clears the Redis active pointer and marks the
-	DocType row as `Stopping`. The analyze pipeline (Phase 3) will pick
-	up `Stopping` rows, run analyzers, render reports, and transition
-	them to `Ready`.
+	Clears the Redis active pointer, marks the Profiler Session row as
+	``Stopping``, and either enqueues the analyze job or runs it inline
+	(v0.5.0: scheduler-aware fallback — see ``_enqueue_analyze``).
+
+	Returns:
+	    dict with ``stopped``, ``session_uuid``, ``docname``, and
+	    ``ran_inline``. The widget reads ``ran_inline`` to decide whether
+	    to transition through "Analyzing…" or jump straight to "Ready".
 	"""
 	user = _require_profiler_user()
 	active = session.get_active_session_for(user)
 	if not active:
 		return {"stopped": False, "reason": "no active session"}
 
-	docname = _stop_session(user, active)
-	return {"stopped": True, "session_uuid": active, "docname": docname}
+	docname, ran_inline = _stop_session(user, active)
+	return {
+		"stopped": True,
+		"session_uuid": active,
+		"docname": docname,
+		"ran_inline": ran_inline,
+	}
 
 
-def _stop_session(user: str, session_uuid: str) -> str | None:
+def _stop_session(user: str, session_uuid: str) -> tuple[str | None, bool]:
 	"""Internal: clear the active pointer, mark the DocType as Stopping,
-	and enqueue the analyze job.
+	and enqueue (or inline-run) the analyze job.
 
-	Returns the docname of the affected Profiler Session, or None if the
-	row couldn't be found (Redis/MariaDB state drift — e.g. after a
-	Redis flush). Composed from three small helpers for clarity.
+	Returns a tuple ``(docname, ran_inline)``:
+	    docname     — the Profiler Session docname, or None if not found
+	    ran_inline  — True if analyze was executed synchronously
+	                  (scheduler-disabled fallback), False otherwise
+
+	v0.5.0 adds the scheduler-disabled safety cap: when
+	``is_scheduler_disabled()`` is True and the session's recording count
+	exceeds ``profiler_inline_analyze_limit`` (default 50), we refuse to
+	run analyze inline because gunicorn would likely kill the request
+	mid-flight. Instead the session is marked Failed with an actionable
+	error message and the user is directed to re-enable the scheduler
+	and use the Retry Analyze button.
 	"""
 	# v0.3.0: stop any in-flight pyinstrument session and clear capture
 	# state on this worker before flipping the active flag, so a previous
@@ -178,9 +196,41 @@ def _stop_session(user: str, session_uuid: str) -> str | None:
 	_clear_active(user)
 	docname = _mark_stopping(user, session_uuid)
 	if not docname:
-		return None
-	_enqueue_analyze(session_uuid)
-	return docname
+		return None, False
+
+	# v0.5.0: if analyze would have to run inline (scheduler disabled),
+	# refuse large sessions to stay within gunicorn's 120s timeout.
+	from frappe.utils.scheduler import is_scheduler_disabled
+
+	would_run_inline = False
+	try:
+		would_run_inline = bool(is_scheduler_disabled())
+	except Exception:
+		pass
+
+	if would_run_inline:
+		cap = frappe.conf.get("profiler_inline_analyze_limit") or 50
+		count = session.recording_count(session_uuid)
+		if count > cap:
+			frappe.db.set_value(
+				"Profiler Session",
+				docname,
+				{
+					"status": "Failed",
+					"analyze_error": (
+						f"Scheduler is disabled and this session has "
+						f"{count} recordings, exceeding the inline "
+						f"analyze cap of {cap}. Re-enable the scheduler "
+						f"(bench enable-scheduler) and click Retry "
+						f"Analyze on this session's form view."
+					),
+				},
+			)
+			frappe.db.commit()
+			return docname, False
+
+	ran_inline = _enqueue_analyze(session_uuid)
+	return docname, ran_inline
 
 
 def _clear_active(user: str) -> None:
