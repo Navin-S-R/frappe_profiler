@@ -19,11 +19,12 @@ required_apps = ["frappe"]
 
 # NOTE: the ?v=... query string is a cache-buster. Frappe's dev server
 # sends Cache-Control: max-age=43200 (12h) on static assets, so without
-# a versioned URL the browser never re-fetches updated JS. Bump this
-# whenever you change floating_widget.js so users get the new code on
-# their next page load without needing "Empty Cache and Hard Reload".
-app_include_js = "/assets/frappe_profiler/js/floating_widget.js?v=0.3.0-1"
-app_include_css = "/assets/frappe_profiler/css/floating_widget.css?v=0.3.0-1"
+# a versioned URL the browser never re-fetches updated JS. v0.4.0+
+# pulls the version from __version__ so every release auto-busts.
+from frappe_profiler import __version__ as _frappe_profiler_version
+
+app_include_js = f"/assets/frappe_profiler/js/floating_widget.js?v={_frappe_profiler_version}"
+app_include_css = f"/assets/frappe_profiler/css/floating_widget.css?v={_frappe_profiler_version}"
 
 # Installation
 # ------------
