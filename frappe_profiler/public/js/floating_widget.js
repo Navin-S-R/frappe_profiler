@@ -355,18 +355,44 @@
 		// Update currentState.display BEFORE the API call so refreshStatus()'s
 		// transient-state guard (line ~241) kicks in — otherwise the 5s poll
 		// can race the stop API and flip the widget back to "Recording".
+		//
+		// v0.5.0: also flush any buffered frontend metrics before the stop
+		// API fires, so analyze can join them to recordings. Best-effort —
+		// a failed flush never blocks stop.
 		setDisplay("stopping", "Stopping…", "");
 		currentState.display = "stopping";
 		stopElapsedTimer();
+
+		try {
+			if (window.frappe_profiler_frontend && window.frappe_profiler_frontend.flush) {
+				window.frappe_profiler_frontend.flush({ sync: false });
+			}
+		} catch (e) { /* noop — frontend module missing or flush failed */ }
+
 		frappe.call({
 			method: "frappe_profiler.api.stop",
-			callback: () => {
-				setDisplay("analyzing", "Analyzing…", "");
-				currentState.display = "analyzing";
-				frappe.show_alert({
-					message: __("Profiler stopped — analyzing session…"),
-					indicator: "orange",
-				});
+			callback: (r) => {
+				const data = (r && r.message) || {};
+				if (data.ran_inline) {
+					// v0.5.0: scheduler was disabled and analyze ran
+					// synchronously inside the stop request. Skip the
+					// "Analyzing…" state because the report is already
+					// attached to the session.
+					currentState.display = "ready";
+					currentState.docname = data.docname;
+					setDisplay("ready", "Report ready", "click to view");
+					frappe.show_alert({
+						message: __("Profiler report ready"),
+						indicator: "blue",
+					});
+				} else {
+					setDisplay("analyzing", "Analyzing…", "");
+					currentState.display = "analyzing";
+					frappe.show_alert({
+						message: __("Profiler stopped — analyzing session…"),
+						indicator: "orange",
+					});
+				}
 			},
 			error: () => {
 				// Stop failed — recording is still active server-side.
