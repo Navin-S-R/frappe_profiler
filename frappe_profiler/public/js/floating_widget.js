@@ -430,6 +430,7 @@
 		// v0.5.0: also flush any buffered frontend metrics before the stop
 		// API fires, so analyze can join them to recordings. Best-effort —
 		// a failed flush never blocks stop.
+		console.log("[frappe_profiler] confirmAndStop: click received");
 		setDisplay("stopping", "Stopping…", "");
 		currentState.display = "stopping";
 		stopElapsedTimer();
@@ -444,6 +445,32 @@
 			method: "frappe_profiler.api.stop",
 			callback: (r) => {
 				const data = (r && r.message) || {};
+				console.log("[frappe_profiler] stop callback:", data);
+
+				// v0.5.1: handle the "no active session" case explicitly.
+				// Stop API returns {stopped: false, reason: "no active session"}
+				// when the session has already been cleared (auto-stop,
+				// janitor sweep, or a retried click after a network blip
+				// on the first stop). Previously we fell into the else
+				// branch and transitioned to "Analyzing…" — wrong, because
+				// there's nothing analyzing. The widget would hang on
+				// Analyzing… forever because no realtime event would ever
+				// fire for a session that no longer exists server-side.
+				if (data.stopped === false) {
+					currentState.display = "inactive";
+					currentState.active = false;
+					currentState.session_uuid = null;
+					if (widget) {
+						widget.removeAttribute("data-session-uuid");
+					}
+					setDisplay("inactive", "Profiler", "");
+					frappe.show_alert({
+						message: __("No active session — widget reset"),
+						indicator: "gray",
+					});
+					return;
+				}
+
 				if (data.ran_inline) {
 					// v0.5.0: scheduler was disabled and analyze ran
 					// synchronously inside the stop request. The session
@@ -477,16 +504,61 @@
 					});
 				}
 			},
-			error: () => {
-				// Stop failed — recording is still active server-side.
-				// Revert to recording so the user can retry instead of
-				// being stranded on "Stopping…" forever.
-				currentState.display = "recording";
-				setDisplay("recording", "Recording", computeElapsed());
-				startElapsedTimer();
-				frappe.show_alert({
-					message: __("Failed to stop profiler — try again"),
-					indicator: "red",
+			error: (r) => {
+				// Stop failed at the network or server level. Don't
+				// unconditionally revert to Recording — we don't actually
+				// know whether the stop succeeded on the server. It's
+				// possible the session was already cleared (auto-stop,
+				// janitor sweep) and the 'error' is a 400 / 500 we
+				// can't easily distinguish from a real network blip.
+				//
+				// Safer: call status() to ask the server what it thinks.
+				// If active → really revert to Recording. If inactive →
+				// the session is gone; reset the widget to inactive.
+				console.warn("[frappe_profiler] stop error:", r);
+				frappe.call({
+					method: "frappe_profiler.api.status",
+					callback: (sr) => {
+						const sdata = (sr && sr.message) || {};
+						if (sdata.active) {
+							// Session is still live server-side — retry is
+							// meaningful.
+							currentState.display = "recording";
+							setDisplay("recording", "Recording", computeElapsed());
+							startElapsedTimer();
+							frappe.show_alert({
+								message: __("Failed to stop profiler — try again"),
+								indicator: "red",
+							});
+						} else {
+							// Server says the session is gone. Something
+							// stopped it (the stop we just sent, an
+							// auto-stop, or the janitor). Reset widget.
+							currentState.display = "inactive";
+							currentState.active = false;
+							currentState.session_uuid = null;
+							if (widget) {
+								widget.removeAttribute("data-session-uuid");
+							}
+							setDisplay("inactive", "Profiler", "");
+							frappe.show_alert({
+								message: __("Session already stopped"),
+								indicator: "gray",
+							});
+						}
+					},
+					error: () => {
+						// Both stop AND status failed. Network is probably
+						// down. Reset to recording so the user can retry
+						// when the network comes back.
+						currentState.display = "recording";
+						setDisplay("recording", "Recording", computeElapsed());
+						startElapsedTimer();
+						frappe.show_alert({
+							message: __("Network error — please retry"),
+							indicator: "red",
+						});
+					},
 				});
 			},
 		});

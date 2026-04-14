@@ -148,16 +148,78 @@ def test_widget_start_has_error_callback():
 
 def test_widget_stop_has_error_callback():
 	"""Companion to the start-error guard: the Stop call already had an
-	error handler added in an earlier fix. Make sure it stays."""
+	error handler added in an earlier fix. Make sure it stays.
+
+	We look at the entire confirmAndStop function body (finding it
+	from the 'function confirmAndStop' keyword to the closing brace)
+	rather than a fixed-size window after the stop call site — the
+	callback body grew in v0.5.1 to handle the 'no active session'
+	reset path and a couple of console.log diagnostics, and a fixed
+	window was both brittle and too narrow.
+	"""
 	with open(WIDGET_JS) as f:
 		src = f.read()
 
-	stop_call_idx = src.find("frappe_profiler.api.stop")
-	assert stop_call_idx > 0
-	window = src[stop_call_idx : stop_call_idx + 2000]
-	assert "error:" in window, (
+	fn_idx = src.find("function confirmAndStop")
+	assert fn_idx > 0, "widget must define confirmAndStop"
+
+	# Find the end of the function: match the opening brace after the
+	# function name, then walk forward tracking brace balance.
+	open_brace_idx = src.find("{", fn_idx)
+	assert open_brace_idx > 0
+	depth = 0
+	end_idx = None
+	for i in range(open_brace_idx, len(src)):
+		c = src[i]
+		if c == "{":
+			depth += 1
+		elif c == "}":
+			depth -= 1
+			if depth == 0:
+				end_idx = i + 1
+				break
+	assert end_idx is not None, "couldn't find end of confirmAndStop"
+
+	body = src[fn_idx:end_idx]
+	assert "frappe_profiler.api.stop" in body
+	assert "error:" in body, (
 		"confirmAndStop's frappe.call(api.stop) must have an error "
 		"callback so failed stops don't strand the widget in 'Stopping…'"
+	)
+
+
+def test_widget_stop_handles_no_active_session():
+	"""v0.5.1 regression guard: when the stop API returns
+	{stopped: false} (session already gone — auto-stopped, janitor-
+	swept, or a retried click after a network blip on the first
+	stop), the widget must reset to inactive, NOT transition to
+	'Analyzing…' (which would hang forever because no session is
+	actually analyzing).
+	"""
+	with open(WIDGET_JS) as f:
+		src = f.read()
+
+	fn_idx = src.find("function confirmAndStop")
+	open_brace_idx = src.find("{", fn_idx)
+	depth = 0
+	end_idx = None
+	for i in range(open_brace_idx, len(src)):
+		c = src[i]
+		if c == "{":
+			depth += 1
+		elif c == "}":
+			depth -= 1
+			if depth == 0:
+				end_idx = i + 1
+				break
+	body = src[fn_idx:end_idx]
+
+	# Must explicitly check data.stopped === false
+	assert "data.stopped === false" in body, (
+		"confirmAndStop's success callback must handle the "
+		"{stopped: false} response (session already gone) and reset "
+		"to inactive — without this check, the widget falls through "
+		"to the 'Analyzing…' branch and hangs forever"
 	)
 
 
