@@ -104,10 +104,27 @@ def test_force_stop_clears_local_start():
     from frappe_profiler import infra_capture
 
     class FakeLocal:
-        profiler_infra_start = {"sys_cpu_percent": 42}
+        pass
 
     local = FakeLocal()
+    # Set as instance attribute to match how frappe.local (werkzeug Local
+    # proxy) actually stores per-request values.
+    local.profiler_infra_start = {"sys_cpu_percent": 42}
+    assert hasattr(local, "profiler_infra_start")
+
     infra_capture._force_stop_inflight(local)
+    assert not hasattr(local, "profiler_infra_start")
+
+
+def test_force_stop_idempotent():
+    """Calling force_stop when the attribute was never set must not raise."""
+    from frappe_profiler import infra_capture
+
+    class FakeLocal:
+        pass
+
+    local = FakeLocal()
+    infra_capture._force_stop_inflight(local)  # must not raise
     assert not hasattr(local, "profiler_infra_start")
 
 

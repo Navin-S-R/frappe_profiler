@@ -162,6 +162,17 @@ def test_stop_session_blocks_huge_inline_analyze(monkeypatch):
         infra_capture, "_force_stop_inflight", lambda local_proxy: None
     )
 
+    # _mark_stopping internally calls now_datetime() which reads Frappe's
+    # system-timezone setting, a path that needs a real site. Short-circuit
+    # it by returning a fixed docname — we're not testing _mark_stopping
+    # here, only the cap-check branch inside _stop_session.
+    monkeypatch.setattr(
+        api_mod, "_mark_stopping", lambda user, session_uuid: "PS-0001"
+    )
+    monkeypatch.setattr(
+        api_mod, "_clear_active", lambda user: None
+    )
+
     # Spy on _enqueue_analyze to make sure it's NOT called
     enqueue_calls = []
     monkeypatch.setattr(
