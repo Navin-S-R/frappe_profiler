@@ -8,6 +8,430 @@ versions may contain breaking changes — see migration notes below).
 
 ---
 
+## [0.5.1] — 2026-04-15
+
+The "architect review" release. After v0.5.0 landed on the branch, we
+did seven back-to-back architect-review passes over the entire diff
+looking for production bugs, false positives, and bad UX. Each pass
+found 2–3 real issues of a different class — surface bugs, tests
+mirroring broken production code, end-to-end error path regressions,
+HTTP-layer integration gaps, inconsistent helper adoption, and
+schema-field typos. This release bundles all of those fixes plus the
+user-reported widget bugs that surfaced during manual smoke testing
+against a real site. Zero new features — entirely product quality
+and correctness work.
+
+**No DocType schema changes.** No migration needed beyond
+`bench restart` + hard browser refresh.
+
+### Fixed — security
+
+- **Stored XSS bypass via `sanitize_html` JSON fast-path.** The
+  v0.5.0 renderer called Frappe's `sanitize_html` on the `notes`
+  field before passing to the template's `|safe` filter — but
+  without `always_sanitize=True`, sanitize_html has a JSON fast-path
+  that returns the input unchanged when it parses as valid JSON.
+  An attacker could set `notes` to `'{"x":"<script>alert(1)</script>"}'`
+  (a valid JSON string literal containing a script tag) and the
+  fast-path would pass it through, letting the template render a
+  live `<script>` tag to anyone viewing the session. Fixed by
+  passing `always_sanitize=True` so nh3/bleach runs on every input
+  regardless of format detection, with an `html.escape` fallback
+  if sanitize_html itself fails.
+
+- **Safe Report URL redaction switched from allowlist to denylist.**
+  `_safe_url`'s query-string redactor previously used an allowlist
+  of known-PII keys (`source_name`, `filters`, etc.) and passed
+  through everything else. A custom filter key added by a third-party
+  app would silently leak PII in Safe mode. v0.5.1 redacts every
+  query-string value by default and whitelists only schema refs,
+  pagination, sort flags, and format hints (`doctype`, `limit`,
+  `order_by`, `as_dict`, etc.). Unknown keys now redact, which is
+  the safe direction.
+
+- **`_DOCNAME_PATH_RE` now skips Frappe reserved second-segments.**
+  `/app/<doctype>/view/list` used to redact `view` as if it were a
+  docname, producing `/app/sales-invoice/<name>/list`. Cosmetic
+  but semantically wrong. v0.5.1 guards against 13 reserved
+  keywords (`view`, `list`, `new`, `edit`, `report`, `tree`,
+  `dashboard`, `calendar`, `kanban`, `gantt`, `image`, `inbox`,
+  `print`) so only actual docnames get stripped.
+
+- **`_inject_correlation_header` uses tokenwise idempotency check,
+  not substring match.** Previously the `X-Profiler-Recording-Id not
+  in existing` check was a substring compare. If another app had
+  already set `Access-Control-Expose-Headers: X-Profiler-Recording-Id-Legacy`
+  (or similar), the substring match would falsely think our header
+  was already present and skip appending it — silently breaking
+  the entire frontend correlation feature because the browser would
+  refuse to surface the real header to JavaScript. Fixed with a
+  proper comma-split case-insensitive token comparison.
+
+- **Correlation header gated on active profiler session, not just
+  recorder presence.** The `after_request` hook previously injected
+  `X-Profiler-Recording-Id` whenever `frappe.local._recorder` had a
+  `.uuid` — which is true any time the standalone Frappe Recorder UI
+  is running, even for users who have no profiler session. The header
+  was leaking onto every recorded response site-wide, and
+  `profiler_frontend.js` was buffering XHRs tagged to a recording
+  that no session could claim. Now gated on
+  `frappe.local.profiler_session_id` which is only set by our own
+  `before_request` hook.
+
+### Fixed — production bugs that tests were covering for
+
+These bugs shipped with v0.5.0 because my tests mocked the same
+broken pattern the production code used, so the test suite rubber-
+stamped the bugs. v0.5.1 includes new regression guards that would
+have caught each one via behavioral tests instead of source-string
+matching.
+
+- **`infra_capture` tried to access `frappe.cache.redis` as a child
+  attribute.** But `frappe.cache` IS a `redis.Redis` subclass
+  (`RedisWrapper` at `frappe/utils/redis_wrapper.py`), not a wrapper
+  with a `.redis` child. `getattr(frappe.cache, "redis", None)`
+  returned `None` in production, silently disabling Redis ops/sec
+  and all RQ queue depth metrics. Every production snapshot since
+  v0.5.0 landed would have had those keys as None. The `FakeCache`
+  mock mirrored the broken code exactly (`FakeCache.redis = ...`)
+  so the tests passed without exercising the real access pattern.
+  Fixed by calling `frappe.cache.info("stats")` directly and
+  passing `frappe.cache` as the RQ connection. New `Tripwire` test
+  stub raises on `.redis` access and asserts `info()` is called on
+  the root object — behavioral catch instead of string matching.
+
+- **Cap-exceeded failure path wrote to phantom `analyze_error`
+  field.** v0.5.0's inline-analyze safety cap (default 50 recordings)
+  called `frappe.db.set_value("Profiler Session", docname,
+  {"analyze_error": "..."})` — but that field does NOT exist on the
+  doctype. The real field is `analyzer_warnings` (plural). On
+  scheduler-disabled sites with ≥51 recordings, clicking Stop
+  crashed with MariaDB `Unknown column 'analyze_error' in 'field
+  list'`, the stop API returned 500, and the widget stranded the
+  user on Stopping→Analyzing→hang-forever. Fixed by writing to the
+  real field, with a test that explicitly asserts the payload dict
+  contains `analyzer_warnings` AND does NOT contain `analyze_error`.
+
+- **Inline analyze failure path stranded the widget.** `analyze.run`
+  catches its own exceptions, marks the session Failed, and
+  re-raises. When analyze ran inline via `frappe.enqueue(now=True)`,
+  the re-raise propagated all the way up through `_enqueue_analyze`
+  → `_stop_session` → `stop()` → the client. The widget's error
+  callback fired, showed "Failed to stop profiler — try again,"
+  and reset the widget to Recording — but the session was actually
+  Failed server-side. User clicks again, `status()` says no active
+  session, widget falls into "Analyzing…" and hangs forever. Fixed
+  by catching the inline-analyze re-raise in `_enqueue_analyze` and
+  having `stop()` read the final session status from the DocType
+  before returning. The widget now branches on `data.status` when
+  `ran_inline` is true to show "Report ready" or "Analyze failed"
+  correctly.
+
+- **`submit_frontend_metrics` had a GET-merge-SET race.** Two
+  concurrent submits (stop-time `frappe.call` racing a `beforeunload`
+  sendBeacon) could both read the same existing blob, both compute
+  a merged result, and both write — losing one submission's data.
+  v0.5.1 switched to two atomic Redis lists per session
+  (`profiler:frontend:<uuid>:xhr` and `:vitals`) written via RPUSH +
+  LTRIM. Each submit appends its entries atomically; LTRIM enforces
+  the soft cap tail-preferring so the newest entries survive on
+  overflow. A new `_read_frontend_data` helper decodes the lists
+  back into the dict shape `frontend_timings.analyze` expects.
+  Legacy single-blob fallback kept for upgrade safety on sessions
+  captured just before the v0.5.1 upgrade.
+
+- **sendBeacon silently dropped every payload.** The endpoint
+  signature is `submit_frontend_metrics(payload: str)`, which works
+  fine for the stop-time `frappe.call` path (sends `args:{payload: body}`
+  via form encoding). But sendBeacon sends the raw JSON body as
+  `application/json`, and Frappe's request handler parses JSON
+  bodies and flattens their top-level keys into `form_dict` as
+  kwargs. So the server was being called with
+  `submit_frontend_metrics(session_uuid=..., xhr=..., vitals=...)` —
+  mismatching the `payload` signature and failing with `TypeError`
+  deep in the request router, logged into Frappe's internal error
+  log and never reaching our own. Every `beforeunload` beacon was
+  silently failing. Fixed client-side: `profiler_frontend.js` now
+  wraps the beacon body as `JSON.stringify({payload: body})` so
+  Frappe's flattening produces `{"payload": "..."}` which matches
+  the endpoint signature.
+
+### Fixed — false positives in findings
+
+- **Missing Index now verifies the column is actually not indexed.**
+  v0.5.0 trusted `frappe.core.doctype.recorder.recorder._optimize_query`
+  and emitted a finding for whatever column it suggested. But
+  `DBOptimizer` is a heuristic that analyzes WHERE clauses — it
+  does NOT check whether an index already exists. Every Frappe
+  session would likely produce false positives for pre-indexed
+  columns: primary keys (`name`), framework columns (`parent`,
+  `owner`, `modified`, `creation`), and any Link/Data field with
+  `search_index: 1`. v0.5.1 verifies each suggestion against
+  `information_schema` before emitting:
+
+    - `SHOW INDEX FROM <table>` → set of columns that are leftmost
+      of at least one index (composite non-leftmost doesn't count,
+      because btree can't serve queries filtering on just that col)
+    - `information_schema.columns` → per-column data type
+
+  Outcomes:
+    - Column already indexed → suppressed, warning added to report
+    - Column type is JSON / geometry → suppressed (not btree-indexable)
+    - Column type is TEXT / BLOB → kept, but DDL rewritten to include
+      a prefix length: `ADD INDEX \`idx_col\` (\`col\`(255))` — the
+      plain DDL fails on TEXT with "BLOB/TEXT column used in key
+      specification without a key length"
+    - Column doesn't exist on table → suppressed (sql_metadata parse
+      error hallucination guard)
+    - Regular indexable column → kept with the plain DDL, finding
+      now carries `verified_not_indexed: true` in technical_detail
+
+  Per-table caching: one `SHOW INDEX` + one `information_schema`
+  query per distinct table in the suggestions, not one per column.
+
+- **Repeated Hot Frame used bare function name as the dedup key.**
+  User ran v0.5.0 against a real session and reported two findings:
+  `wrapper appeared in 11 actions and consumed 3534ms total` and
+  `handle appeared in 10 actions and consumed 2984ms total`. Both
+  were false positives. The aggregator used `function` alone as the
+  cross-action dedup key, so 35 different functions called `wrapper`
+  (functools decorator, werkzeug wrapper, `frappe.whitelist` wrapper,
+  `RedisWrapper` methods, gunicorn worker wrappers, `cached_property`,
+  etc.) all collapsed into a single `wrapper` bucket. The finding's
+  customer description read *"optimizing it would help every flow
+  that touches it"* — which is useless because there is no single
+  function called `wrapper` the user can optimize; it's a name
+  shared across dozens of unrelated implementations. v0.5.1 fixes
+  by including the filename in the dedup key. Key format is
+  `"short/path.py::function"` where `short` is the last two path
+  segments — readable without leaking absolute paths.
+
+- **Repeated Hot Frame was also suppressing legitimate Frappe
+  application-layer targets.** The first fix of the above used the
+  broad `_is_framework_frame` filter, which skipped ALL of `frappe/*`
+  to remove the framework wrappers. But that's too aggressive:
+  `Document.run_method` runs the user's own doc-event hooks,
+  `has_permission` evaluates user-defined permission rules (including
+  custom Permission Query Conditions), `make_autoname` runs the user's
+  chosen naming series — all legitimate optimization targets inside
+  `frappe/*`. v0.5.1 introduces a narrower `_is_pure_helper_frame`
+  filter that only skips pure plumbing (`frappe/utils/`, `frappe/handler.py`,
+  `frappe/app.py`, werkzeug, gunicorn, rq, pyinstrument itself,
+  pytz, dateutil). Most of `frappe/*` is KEPT so findings remain
+  useful when application-layer Frappe is the actual bottleneck.
+  `_is_framework_frame` is unchanged and still used by SQL-to-Python
+  reconciliation and Slow Hot Path findings, where the aggressive
+  skip is correct.
+
+- **DB Pool Saturation used the wrong ratio.** v0.5.0 computed
+  `threads_running / threads_connected` — which measures *"of the
+  currently open connections, what % are executing queries"* —
+  and fired when that ratio exceeded 0.9. On a dev box with 5
+  connections and 5 of them busy, that's 1.0 → fires the finding,
+  even though MariaDB has 495 pool slots unused. The correct
+  metric is `threads_connected / max_connections`. v0.5.1 reads
+  `max_connections` from `SHOW VARIABLES` (cached at module level
+  since it's a config value) and uses the correct ratio, with a
+  legacy fallback to the old proxy for pre-v0.5.1 infra blobs.
+
+- **`infra_pressure` crashed on non-dict `infra` value.** The
+  guard was `infra = rec.get("infra") or {}; if not infra: continue`
+  — which handles None and empty-dict but not a truthy non-dict
+  (list, string) that could come from corrupt Redis data. Any
+  such value would pass the falsy check and then crash on
+  `infra.get(...)`, killing analyze.run for the entire session.
+  Added `isinstance(infra, dict)` guard.
+
+### Fixed — user-reported widget bugs
+
+- **Widget stuck on "Recording" after clicking Stop.** Two
+  compounding causes:
+
+  1. **Cache buster inertia.** The `app_include_js` cache-buster
+     uses `?v={__version__}`, and `__version__` stayed at `0.5.0`
+     through a lot of JS edits. Browsers that loaded Desk once
+     early in testing served cached JS from that first visit,
+     invisible to every subsequent fix. v0.5.1 bumps to `0.5.1`
+     and adds a hardcoded `WIDGET_BUILD_ID` constant
+     (`2026-04-15-stop-fix-v3`) logged at script load and exposed
+     on the widget element's `title` + `data-build-id` attributes
+     so users can verify from devtools which JS is actually
+     running without guessing. Longer-term, the cache-buster
+     should hash file contents instead of relying on manual
+     version bumps; flagged as a v0.6 followup.
+
+  2. **Stop callback didn't handle `{stopped: false}` response.**
+     When the stop API returns `{stopped: false, reason: "no active
+     session"}` — which happens on auto-stop, janitor sweep, or a
+     retried click after a network blip on the first stop — the
+     callback fell into the else branch and transitioned the
+     widget to "Analyzing…" despite nothing being analyzed
+     server-side. No `profiler_session_ready` realtime event would
+     ever fire, so the widget hung on Analyzing forever. v0.5.1
+     checks `data.stopped === false` explicitly and resets the
+     widget to inactive with a gray toast, clearing
+     `currentState.session_uuid` and removing the
+     `data-session-uuid` DOM attribute.
+
+- **Stop error callback was too naive.** The previous error handler
+  unconditionally reverted the widget to Recording and restarted
+  the elapsed timer. But that's wrong when the stop actually
+  succeeded server-side and the client only got a network error
+  — the widget would show Recording despite the session being
+  gone. v0.5.1 error handler calls `status()` to ask the server
+  what actually happened: if active → revert to Recording, if
+  inactive → reset to inactive with a "Session already stopped"
+  toast, if status() also errors → true network failure with a
+  "Network error" toast.
+
+- **Start dialog silently failed on server error.** The
+  `openStartDialog` `frappe.call(api.start)` had no error callback.
+  Any server-side failure — permission denied, concurrent session
+  conflict, server exception — made `frappe.call` silently skip
+  the success callback and do nothing. Dialog closed, widget
+  stayed inactive, no feedback. v0.5.1 adds an error handler that
+  surfaces a red toast with actionable text, and the success path
+  also surfaces an orange toast if the response came back without
+  a `session_uuid` (unexpected 200).
+
+- **Diagnostic logging added.** `confirmAndStop` now logs at entry,
+  in the success callback (with the full response dict), and in
+  the error callback (with the full error object). Log lines use
+  the `[frappe_profiler]` prefix so they're easy to filter in
+  devtools. Makes future "widget doesn't work" reports debuggable
+  without adding ad-hoc logging after the fact.
+
+### Fixed — inconsistent helper adoption
+
+- **`retry_analyze` now uses `_enqueue_analyze` for the scheduler-
+  aware fallback.** v0.5.0 added the scheduler fallback to
+  `stop()` but left `retry_analyze` calling `frappe.enqueue`
+  directly. On scheduler-disabled sites, clicking **Retry Analyze**
+  on a Failed session would push to a queue no worker consumes,
+  re-hitting the original hung-forever bug the v0.5.0 fallback
+  was designed to fix. v0.5.1 threads `docname` through
+  `_enqueue_analyze` so `retry_analyze` gets the same inline
+  fallback and the same recording-count safety cap that `stop()`
+  gets. Fixes the class of "I added a helper but didn't migrate
+  the siblings" bug.
+
+- **Inline-analyze cap moved from `_stop_session` into
+  `_enqueue_analyze`.** Previously the cap was inline in
+  `_stop_session`, so `retry_analyze` (and, in theory, the janitor
+  auto-stop path) didn't get the protection. v0.5.1 moves the cap
+  check inside `_enqueue_analyze` so every caller gets it
+  uniformly, and consolidates what was a duplicate
+  `is_scheduler_disabled()` call in `_stop_session` + `_enqueue_analyze`
+  into a single call path.
+
+### Fixed — miscellaneous correctness and polish
+
+- **Widget poll-callback race.** The pass-1 fix added a guard at
+  the top of `refreshStatus` to skip polling during `stopping`/
+  `analyzing` states, but only prevented NEW polls from firing.
+  An in-flight poll whose `frappe.call` was already dispatched
+  before the user clicked Stop would have its callback arrive
+  late and overwrite the `stopping` display back to `recording`,
+  clobbering the transition. v0.5.1 repeats the transient-state
+  check INSIDE the status callback: late observations early-
+  return without touching state.
+
+- **`v5_aggregate_json` tail-preferring caps.** On a 200-recording
+  session with rich frontend data, the v0.5.0 aggregate JSON
+  could balloon to 1 MB+, slowing Profiler Session form loads
+  for every viewer. v0.5.1 adds tail-preferring caps in
+  `_persist`: `infra_timeline` at 200, `frontend_xhr_matched` at
+  500, `frontend_orphans` at 100. Truncation surfaces a warning
+  via `analyzer_warnings` so operators can see the drop.
+
+- **`profiler_frontend.js` watchdog is a no-op when inactive.**
+  Previously the 60-second watchdog interval checked
+  `xhrBuffer.length > 200` every tick regardless of session
+  state. v0.5.1 adds an early `if (!currentSessionUuid()) return;`
+  so the inactive path is a single DOM attribute read (~1 µs)
+  per tick. Still O(n) when a session IS active and the buffer
+  is over threshold, but that's the correct behavior.
+
+- **`response_size_bytes` uses TextEncoder for accurate byte
+  count.** The XHR fallback path was using
+  `xhr.responseText.length` which is a UTF-16 code-unit count
+  — undercounts multi-byte characters (emoji, non-ASCII).
+  v0.5.1 uses `new TextEncoder().encode(str).length` with a Blob
+  fallback and a char-count fallback for legacy browsers.
+
+- **Missing wiring test for `analyze.run`.** v0.5.0 integration
+  lacked a regression guard that someone removing
+  `infra_pressure` from `_BUILTIN_ANALYZERS` or dropping the
+  `context.frontend_data` load would be caught. Added
+  `test_analyze_run_v5_wiring.py` with 5 source-inspection
+  guards covering imports, analyzer list membership, context
+  loading, per-recording infra attachment, and `_persist`
+  aggregate serialization.
+
+### Changed
+
+- `__version__` bumped from `0.5.0` to `0.5.1`. Cache-buster
+  rotates; browsers re-fetch `floating_widget.js` and
+  `profiler_frontend.js` on the next Desk load.
+- Widget now exposes a `WIDGET_BUILD_ID` constant, logged to the
+  browser console at script load and set as `title` +
+  `data-build-id` attributes on the widget element so users can
+  confirm which JS is running from devtools.
+- README.md rewritten top-to-bottom. Previously stuck at v0.1.0
+  status with outdated runtime flag docs (`capture_stack`,
+  `explain` — neither exists; real flags are `capture_python_tree`
+  and `notes`). The new README covers all 18 finding types, the
+  full configuration surface, scheduler-disabled operation, a
+  troubleshooting section with every v0.5.1-era failure mode,
+  and an honest comparison matrix against frappe.recorder / New
+  Relic / Scout / Bullet.
+- Custom `_is_pure_helper_frame` helper in `call_tree.py` for
+  Repeated Hot Frame aggregation. Narrower than the pre-existing
+  `_is_framework_frame`. Both helpers are live — the broad
+  filter is used for SQL-to-Python reconciliation and Slow Hot
+  Path findings (where it's correct), the narrow filter is used
+  for hot-frame aggregation (where the broad filter was too
+  aggressive).
+
+### Migration notes
+
+No DocType schema changes. No patches. Running
+`bench --site <site> migrate` is a no-op for v0.5.1 specifically,
+but `bench restart` is REQUIRED so the Python workers reload
+`hooks.py` with the new `__version__` cache-buster — otherwise
+browsers continue serving cached JS and none of the widget /
+frontend_frontend fixes take effect.
+
+**Browser-side**: all active Desk users must hard-refresh
+(Cmd+Shift+R / Ctrl+Shift+R) after `bench restart` to discard
+cached `floating_widget.js` and `profiler_frontend.js`.
+
+**Verification**: after restart + refresh, open devtools →
+Console and look for
+`[frappe_profiler] floating_widget.js LOADED build=2026-04-15-stop-fix-v3`.
+If the build ID is different or the log line is missing, the
+browser is still serving cached JS and more cache invalidation
+is needed.
+
+### Known limitations (unchanged from v0.5.0)
+
+- `navigator.sendBeacon` delivery depends on Frappe v16's CSRF
+  middleware accepting cookie-authenticated POSTs without a
+  custom `X-Frappe-CSRF-Token` header. The SameSite cookie
+  strategy is expected to work, but only the `beforeunload` path
+  is affected — the stop-time `frappe.call` flush (the primary
+  delivery mechanism) is unchanged.
+- Inline analyze pollutes `RECORDER_REQUEST_HASH` with an orphan
+  recording containing analyze's own query activity. Operational
+  noise only; the orphan self-cleans via 10-minute Redis TTL.
+  Flagged as a v0.6 cleanup.
+- The cache-buster pattern (`?v={__version__}`) requires manual
+  version bumps between dev iterations. v0.6 will switch to a
+  content-hash or file-mtime scheme so every JS edit
+  auto-invalidates the browser cache.
+
+---
+
 ## [0.5.0] — 2026-04-14
 
 The "Is it my code or my server?" release. Closes two competitive gaps
