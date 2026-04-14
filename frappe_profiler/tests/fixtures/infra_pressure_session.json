@@ -1,0 +1,64 @@
+{
+  "recordings": [
+    {
+      "uuid": "rec-1",
+      "action_label": "POST /api/method/save",
+      "calls": [],
+      "infra": {
+        "sys_cpu_percent": 92.0,
+        "worker_rss_bytes": 520000000,
+        "sys_mem_available_bytes": 1000000000,
+        "sys_mem_total_bytes": 16000000000,
+        "sys_swap_used_bytes": 0,
+        "sys_load_avg_1min": 4.2,
+        "db_threads_connected": 12,
+        "db_threads_running": 8,
+        "db_slow_queries_total": 2,
+        "redis_instantaneous_ops_per_sec": 340,
+        "rq_queue_default": 4,
+        "rq_queue_short": 0,
+        "rq_queue_long": 2
+      }
+    },
+    {
+      "uuid": "rec-2",
+      "action_label": "POST /api/method/submit",
+      "calls": [],
+      "infra": {
+        "sys_cpu_percent": 88.0,
+        "worker_rss_bytes": 680000000,
+        "sys_mem_available_bytes": 900000000,
+        "sys_mem_total_bytes": 16000000000,
+        "sys_swap_used_bytes": 50000000,
+        "sys_load_avg_1min": 5.1,
+        "db_threads_connected": 15,
+        "db_threads_running": 10,
+        "db_slow_queries_total": 5,
+        "redis_instantaneous_ops_per_sec": 400,
+        "rq_queue_default": 8,
+        "rq_queue_short": 1,
+        "rq_queue_long": 4
+      }
+    },
+    {
+      "uuid": "rec-3",
+      "action_label": "GET /api/method/status",
+      "calls": [],
+      "infra": {
+        "sys_cpu_percent": 35.0,
+        "worker_rss_bytes": 520000000,
+        "sys_mem_available_bytes": 1200000000,
+        "sys_mem_total_bytes": 16000000000,
+        "sys_swap_used_bytes": 0,
+        "sys_load_avg_1min": 2.1,
+        "db_threads_connected": 5,
+        "db_threads_running": 2,
+        "db_slow_queries_total": 0,
+        "redis_instantaneous_ops_per_sec": 120,
+        "rq_queue_default": 0,
+        "rq_queue_short": 0,
+        "rq_queue_long": 0
+      }
+    }
+  ]
+}
