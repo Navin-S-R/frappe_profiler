@@ -8,6 +8,100 @@ versions may contain breaking changes — see migration notes below).
 
 ---
 
+## [0.4.0] — 2026-04-14
+
+The "Make it usable" release. Sands down the rough edges between
+"customer installs the app" and "customer hands a useful report to
+their software company". The product thesis is unchanged; the
+handoff workflow is faster and the report is more actionable.
+
+### Added
+
+- **Session comparison / baseline pinning** — pin any Ready session as
+  the baseline for its label. Subsequent recordings with the same label
+  auto-render three comparison sections in the safe + raw reports:
+  session-level delta, per-action diff, and finding-level diff
+  (fixed / new / unchanged buckets). Lets the dev shop prove "the fix
+  worked" by recording a before/after.
+- **`Pin as baseline` and `Compare with...` buttons** on the Profiler
+  Session form view. Pinning is per-session-label and persists in
+  Redis under `profiler:baseline:<label>`.
+- **Auto-inheritance of baseline** at recording start — `api.start`
+  checks the baseline cache for the label and pre-populates
+  `compared_to_session` on the new session.
+- **`comparison.py` module** — pure-function action and finding
+  matchers, fixture-testable, no Frappe DB access.
+- **PDF export of the safe report** — lazy-generated on first
+  download click via `frappe.utils.pdf.get_pdf` (wkhtmltopdf), cached
+  to a private File attachment on the Profiler Session. Subsequent
+  downloads serve from cache. Generation cost is kept out of the
+  analyze pipeline.
+- **`pdf_export.py` module** — `get_or_generate_pdf` and
+  `clear_cached_pdf` helpers.
+- **PDF download button** on the Profiler Session form (lazy generation
+  with progress alert).
+- **Auto-assign `Profiler User` role to System Managers** on install
+  via `after_install`. Also wires a `User.validate` doc_event so new
+  System Managers automatically get the Profiler User role.
+- **One-time onboarding toast** on first Desk visit after install,
+  pointing the user at the floating Profiler pill. Suppressed for
+  experienced users (anyone with a Ready Profiler Session row).
+  Tracked via `profiler:onboarding_seen:<user>` in Redis.
+- **Version-driven asset cache buster** — `app_include_js` and
+  `app_include_css` now read `?v={__version__}` so every release
+  automatically invalidates browser caches.
+- **6 new whitelisted API endpoints** —
+  `check_onboarding_seen`, `mark_onboarding_seen`, `pin_baseline`,
+  `unpin_baseline`, `set_comparison`, `download_pdf`.
+- **3 new fields on Profiler Session** — `compared_to_session`
+  (Link), `is_baseline` (Check), `safe_report_pdf_file` (Attach).
+- **SVG donut fallback for PDF mode** — wkhtmltopdf doesn't handle
+  `conic-gradient` reliably; the renderer now produces an inline SVG
+  pie chart that's hidden in HTML mode (via `@media print` CSS) and
+  shown in PDF rendering.
+- **Janitor cascade** — `sweep_old_sessions` clears the baseline
+  cache key before deleting a baseline session and cascades the
+  v0.4.0 `safe_report_pdf_file` attachment.
+- **`retry_analyze` clears the cached PDF** so the next download
+  regenerates from the freshly-analyzed report.
+- **Self-contained safe report regression gate** — new test
+  `test_safe_report_self_contained.py` asserts the rendered HTML
+  contains no external URL fetches. Catches accidental introductions
+  of CDN references at CI time.
+
+### Changed
+
+- **No changes to the v0.3.0 capture or analyze pipelines.**
+  `capture.py`, `hooks_callbacks.py`, `analyze.py`, and the analyzer
+  modules are frozen for this release.
+- **`api.start(label, ...)` accepts the same kwargs as v0.3.0** —
+  `capture_python_tree` is unchanged. The new auto-inheritance of
+  `compared_to_session` is transparent to callers.
+- **Renderer adds a comparison computation block** when
+  `compared_to_session` is set on the session being rendered.
+  Backward-compat: sessions with the field unset render exactly as
+  in v0.3.0.
+
+### Migration notes
+
+Running `bench --site <site> migrate` will:
+
+1. Apply patch `frappe_profiler.patches.v0_4_0.add_comparison_and_pdf_fields`
+   which reloads the Profiler Session DocType.
+2. Add 3 new fields to `tabProfiler Session`: `compared_to_session`,
+   `is_baseline`, `safe_report_pdf_file`. All nullable / default 0.
+
+No breaking API changes. v0.3.0 sessions render unchanged in v0.4.0
+because all new fields default to NULL/0 and the renderer skips the
+comparison and PDF paths when fields are unset.
+
+To pin a session as a baseline, open it in the Profiler Session form
+view (Status: Ready) and click **Pin as baseline**. Subsequent
+recordings of the same flow (matching session title) will auto-include
+comparison sections in their safe + raw reports.
+
+---
+
 ## [0.3.0] — 2026-04-13
 
 Adds a Python call tree capture and analysis layer on top of the existing
