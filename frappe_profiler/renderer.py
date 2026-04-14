@@ -44,26 +44,63 @@ _TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templ
 # to frontend XHR URLs and page paths in the Frontend panel.
 
 _DOCNAME_PATH_RE = re.compile(r"^/app/([^/]+)/([^/?#]+)")
-_QS_REDACT_KEYS = {
-	"source_name",
-	"filters",
-	"name",
-	"doctype",
-	"reference_name",
-	"parent",
-	"customer",
-	"supplier",
-}
+
+# Frappe's /app/<doctype>/<second> URL scheme uses reserved second-segment
+# keywords for list/view/new/report/calendar/etc. These aren't docnames
+# and must NOT be replaced with <name> — that would mangle list routes
+# into `/app/sales-invoice/<name>/list` which is semantically wrong.
+# v0.5.1 fix for the false-positive flagged in the architect review.
+_APP_RESERVED_SEGMENTS = frozenset({
+	"view",         # list/report view suffix
+	"new",          # new-doc form
+	"edit",         # edit form (rare)
+	"list",         # direct list route
+	"report",       # report view
+	"tree",         # tree view
+	"dashboard",    # dashboard view
+	"calendar",     # calendar view
+	"kanban",       # kanban board
+	"gantt",        # gantt chart
+	"image",        # image gallery
+	"inbox",        # inbox view
+	"print",        # print format preview
+})
+
+# Query string values are redacted by default in Safe mode (denylist
+# strategy: redact everything that isn't explicitly marked safe). This
+# is the opposite of the old allowlist approach — safer for custom
+# Frappe apps that add their own filter keys, because we never miss
+# a PII leak just because we didn't know about a new key name.
+#
+# Safe keys are schema references, pagination/sort flags, and format
+# hints — values that can't contain customer data.
+_QS_SAFE_KEYS = frozenset({
+	# Schema references (code identifiers, not PII)
+	"doctype", "fieldtype", "fieldname", "parenttype", "parentfield",
+	# Pagination
+	"limit", "offset", "limit_start", "limit_page_length", "start", "page_length",
+	# Sorting
+	"order_by", "sort_by", "sort_order", "sort",
+	# Format hints
+	"as_array", "as_list", "as_dict", "format", "json", "csv",
+	# Extension flags
+	"with_childnames", "with_comment_count", "debug", "ignore_permissions",
+	# Cache behavior
+	"cache", "refresh", "force", "cmd",
+})
 
 
 def _safe_url(url: str | None) -> str:
 	"""Redact PII from a captured URL for Safe Report mode.
 
 	Redaction rules:
-	  /app/<doctype>/<name>/...   ->  /app/<doctype>/<name>/...  (strip docname)
-	  ?source_name=X              ->  ?source_name=?
-	  ?filters=[...]              ->  ?filters=?
-	  ?name=X, ?doctype=X, ...    ->  ?<key>=?   (for _QS_REDACT_KEYS)
+	  /app/<doctype>/<name>/...   ->  /app/<doctype>/<name>/...  (strip docname,
+	                                  unless the second segment is a Frappe
+	                                  reserved keyword like `view`, `list`,
+	                                  `new`, etc. — those are route hints,
+	                                  not docnames).
+	  ?<key>=<value>              ->  ?<key>=?  (for every key NOT in
+	                                  _QS_SAFE_KEYS — denylist strategy).
 
 	Method URLs (/api/method/frappe.client.save) pass through because
 	method names are code identifiers, not PII — same status as SQL
@@ -75,12 +112,19 @@ def _safe_url(url: str | None) -> str:
 		return ""
 
 	parsed = urlparse(url)
-	path = _DOCNAME_PATH_RE.sub(r"/app/\1/<name>", parsed.path)
 
+	# Docname path redaction with reserved-segment guard.
+	m = _DOCNAME_PATH_RE.match(parsed.path)
+	if m and m.group(2) not in _APP_RESERVED_SEGMENTS:
+		path = _DOCNAME_PATH_RE.sub(r"/app/\1/<name>", parsed.path)
+	else:
+		path = parsed.path
+
+	# Query string denylist: redact everything not explicitly safe.
 	if parsed.query:
 		pairs = parse_qsl(parsed.query, keep_blank_values=True)
 		redacted_pairs = [
-			(key, "?" if key in _QS_REDACT_KEYS else value)
+			(key, value if key in _QS_SAFE_KEYS else "?")
 			for key, value in pairs
 		]
 		query = urlencode(redacted_pairs, doseq=True)

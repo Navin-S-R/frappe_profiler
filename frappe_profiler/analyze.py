@@ -194,11 +194,26 @@ def run(session_uuid: str):
 		if meta.get("cap_warning"):
 			context.warnings.append(meta["cap_warning"])
 
-		# v0.5.0: load the frontend metrics blob posted by profiler_frontend.js
-		# for consumption by the frontend_timings analyzer.
-		context.frontend_data = frappe.cache.get_value(
-			f"profiler:frontend:{session_uuid}"
-		) or {"xhr": [], "vitals": []}
+		# v0.5.0: load the frontend metrics posted by profiler_frontend.js
+		# for consumption by the frontend_timings analyzer. Reads from the
+		# two atomic Redis lists written by api.submit_frontend_metrics
+		# (v0.5.1+). Falls back to the pre-v0.5.1 single-blob format if
+		# that's what's in Redis — for upgrade safety on sessions
+		# captured just before the update.
+		try:
+			from frappe_profiler import api as _api
+			context.frontend_data = _api._read_frontend_data(session_uuid)
+			if (
+				not context.frontend_data.get("xhr")
+				and not context.frontend_data.get("vitals")
+			):
+				legacy = frappe.cache.get_value(
+					f"profiler:frontend:{session_uuid}"
+				)
+				if legacy and isinstance(legacy, dict):
+					context.frontend_data = legacy
+		except Exception:
+			context.frontend_data = {"xhr": [], "vitals": []}
 
 		# v0.5.0: attach per-recording infra dicts from profiler:infra:<uuid>
 		# so infra_pressure.analyze can read them as rec["infra"] without a
@@ -654,14 +669,47 @@ def _persist(
 	doc.table_breakdown_json = json.dumps(
 		context.aggregate.get("table_breakdown", []), default=str
 	)
-	# v0.5.0: infra_pressure and frontend_timings aggregates.
+	# v0.5.0: infra_pressure and frontend_timings aggregates. Capped to
+	# prevent unbounded growth on pathological 200-recording sessions —
+	# without caps, v5_aggregate_json could balloon to 1 MB+ and slow
+	# the form load for the Profiler Session record. Truncation is
+	# tail-preferring (keep the last N entries) with a warning surfaced
+	# in analyzer_warnings so operators can see the drop.
+	V5_INFRA_TIMELINE_CAP = 200
+	V5_FRONTEND_XHR_CAP = 500
+	V5_FRONTEND_ORPHANS_CAP = 100
+
+	infra_timeline = context.aggregate.get("infra_timeline", [])
+	if len(infra_timeline) > V5_INFRA_TIMELINE_CAP:
+		context.warnings.append(
+			f"v5_aggregate: infra_timeline truncated from "
+			f"{len(infra_timeline)} to {V5_INFRA_TIMELINE_CAP} entries (tail kept)"
+		)
+		infra_timeline = infra_timeline[-V5_INFRA_TIMELINE_CAP:]
+
+	frontend_xhr = context.aggregate.get("frontend_xhr_matched", [])
+	if len(frontend_xhr) > V5_FRONTEND_XHR_CAP:
+		context.warnings.append(
+			f"v5_aggregate: frontend_xhr_matched truncated from "
+			f"{len(frontend_xhr)} to {V5_FRONTEND_XHR_CAP} entries (tail kept)"
+		)
+		frontend_xhr = frontend_xhr[-V5_FRONTEND_XHR_CAP:]
+
+	frontend_orphans = context.aggregate.get("frontend_orphans", [])
+	if len(frontend_orphans) > V5_FRONTEND_ORPHANS_CAP:
+		context.warnings.append(
+			f"v5_aggregate: frontend_orphans truncated from "
+			f"{len(frontend_orphans)} to {V5_FRONTEND_ORPHANS_CAP} entries"
+		)
+		frontend_orphans = frontend_orphans[-V5_FRONTEND_ORPHANS_CAP:]
+
 	doc.v5_aggregate_json = json.dumps(
 		{
-			"infra_timeline": context.aggregate.get("infra_timeline", []),
+			"infra_timeline": infra_timeline,
 			"infra_summary": context.aggregate.get("infra_summary", {}),
-			"frontend_xhr_matched": context.aggregate.get("frontend_xhr_matched", []),
+			"frontend_xhr_matched": frontend_xhr,
 			"frontend_vitals_by_page": context.aggregate.get("frontend_vitals_by_page", {}),
-			"frontend_orphans": context.aggregate.get("frontend_orphans", []),
+			"frontend_orphans": frontend_orphans,
 			"frontend_summary": context.aggregate.get("frontend_summary", {}),
 		},
 		default=str,

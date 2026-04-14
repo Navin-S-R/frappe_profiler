@@ -93,6 +93,32 @@
 	}
 
 	// -----------------------------------------------------------------
+	// Byte-length helper: counts actual UTF-8 bytes, not JS characters.
+	// responseText.length is a UTF-16 code unit count, which undercounts
+	// multi-byte characters (emoji, non-ASCII text). TextEncoder gives
+	// us the real wire byte count. For large responses this is O(n)
+	// with an allocation — acceptable because it only runs when
+	// Content-Length is missing (the common case on modern servers
+	// already sets the header).
+	// -----------------------------------------------------------------
+	function measureBytes(str) {
+		if (!str) return 0;
+		if (typeof TextEncoder !== "undefined") {
+			try {
+				return new TextEncoder().encode(str).length;
+			} catch (e) { /* fall through */ }
+		}
+		// Legacy browsers without TextEncoder (shouldn't exist in 2026
+		// but defensive): use Blob as a second-choice accurate count.
+		try {
+			return new Blob([str]).size;
+		} catch (e) { /* fall through */ }
+		// Last resort: char count. Undercounts multi-byte chars but
+		// at least doesn't crash.
+		return str.length;
+	}
+
+	// -----------------------------------------------------------------
 	// 2. XMLHttpRequest wrap (catches jQuery $.ajax too)
 	// -----------------------------------------------------------------
 	if (typeof XMLHttpRequest !== "undefined") {
@@ -115,7 +141,10 @@
 					if (!recordingId) return;
 					var size = parseInt(
 						xhr.getResponseHeader("Content-Length") || "0", 10
-					) || (xhr.responseText ? xhr.responseText.length : 0);
+					);
+					if (!size && xhr.responseText) {
+						size = measureBytes(xhr.responseText);
+					}
 					recordXhr({
 						recording_id: recordingId,
 						url: xhr._fp_url || "",
@@ -216,9 +245,18 @@
 		} catch (e) { /* last-ditch — nothing more we can do */ }
 	}
 
+	// Watchdog flush: runs every 60s but ONLY does work when there's an
+	// active session AND the buffer has grown past the threshold. The
+	// no-session early return keeps cost at ~1 microsecond per tick,
+	// which is cheap enough to leave running. We intentionally do NOT
+	// tear down the interval when the session ends, because sessions
+	// can start and stop multiple times on the same page load and
+	// re-creating the interval each time is more code for no benefit.
 	function startWatchdog() {
 		if (watchdogHandle) return;
 		watchdogHandle = setInterval(function () {
+			// Cheap gate: no active session → no work.
+			if (!currentSessionUuid()) return;
 			if (xhrBuffer.length > WATCHDOG_XHR_THRESHOLD) {
 				flush({ sync: false });
 			}

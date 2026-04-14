@@ -363,6 +363,14 @@ SOFT_CAP_FRONTEND_XHR = 1000
 SOFT_CAP_FRONTEND_VITALS = 200
 
 
+def _frontend_xhr_key(session_uuid: str) -> str:
+	return f"profiler:frontend:{session_uuid}:xhr"
+
+
+def _frontend_vitals_key(session_uuid: str) -> str:
+	return f"profiler:frontend:{session_uuid}:vitals"
+
+
 @frappe.whitelist(methods=["POST"])
 def submit_frontend_metrics(payload: str) -> dict:
 	"""Receive a batch of frontend metrics (XHR timings + Web Vitals).
@@ -373,9 +381,19 @@ def submit_frontend_metrics(payload: str) -> dict:
 	parsing doesn't kick in for sendBeacon, so we take a string and
 	parse explicitly.
 
-	Idempotent: multiple submits for the same session merge into one
-	Redis blob so a sendBeacon flush followed by a normal stop-time
-	flush doesn't duplicate data.
+	**Storage: two Redis lists per session, written via atomic RPUSH
+	+ LTRIM.** Earlier versions of this endpoint used a GET-merge-SET
+	pattern over a single JSON dict, which had a read-modify-write race:
+	two concurrent submits (e.g. stop-time frappe.call colliding with a
+	beforeunload beacon) could both read the same existing blob, both
+	compute a merged result, and both write — losing one submission's
+	contents. RPUSH + LTRIM is atomic in Redis, so concurrent submits
+	just append their entries without data loss. LTRIM enforces the
+	soft cap (tail-preferring — newest entries survive).
+
+	Redis keys:
+	  profiler:frontend:<uuid>:xhr     → list of JSON-encoded XHR entries
+	  profiler:frontend:<uuid>:vitals  → list of JSON-encoded Web Vitals entries
 	"""
 	user = _require_profiler_user()
 
@@ -402,32 +420,92 @@ def submit_frontend_metrics(payload: str) -> dict:
 	if not meta or meta.get("user") != user:
 		return {"accepted": False, "reason": "session not found"}
 
-	# Tail-preferring cap on the incoming payload. End-of-flow is where
-	# the slow thing probably happened, so on overflow we keep the most
-	# recent entries, not the oldest.
+	# Client-side tail-preferring cap so a single oversized submit
+	# doesn't push MAX entries through Redis only to have them trimmed.
+	import json as _json
+
 	xhr = (data.get("xhr") or [])[-SOFT_CAP_FRONTEND_XHR:]
 	vitals = (data.get("vitals") or [])[-SOFT_CAP_FRONTEND_VITALS:]
 
-	key = f"profiler:frontend:{session_uuid}"
-	existing = frappe.cache.get_value(key) or {"xhr": [], "vitals": []}
+	xhr_key = _frontend_xhr_key(session_uuid)
+	vitals_key = _frontend_vitals_key(session_uuid)
 
-	merged_xhr = (existing.get("xhr") or []) + xhr
-	merged_vitals = (existing.get("vitals") or []) + vitals
+	# Atomic append: RPUSH + LTRIM. Each entry is JSON-encoded as a
+	# Redis list element. frappe.cache.rpush accepts one value at a
+	# time — we loop, which is O(n) round trips but fine at the
+	# submission sizes we cap at (≤ 1000 XHRs, ≤ 200 vitals per call).
+	if xhr:
+		for entry in xhr:
+			try:
+				frappe.cache.rpush(xhr_key, _json.dumps(entry, default=str))
+			except Exception:
+				frappe.log_error(title="frappe_profiler frontend rpush (xhr)")
+		# Tail-preferring trim: keep the last N entries.
+		try:
+			frappe.cache.ltrim(xhr_key, -SOFT_CAP_FRONTEND_XHR, -1)
+			frappe.cache.expire_key(xhr_key, session.SESSION_TTL_SECONDS)
+		except Exception:
+			frappe.log_error(title="frappe_profiler frontend ltrim (xhr)")
 
-	blob = {
-		"xhr": merged_xhr[-SOFT_CAP_FRONTEND_XHR:],
-		"vitals": merged_vitals[-SOFT_CAP_FRONTEND_VITALS:],
-	}
+	if vitals:
+		for entry in vitals:
+			try:
+				frappe.cache.rpush(vitals_key, _json.dumps(entry, default=str))
+			except Exception:
+				frappe.log_error(title="frappe_profiler frontend rpush (vitals)")
+		try:
+			frappe.cache.ltrim(vitals_key, -SOFT_CAP_FRONTEND_VITALS, -1)
+			frappe.cache.expire_key(vitals_key, session.SESSION_TTL_SECONDS)
+		except Exception:
+			frappe.log_error(title="frappe_profiler frontend ltrim (vitals)")
 
-	frappe.cache.set_value(
-		key,
-		blob,
-		expires_in_sec=session.SESSION_TTL_SECONDS,
-	)
+	# Report the current post-merge sizes so the client can confirm.
+	try:
+		xhr_count = frappe.cache.llen(xhr_key) or 0
+	except Exception:
+		xhr_count = 0
+	try:
+		vitals_count = frappe.cache.llen(vitals_key) or 0
+	except Exception:
+		vitals_count = 0
+
 	return {
 		"accepted": True,
-		"xhr_count": len(blob["xhr"]),
-		"vitals_count": len(blob["vitals"]),
+		"xhr_count": xhr_count,
+		"vitals_count": vitals_count,
+	}
+
+
+def _read_frontend_data(session_uuid: str) -> dict:
+	"""Read the submit_frontend_metrics Redis lists back into a dict
+	with the shape the frontend_timings analyzer expects.
+
+	Decodes each list entry from JSON. Bad entries are silently
+	skipped — the analyzer can handle partial data.
+	"""
+	import json as _json
+
+	xhr_key = _frontend_xhr_key(session_uuid)
+	vitals_key = _frontend_vitals_key(session_uuid)
+
+	def _decode_list(key):
+		try:
+			raw = frappe.cache.lrange(key, 0, -1) or []
+		except Exception:
+			return []
+		out = []
+		for item in raw:
+			if isinstance(item, bytes):
+				item = item.decode("utf-8", errors="replace")
+			try:
+				out.append(_json.loads(item))
+			except Exception:
+				continue
+		return out
+
+	return {
+		"xhr": _decode_list(xhr_key),
+		"vitals": _decode_list(vitals_key),
 	}
 
 
