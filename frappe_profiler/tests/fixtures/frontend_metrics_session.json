@@ -1,0 +1,54 @@
+{
+  "recordings": [
+    {
+      "uuid": "rec-A",
+      "action_label": "POST /api/method/save",
+      "duration_ms": 320
+    },
+    {
+      "uuid": "rec-B",
+      "action_label": "POST /api/method/submit",
+      "duration_ms": 180
+    }
+  ],
+  "frontend_data": {
+    "xhr": [
+      {
+        "recording_id": "rec-A",
+        "url": "/api/method/frappe.client.save",
+        "method": "POST",
+        "duration_ms": 420,
+        "status": 200,
+        "response_size_bytes": 14200,
+        "transport": "xhr",
+        "timestamp": 1700000000000
+      },
+      {
+        "recording_id": "rec-B",
+        "url": "/api/method/erpnext.selling.doctype.sales_invoice.sales_invoice.submit",
+        "method": "POST",
+        "duration_ms": 1900,
+        "status": 200,
+        "response_size_bytes": 512000,
+        "transport": "fetch",
+        "timestamp": 1700000001000
+      },
+      {
+        "recording_id": "rec-ORPHAN",
+        "url": "/api/method/stale",
+        "method": "GET",
+        "duration_ms": 50,
+        "status": 200,
+        "response_size_bytes": 100,
+        "transport": "xhr",
+        "timestamp": 1700000002000
+      }
+    ],
+    "vitals": [
+      {"name": "fcp", "value_ms": 420,  "page_url": "/app/sales-invoice/SI-001", "timestamp": 1700000000000},
+      {"name": "lcp", "value_ms": 1500, "page_url": "/app/sales-invoice/SI-001", "timestamp": 1700000000100},
+      {"name": "lcp", "value_ms": 2800, "page_url": "/app/sales-invoice/SI-001", "timestamp": 1700000000200},
+      {"name": "cls", "value": 0.02,    "page_url": "/app/sales-invoice/SI-001", "timestamp": 1700000000300}
+    ]
+  }
+}

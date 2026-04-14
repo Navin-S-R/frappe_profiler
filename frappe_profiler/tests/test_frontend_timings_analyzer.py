@@ -1,0 +1,179 @@
+# frappe_profiler/tests/test_frontend_timings_analyzer.py
+# Copyright (c) 2026, Frappe Profiler contributors
+
+"""Tests for v0.5.0 frontend_timings analyzer."""
+
+import json
+import os
+
+
+FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
+
+
+def _load_session():
+    with open(os.path.join(FIXTURES_DIR, "frontend_metrics_session.json")) as f:
+        return json.load(f)
+
+
+def _make_context(frontend_data):
+    from frappe_profiler.analyzers.base import AnalyzeContext
+    ctx = AnalyzeContext(session_uuid="test", docname="test")
+    ctx.frontend_data = frontend_data
+    return ctx
+
+
+def test_xhr_join_by_recording_id():
+    from frappe_profiler.analyzers import frontend_timings
+
+    session = _load_session()
+    ctx = _make_context(session["frontend_data"])
+    result = frontend_timings.analyze(session["recordings"], ctx)
+
+    matched = result.aggregate["frontend_xhr_matched"]
+    assert len(matched) == 2
+    ids = [m["action_idx"] for m in matched]
+    assert 0 in ids and 1 in ids
+
+
+def test_orphans_are_separated():
+    from frappe_profiler.analyzers import frontend_timings
+
+    session = _load_session()
+    ctx = _make_context(session["frontend_data"])
+    result = frontend_timings.analyze(session["recordings"], ctx)
+
+    orphans = result.aggregate["frontend_orphans"]
+    assert len(orphans) == 1
+    assert orphans[0]["recording_id"] == "rec-ORPHAN"
+
+
+def test_lcp_dedup_picks_last_per_page():
+    """LCP fires multiple times — analyzer should keep the last value
+    per page_url, matching the Web Vitals library convention."""
+    from frappe_profiler.analyzers import frontend_timings
+
+    session = _load_session()
+    ctx = _make_context(session["frontend_data"])
+    result = frontend_timings.analyze(session["recordings"], ctx)
+
+    by_page = result.aggregate["frontend_vitals_by_page"]
+    assert "/app/sales-invoice/SI-001" in by_page
+    assert by_page["/app/sales-invoice/SI-001"]["lcp_ms"] == 2800
+
+
+def test_slow_frontend_render_fires_on_lcp():
+    from frappe_profiler.analyzers import frontend_timings
+
+    session = _load_session()
+    ctx = _make_context(session["frontend_data"])
+    result = frontend_timings.analyze(session["recordings"], ctx)
+
+    slow = [f for f in result.findings if f["finding_type"] == "Slow Frontend Render"]
+    assert len(slow) == 1
+    assert slow[0]["severity"] == "Medium"  # 2800ms is Medium (2500 < x < 4000)
+
+
+def test_network_overhead_fires_on_disproportion():
+    """rec-B: XHR 1900ms - backend 180ms = 1720ms delta. 1720 > 500 AND
+    1720 > 180 * 1.5 = 270 → fires. Severity: delta > 1000 → Medium."""
+    from frappe_profiler.analyzers import frontend_timings
+
+    session = _load_session()
+    ctx = _make_context(session["frontend_data"])
+    result = frontend_timings.analyze(session["recordings"], ctx)
+
+    overhead = [f for f in result.findings if f["finding_type"] == "Network Overhead"]
+    assert len(overhead) == 1
+    assert overhead[0]["severity"] == "Medium"
+
+
+def test_network_overhead_does_not_fire_on_proportional_delta():
+    """Small proportional overhead must NOT fire. Delta 50ms vs 300ms backend
+    is 16%, NOT a disproportionate overhead pattern."""
+    from frappe_profiler.analyzers import frontend_timings
+
+    recordings = [{"uuid": "r1", "action_label": "a", "duration_ms": 300}]
+    ctx = _make_context({
+        "xhr": [{
+            "recording_id": "r1", "url": "/api/method/foo", "method": "GET",
+            "duration_ms": 350, "status": 200, "response_size_bytes": 0,
+            "transport": "xhr", "timestamp": 0,
+        }],
+        "vitals": [],
+    })
+    result = frontend_timings.analyze(recordings, ctx)
+    overhead = [f for f in result.findings if f["finding_type"] == "Network Overhead"]
+    assert overhead == []
+
+
+def test_heavy_response_flags_large_payloads():
+    from frappe_profiler.analyzers import frontend_timings
+
+    session = _load_session()
+    ctx = _make_context(session["frontend_data"])
+    result = frontend_timings.analyze(session["recordings"], ctx)
+
+    heavy = [f for f in result.findings if f["finding_type"] == "Heavy Response"]
+    # rec-B response_size 512000 > 500000 threshold → fires.
+    assert len(heavy) == 1
+    assert heavy[0]["severity"] == "Low"
+
+
+def test_negative_network_delta_clamps_to_zero():
+    """Clock skew between browser and server can produce a negative
+    delta. Clamp to 0 so we don't emit misleading findings."""
+    from frappe_profiler.analyzers import frontend_timings
+
+    recordings = [{"uuid": "r1", "action_label": "a", "duration_ms": 500}]
+    ctx = _make_context({
+        "xhr": [{
+            "recording_id": "r1",
+            "url": "/api/method/foo",
+            "method": "GET",
+            "duration_ms": 300,  # browser says 300ms, backend says 500ms
+            "status": 200,
+            "response_size_bytes": 0,
+            "transport": "xhr",
+            "timestamp": 0,
+        }],
+        "vitals": [],
+    })
+    result = frontend_timings.analyze(recordings, ctx)
+    matched = result.aggregate["frontend_xhr_matched"]
+    assert matched[0]["network_delta_ms"] == 0
+
+
+def test_empty_frontend_data_is_safe():
+    from frappe_profiler.analyzers import frontend_timings
+
+    ctx = _make_context({"xhr": [], "vitals": []})
+    result = frontend_timings.analyze([], ctx)
+    assert result.findings == []
+    assert result.aggregate["frontend_xhr_matched"] == []
+    assert result.aggregate["frontend_vitals_by_page"] == {}
+
+
+def test_missing_frontend_data_attribute_is_safe():
+    """If analyze.run forgot to set context.frontend_data, don't crash."""
+    from frappe_profiler.analyzers import frontend_timings
+    from frappe_profiler.analyzers.base import AnalyzeContext
+
+    ctx = AnalyzeContext(session_uuid="test", docname="test")
+    # Deliberately do not set ctx.frontend_data.
+    result = frontend_timings.analyze([], ctx)
+    assert result.findings == []
+
+
+def test_lcp_below_threshold_does_not_fire():
+    from frappe_profiler.analyzers import frontend_timings
+
+    recordings = [{"uuid": "r1", "action_label": "a", "duration_ms": 100}]
+    ctx = _make_context({
+        "xhr": [],
+        "vitals": [
+            {"name": "lcp", "value_ms": 1800, "page_url": "/app", "timestamp": 0},
+        ],
+    })
+    result = frontend_timings.analyze(recordings, ctx)
+    slow = [f for f in result.findings if f["finding_type"] == "Slow Frontend Render"]
+    assert slow == []
