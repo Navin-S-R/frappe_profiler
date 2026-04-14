@@ -15,8 +15,97 @@ frappe.ui.form.on("Profiler Session", {
 		render_retry_button(frm);
 		render_findings_summary(frm);
 		render_analyzer_warnings(frm);
+		render_baseline_buttons(frm);
+		render_no_baseline_banner(frm);
 	},
 });
+
+// v0.4.0: Pin / Unpin / Compare baseline buttons
+function render_baseline_buttons(frm) {
+	if (frm.is_new()) return;
+	if (frm.doc.status !== "Ready") return;
+
+	if (frm.doc.is_baseline) {
+		frm.add_custom_button(__("Unpin baseline"), function () {
+			frappe.call({
+				method: "frappe_profiler.api.unpin_baseline",
+				args: { session_uuid: frm.doc.session_uuid },
+				callback: function () {
+					frappe.show_alert({
+						message: __("Baseline unpinned"),
+						indicator: "blue",
+					});
+					frm.reload_doc();
+				},
+			});
+		});
+	} else {
+		frm.add_custom_button(__("Pin as baseline"), function () {
+			frappe.call({
+				method: "frappe_profiler.api.pin_baseline",
+				args: { session_uuid: frm.doc.session_uuid },
+				callback: function () {
+					frappe.show_alert({
+						message: __("Pinned as baseline"),
+						indicator: "green",
+					});
+					frm.reload_doc();
+				},
+			});
+		});
+	}
+
+	frm.add_custom_button(__("Compare with..."), function () {
+		var d = new frappe.ui.Dialog({
+			title: __("Compare with another Profiler Session"),
+			fields: [
+				{
+					fieldname: "target",
+					fieldtype: "Link",
+					label: "Profiler Session",
+					options: "Profiler Session",
+					reqd: 1,
+					get_query: function () {
+						return { filters: { status: "Ready" } };
+					},
+				},
+			],
+			primary_action_label: __("Compare"),
+			primary_action: function (values) {
+				d.hide();
+				frappe.call({
+					method: "frappe_profiler.api.set_comparison",
+					args: {
+						session_uuid: frm.doc.session_uuid,
+						compared_to: values.target,
+					},
+					callback: function () {
+						frappe.show_alert({
+							message: __("Comparison set; reloading report"),
+							indicator: "green",
+						});
+						frm.reload_doc();
+					},
+				});
+			},
+		});
+		d.show();
+	});
+}
+
+function render_no_baseline_banner(frm) {
+	// Only show if Ready, no baseline set, and not itself a baseline
+	if (frm.is_new()) return;
+	if (frm.doc.status !== "Ready") return;
+	if (frm.doc.compared_to_session) return;
+	if (frm.doc.is_baseline) return;
+	// Don't override an existing analyzer_warnings intro
+	if (frm.doc.analyzer_warnings) return;
+	frm.set_intro(
+		__("No baseline set. Pin this session to compare future runs, or click 'Compare with...' to pick one now."),
+		"blue",
+	);
+}
 
 function render_retry_button(frm) {
 	if (frm.is_new()) return;
