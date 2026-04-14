@@ -96,17 +96,25 @@ def start(label: str = "", capture_python_tree: bool = True) -> dict:
 	now = now_datetime()
 	title = (label or "").strip() or f"Profiling session @ {now.strftime('%Y-%m-%d %H:%M:%S')}"
 
+	# v0.4.0: auto-inherit baseline if one is pinned for this label
+	auto_baseline = None
+	try:
+		auto_baseline = frappe.cache.get_value(_baseline_key(title))
+	except Exception:
+		pass
+
 	# Create the DocType row in Recording state.
-	doc = frappe.get_doc(
-		{
-			"doctype": "Profiler Session",
-			"session_uuid": session_uuid,
-			"title": title,
-			"user": user,
-			"status": "Recording",
-			"started_at": now,
-		}
-	).insert(ignore_permissions=True)
+	doc_fields = {
+		"doctype": "Profiler Session",
+		"session_uuid": session_uuid,
+		"title": title,
+		"user": user,
+		"status": "Recording",
+		"started_at": now,
+	}
+	if auto_baseline:
+		doc_fields["compared_to_session"] = auto_baseline
+	doc = frappe.get_doc(doc_fields).insert(ignore_permissions=True)
 
 	# Store metadata in Redis (used by the analyze pipeline later).
 	session.set_session_meta(
@@ -478,6 +486,27 @@ def _rerender_dependents(label: str, baseline_docname: str) -> None:
 			_render_and_attach_reports(name, recordings=[])
 		except Exception:
 			frappe.log_error(title=f"frappe_profiler rerender {name}")
+
+
+@frappe.whitelist()
+def set_comparison(session_uuid: str, compared_to: str) -> dict:
+	"""Set compared_to_session on a single session for a one-off comparison.
+
+	The current session must be Ready; the compared_to session is looked up
+	by docname.
+	"""
+	row = _require_session_owner_or_sysmanager(session_uuid)
+	if not compared_to:
+		frappe.throw("compared_to is required")
+	target_status = frappe.db.get_value("Profiler Session", compared_to, "status")
+	if not target_status:
+		frappe.throw(f"No Profiler Session found with name {compared_to}")
+	if target_status != "Ready":
+		frappe.throw(f"Compared-to session must be Ready, got '{target_status}'")
+
+	frappe.db.set_value("Profiler Session", row["name"], "compared_to_session", compared_to)
+	frappe.db.commit()
+	return {"set": True, "session_uuid": session_uuid, "compared_to": compared_to}
 
 
 @frappe.whitelist()

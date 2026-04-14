@@ -132,3 +132,76 @@ def test_unpin_baseline_clears_cache_key_and_flag(fake_env):
 	api.unpin_baseline(session_uuid="uuid-001")
 	assert "profiler:baseline:Sales Invoice flow" not in cache.store
 	assert rows["PS-001"]["is_baseline"] == 0
+
+
+def test_set_comparison_one_off(fake_env, monkeypatch):
+	cache, rows = fake_env
+	rows["PS-001"]["compared_to_session"] = None
+
+	result = api.set_comparison(session_uuid="uuid-001", compared_to="PS-002")
+	assert result["set"] is True
+	assert rows["PS-001"]["compared_to_session"] == "PS-002"
+
+
+def test_api_start_inherits_baseline_from_cache(fake_env, monkeypatch):
+	"""When a baseline is pinned for a label, api.start with that label
+	pre-populates compared_to_session on the new session."""
+	import datetime as _dt
+
+	import frappe
+	import frappe_profiler.api as api_module
+
+	cache, rows = fake_env
+	cache.store["profiler:baseline:smoke test"] = "PS-001"
+
+	created = {}
+
+	class FakeDoc:
+		def __init__(self, fields):
+			self.fields = dict(fields)
+
+		def insert(self, ignore_permissions=False):
+			created["doc"] = self.fields
+			self.name = "PS-new-001"
+			return self
+
+	def fake_get_doc(arg):
+		if isinstance(arg, dict) and arg.get("doctype") == "Profiler Session":
+			return FakeDoc(arg)
+		return None
+
+	monkeypatch.setattr(frappe, "get_doc", fake_get_doc, raising=False)
+	monkeypatch.setattr(frappe, "generate_hash", lambda length: "fake-uuid", raising=False)
+	# api.py imports now_datetime as a top-level name — patch it on the
+	# api module so we don't hit Frappe's system-settings lookup.
+	monkeypatch.setattr(
+		api_module, "now_datetime",
+		lambda: _dt.datetime(2026, 4, 14, 12, 0, 0),
+		raising=False,
+	)
+	# api._require_profiler_user calls _require_user which reads frappe.session.user
+	# (already stubbed in fake_env) — but it also calls frappe.get_roles and we
+	# stubbed that too.
+	monkeypatch.setattr(
+		"frappe_profiler.session.set_session_meta",
+		lambda *a, **kw: None,
+		raising=False,
+	)
+	monkeypatch.setattr(
+		"frappe_profiler.session.set_active_session",
+		lambda *a, **kw: None,
+		raising=False,
+	)
+	monkeypatch.setattr(
+		"frappe_profiler.session.get_active_session_for",
+		lambda u: None,
+		raising=False,
+	)
+	monkeypatch.setattr(
+		"frappe_profiler.capture._force_stop_inflight_capture",
+		lambda local_proxy: None,
+		raising=False,
+	)
+
+	api.start(label="smoke test")
+	assert created["doc"].get("compared_to_session") == "PS-001"
