@@ -80,6 +80,7 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
         swap = _num(infra.get("sys_swap_used_bytes"))
         dbc = _num(infra.get("db_threads_connected"))
         dbr = _num(infra.get("db_threads_running"))
+        db_max = _num(infra.get("db_max_connections"))
         rq_def = _num(infra.get("rq_queue_default")) or 0
         rq_short = _num(infra.get("rq_queue_short")) or 0
         rq_long = _num(infra.get("rq_queue_long")) or 0
@@ -93,6 +94,7 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
             "swap": swap,
             "db_threads_running": dbr,
             "db_threads_connected": dbc,
+            "db_max_connections": db_max,
             "rq_default": rq_def,
             "rq_short": rq_short,
             "rq_long": rq_long,
@@ -113,8 +115,17 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
             if swap > swap_warn:
                 swap_active = True
 
-        # DB pool saturation: ratio of running-to-connected threads as proxy.
-        if dbc and dbr is not None and dbc > 0:
+        # DB pool saturation: ratio of open connections to max_connections.
+        # When max_connections is unknown (pre-v0.5.0 infra blobs or a DB
+        # that refused the SHOW VARIABLES), fall back to the weaker
+        # threads_running/threads_connected proxy rather than skipping —
+        # the fallback is noisier but still catches the obvious cases.
+        if db_max and db_max > 0 and dbc is not None:
+            ratio = dbc / db_max
+            if ratio > pool_high:
+                db_pool_breaches.append(idx)
+        elif dbc and dbr is not None and dbc > 0:
+            # Legacy fallback for pre-v0.5.1 infra blobs without db_max_connections.
             ratio = dbr / dbc
             if ratio > pool_high:
                 db_pool_breaches.append(idx)

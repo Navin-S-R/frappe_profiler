@@ -38,12 +38,18 @@ _EXPECTED_KEYS = (
     "sys_load_avg_1min",
     "db_threads_connected",
     "db_threads_running",
+    "db_max_connections",
     "db_slow_queries_total",
     "redis_instantaneous_ops_per_sec",
     "rq_queue_default",
     "rq_queue_short",
     "rq_queue_long",
 )
+
+# max_connections is a MariaDB server config and doesn't change between
+# snapshots during a session. Cache at module level on first read so we
+# don't pay the SHOW VARIABLES cost on every snapshot.
+_db_max_connections_cached: int | None = None
 
 # psutil.cpu_percent(interval=None) returns 0.0 on first call because it
 # has no baseline to diff against. Prime it once per worker the first
@@ -165,6 +171,8 @@ def _read_loadavg(out: dict) -> None:
 
 
 def _read_db(out: dict) -> None:
+    global _db_max_connections_cached
+
     rows = frappe.db.sql(
         "SHOW GLOBAL STATUS WHERE Variable_name IN "
         "('Threads_connected', 'Threads_running', 'Slow_queries')"
@@ -173,6 +181,20 @@ def _read_db(out: dict) -> None:
     out["db_threads_connected"] = _to_int(status.get("Threads_connected"))
     out["db_threads_running"] = _to_int(status.get("Threads_running"))
     out["db_slow_queries_total"] = _to_int(status.get("Slow_queries"))
+
+    # MariaDB pool size. Cached at module level because max_connections
+    # is a server config value — doesn't change between snapshots within
+    # a session. Cheap SHOW VARIABLES on first read, free thereafter.
+    if _db_max_connections_cached is None:
+        try:
+            var_rows = frappe.db.sql(
+                "SHOW VARIABLES WHERE Variable_name = 'max_connections'"
+            )
+            if var_rows:
+                _db_max_connections_cached = _to_int(var_rows[0][1])
+        except Exception:
+            pass
+    out["db_max_connections"] = _db_max_connections_cached
 
 
 def _read_redis(out: dict) -> None:

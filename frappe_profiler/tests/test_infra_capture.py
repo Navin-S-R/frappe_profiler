@@ -27,6 +27,7 @@ def test_snapshot_returns_expected_keys(monkeypatch):
         "sys_load_avg_1min",
         "db_threads_connected",
         "db_threads_running",
+        "db_max_connections",
         "db_slow_queries_total",
         "redis_instantaneous_ops_per_sec",
         "rq_queue_default",
@@ -137,7 +138,13 @@ def _install_infra_stubs(monkeypatch, break_psutil=False):
     """Install deterministic stubs for every external call in snapshot().
 
     Keeps the tests runnable without a real psutil/Frappe/MariaDB/Redis.
+    Also resets the infra_capture module-level cache so max_connections
+    and cpu_primed state from a previous test don't bleed through.
     """
+    # Reset module-level caches so each test starts fresh.
+    from frappe_profiler import infra_capture as _ic
+    monkeypatch.setattr(_ic, "_db_max_connections_cached", None, raising=False)
+    monkeypatch.setattr(_ic, "_cpu_primed", False, raising=False)
     # ---- psutil stub ------------------------------------------------------
     if break_psutil:
         fake_psutil = types.ModuleType("psutil")
@@ -186,6 +193,8 @@ def _install_infra_stubs(monkeypatch, break_psutil=False):
                     ("Threads_running", "2"),
                     ("Slow_queries", "42"),
                 ]
+            if "max_connections" in query:
+                return [("max_connections", "151")]
             return []
 
     class FakeRedisClient:

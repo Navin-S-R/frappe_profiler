@@ -258,16 +258,17 @@
     {% endif %}
   </div>
 
-  {# v0.5.0: Steps to Reproduce / Notes (Text Editor / rich HTML). Shown
-     at the top of the report above findings so any reviewer reads the
-     "what did you do" context before the technical detail. User-typed
-     content is NOT auto-redacted — the user owns what they write, and
-     if they share the Safe Report they should review it first. #}
-  {% if session.notes %}
+  {# v0.5.0: Steps to Reproduce / Notes. Content is pre-sanitized by
+     renderer.py via frappe.utils.html_utils.sanitize_html (bleach) so
+     harmless rich-text renders while <script>/onclick/javascript: are
+     stripped. |safe below is only valid because notes_html is already
+     bleach-cleaned — do NOT change to `session.notes | safe` without
+     re-adding sanitization, that's a stored-XSS sink. #}
+  {% if notes_html %}
   <section class="section" style="background: #f0f9ff; border-left: 4px solid #2563eb;">
     <h2 style="margin-top: 0;">Steps to Reproduce</h2>
     <div class="notes-content">
-      {{ session.notes | safe }}
+      {{ notes_html | safe }}
     </div>
   </section>
   {% endif %}

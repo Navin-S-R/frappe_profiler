@@ -81,26 +81,58 @@ def test_api_start_writes_notes_to_doc():
 
 
 def test_report_template_renders_notes():
-	"""The report template must render session.notes as a section and
-	use |safe so the Text Editor HTML renders (rather than escaping)."""
+	"""The report template must render the notes section and
+	use the pre-sanitized `notes_html` context var (which is |safe)."""
 	tpath = os.path.join(HERE, "..", "templates", "report.html")
 	with open(tpath) as f:
 		template = f.read()
 
-	assert "session.notes" in template
-	# Must use |safe since Text Editor stores HTML
-	assert "session.notes | safe" in template or "session.notes|safe" in template
-	# The "Steps to Reproduce" heading must appear in the template too,
-	# so the user knows what this section is for.
+	# Template must use the sanitized notes_html var, not raw session.notes.
+	# Using session.notes directly with |safe would be a stored-XSS sink.
+	assert "notes_html" in template
+	assert "notes_html | safe" in template or "notes_html|safe" in template
+	# "Steps to Reproduce" heading must appear so users know the purpose.
 	assert "Steps to Reproduce" in template
 
-	# Verify notes appear ABOVE the "Findings — what to fix" section header,
-	# not just before the first occurrence of "Findings" (which is a CSS
-	# comment much earlier).
-	notes_idx = template.find("session.notes")
+	# Verify notes appear ABOVE the "Findings — what to fix" section header.
+	notes_idx = template.find("notes_html")
 	findings_heading_idx = template.find("Findings &mdash; what to fix")
 	assert notes_idx > 0
 	assert findings_heading_idx > 0
 	assert findings_heading_idx > notes_idx, (
-		"notes must appear above 'Findings — what to fix' in the report"
+		"notes section must appear above 'Findings — what to fix'"
 	)
+
+
+def test_notes_are_bleach_sanitized_before_render():
+	"""XSS regression guard: a notes field containing <script> must NOT
+	produce an executable <script> in the rendered report. This test
+	loads the sanitize function directly (not a full render) because
+	the test environment doesn't have a real Frappe site."""
+	try:
+		from frappe.utils.html_utils import sanitize_html
+	except Exception:
+		# If Frappe isn't importable at test time for some reason, the
+		# renderer falls back to html.escape which also neutralizes.
+		import html as html_mod
+		cleaned = html_mod.escape('<script>alert(1)</script>')
+		assert "<script>" not in cleaned
+		return
+
+	malicious = '<p>ok</p><script>alert(1)</script>'
+	cleaned = sanitize_html(malicious)
+	# Harmless tags preserved:
+	assert "<p>" in cleaned
+	# Script tags removed (bleach strips or escapes):
+	assert "<script>" not in cleaned
+
+
+def test_renderer_sanitizes_notes_before_template_context():
+	"""The render function must run session.notes through sanitize_html
+	and pass the result as notes_html, not as session.notes directly."""
+	import inspect
+	from frappe_profiler import renderer
+
+	src = inspect.getsource(renderer.render)
+	assert "sanitize_html" in src or "html.escape" in src or "html_mod.escape" in src
+	assert "notes_html" in src

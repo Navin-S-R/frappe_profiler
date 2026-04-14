@@ -100,8 +100,9 @@ def test_memory_pressure_fires_high_on_swap():
 
 
 def test_db_pool_saturation_does_not_fire_below_threshold():
-    """With threads_running max 10/15 ≈ 0.67, DB Pool Saturation should
-    NOT fire (threshold is 0.9)."""
+    """The fixture recordings have no `db_max_connections` set, which
+    triggers the legacy fallback ratio (threads_running/threads_connected).
+    Max is 10/15 ≈ 0.67, below the 0.9 threshold, so no finding."""
     from frappe_profiler.analyzers import infra_pressure
 
     session = _load_session()
@@ -109,6 +110,69 @@ def test_db_pool_saturation_does_not_fire_below_threshold():
 
     pool = [f for f in result.findings if f["finding_type"] == "DB Pool Saturation"]
     assert pool == []
+
+
+def test_db_pool_saturation_fires_on_pool_exhaustion():
+    """When db_max_connections is set and db_threads_connected is close
+    to it, the new (correct) ratio fires. 145/151 = 0.96 > 0.9."""
+    from frappe_profiler.analyzers import infra_pressure
+
+    recordings = [
+        {
+            "uuid": "r1",
+            "action_label": "a",
+            "infra": _synth_infra(
+                db_threads_connected=145,
+                db_threads_running=30,
+                db_max_connections=151,
+            ),
+        },
+        {
+            "uuid": "r2",
+            "action_label": "b",
+            "infra": _synth_infra(
+                db_threads_connected=148,
+                db_threads_running=25,
+                db_max_connections=151,
+            ),
+        },
+    ]
+    result = infra_pressure.analyze(recordings, _empty_context())
+    pool = [f for f in result.findings if f["finding_type"] == "DB Pool Saturation"]
+    assert len(pool) == 1
+    assert pool[0]["severity"] == "High"
+
+
+def test_db_pool_saturation_healthy_pool_no_false_positive():
+    """5 connections open against a 500-slot pool is 1% usage. The
+    old proxy (threads_running/threads_connected) would misfire here
+    if all 5 were busy; the new proxy (connected/max) correctly ignores
+    it."""
+    from frappe_profiler.analyzers import infra_pressure
+
+    recordings = [
+        {
+            "uuid": "r1",
+            "action_label": "a",
+            "infra": _synth_infra(
+                db_threads_connected=5,
+                db_threads_running=5,  # all current connections busy
+                db_max_connections=500,  # but pool has plenty of room
+            ),
+        },
+        {
+            "uuid": "r2",
+            "action_label": "b",
+            "infra": _synth_infra(
+                db_threads_connected=5,
+                db_threads_running=5,
+                db_max_connections=500,
+            ),
+        },
+    ]
+    result = infra_pressure.analyze(recordings, _empty_context())
+    pool = [f for f in result.findings if f["finding_type"] == "DB Pool Saturation"]
+    assert pool == [], "Healthy pool (1% usage) should not fire DB Pool Saturation"
 
 
 def test_aggregate_includes_timeline_and_summary():

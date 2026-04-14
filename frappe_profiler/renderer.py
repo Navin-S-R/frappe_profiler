@@ -71,9 +71,7 @@ def _safe_url(url: str | None) -> str:
 
 	Non-string / None inputs return "" rather than raising.
 	"""
-	if not url:
-		return "" if url != 0 else url  # None / "" → ""
-	if not isinstance(url, str):
+	if not url or not isinstance(url, str):
 		return ""
 
 	parsed = urlparse(url)
@@ -354,6 +352,26 @@ def render(
 	except Exception:
 		v5 = {}
 
+	# v0.5.0: pre-sanitize session.notes before the template uses |safe.
+	# The field was upgraded from plain Text to Text Editor in v0.5.0,
+	# which means `{{ session.notes | safe }}` would render stored HTML
+	# verbatim — a stored-XSS sink if any existing row has script content
+	# (plain-text before, live HTML after). bleach-sanitize via Frappe's
+	# helper so harmless rich-text (p, ul, li, a, strong, etc.) still
+	# renders while <script>/onclick/javascript: URLs are stripped.
+	notes_html = getattr(session_doc, "notes", None) or ""
+	if notes_html:
+		try:
+			from frappe.utils.html_utils import sanitize_html
+			notes_html = sanitize_html(notes_html)
+		except Exception:
+			# If sanitize_html blows up for any reason (unexpected input
+			# type, bleach internal error), fall back to HTML-escaping
+			# via html.escape so the report NEVER renders unsanitized
+			# user input — safe by default.
+			import html as html_mod
+			notes_html = html_mod.escape(notes_html)
+
 	context = {
 		"session": session_doc,
 		"actions": actions,
@@ -386,6 +404,7 @@ def render(
 		"frontend_orphans": v5.get("frontend_orphans") or [],
 		"frontend_summary": v5.get("frontend_summary") or {},
 		"safe_url": _safe_url,
+		"notes_html": notes_html,  # sanitized, safe to pass through |safe
 	}
 
 	return template.render(**context)
