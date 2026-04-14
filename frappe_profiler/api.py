@@ -315,6 +315,46 @@ def health() -> dict:
 	}
 
 
+# v0.4.0: onboarding toast state endpoints. Used by floating_widget.js
+# to decide whether to render the one-time onboarding toast.
+ONBOARDING_CACHE_PREFIX = "profiler:onboarding_seen:"
+ONBOARDING_CACHE_TTL_SECONDS = 365 * 24 * 60 * 60  # 1 year
+
+
+@frappe.whitelist()
+def check_onboarding_seen() -> dict:
+	"""Has the current user dismissed the onboarding toast?
+
+	Also returns True if the user has any existing Ready Profiler Session
+	row (they're an experienced user; suppress the toast).
+	"""
+	user = _require_user()
+	# Suppress for experienced users — anyone with at least one Ready session
+	try:
+		existing = frappe.db.count(
+			"Profiler Session",
+			filters={"user": user, "status": "Ready"},
+		)
+		if existing and existing > 0:
+			return {"seen": True}
+	except Exception:
+		pass
+	flag = frappe.cache.get_value(f"{ONBOARDING_CACHE_PREFIX}{user}")
+	return {"seen": bool(flag)}
+
+
+@frappe.whitelist()
+def mark_onboarding_seen() -> dict:
+	"""Mark the onboarding toast as dismissed for the current user."""
+	user = _require_user()
+	frappe.cache.set_value(
+		f"{ONBOARDING_CACHE_PREFIX}{user}",
+		"1",
+		expires_in_sec=ONBOARDING_CACHE_TTL_SECONDS,
+	)
+	return {"seen": True}
+
+
 @frappe.whitelist()
 def export_session(session_uuid: str) -> dict:
 	"""Export a Profiler Session as a structured JSON blob.
