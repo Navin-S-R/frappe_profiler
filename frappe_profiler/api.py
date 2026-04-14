@@ -510,6 +510,45 @@ def set_comparison(session_uuid: str, compared_to: str) -> dict:
 
 
 @frappe.whitelist()
+def download_pdf(session_uuid: str) -> dict:
+	"""Return the URL of the safe-report PDF, generating it on first call.
+
+	Permission: recording user, System Manager, or Administrator.
+	Mirrors retry_analyze / export_session permission gating.
+	"""
+	user = _require_profiler_user()
+	if not session_uuid:
+		frappe.throw("session_uuid is required")
+
+	row = frappe.db.get_value(
+		"Profiler Session",
+		{"session_uuid": session_uuid},
+		["name", "user", "status"],
+		as_dict=True,
+	)
+	if not row:
+		frappe.throw(f"No Profiler Session found for uuid {session_uuid}")
+	if row["status"] != "Ready":
+		frappe.throw(f"Cannot generate PDF for session in '{row['status']}' state")
+
+	roles = set(frappe.get_roles(user))
+	if (
+		row["user"] != user
+		and "System Manager" not in roles
+		and user != "Administrator"
+	):
+		frappe.throw(
+			"You can only download PDFs for your own sessions.",
+			frappe.PermissionError,
+		)
+
+	from frappe_profiler import pdf_export
+
+	url = pdf_export.get_or_generate_pdf(session_uuid)
+	return {"file_url": url}
+
+
+@frappe.whitelist()
 def export_session(session_uuid: str) -> dict:
 	"""Export a Profiler Session as a structured JSON blob.
 
