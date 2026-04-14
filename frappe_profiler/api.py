@@ -696,6 +696,15 @@ def retry_analyze(session_uuid: str) -> dict:
 	)
 	frappe.db.commit()
 
+	# v0.4.0: clear the cached PDF so the next download regenerates from
+	# the fresh HTML produced by the re-run analyze.
+	try:
+		from frappe_profiler import pdf_export
+
+		pdf_export.clear_cached_pdf(session_uuid)
+	except Exception:
+		pass
+
 	frappe.enqueue(
 		"frappe_profiler.analyze.run",
 		queue="long",
