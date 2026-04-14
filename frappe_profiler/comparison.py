@@ -241,3 +241,103 @@ def match_actions(new_actions: list, baseline_actions: list) -> list:
 		pairs.append(_make_action_pair("only_in_new", new=action))
 
 	return pairs
+
+
+def _delta_dict(old, new):
+	"""Build a per-metric delta dict {old, new, delta, pct}."""
+	old = old or 0
+	new = new or 0
+	delta = new - old
+	pct = 0
+	if old:
+		pct = round((delta / old) * 100)
+	return {
+		"old": round(old, 2),
+		"new": round(new, 2),
+		"delta": round(delta, 2),
+		"pct": pct,
+	}
+
+
+def _action_to_dict(action):
+	"""Coerce a Profiler Action child row (Document or SimpleNamespace) to a dict."""
+	if isinstance(action, dict):
+		return dict(action)
+	return {
+		"action_label": getattr(action, "action_label", None),
+		"path": getattr(action, "path", None),
+		"http_method": getattr(action, "http_method", None),
+		"event_type": getattr(action, "event_type", None),
+		"duration_ms": getattr(action, "duration_ms", 0),
+		"queries_count": getattr(action, "queries_count", 0),
+		"query_time_ms": getattr(action, "query_time_ms", 0),
+	}
+
+
+def _finding_to_dict(finding):
+	"""Coerce a Profiler Finding child row to a dict."""
+	if isinstance(finding, dict):
+		return dict(finding)
+	return {
+		"finding_type": getattr(finding, "finding_type", None),
+		"severity": getattr(finding, "severity", None),
+		"title": getattr(finding, "title", None),
+		"customer_description": getattr(finding, "customer_description", None),
+		"technical_detail_json": getattr(finding, "technical_detail_json", None),
+		"estimated_impact_ms": getattr(finding, "estimated_impact_ms", 0),
+		"affected_count": getattr(finding, "affected_count", 0),
+		"action_ref": getattr(finding, "action_ref", None),
+	}
+
+
+def compute_comparison(new_session, baseline_session) -> dict:
+	"""Build the full comparison data structure for the renderer.
+
+	Both arguments are Profiler Session docs (real Frappe docs OR
+	SimpleNamespace fixtures). They expose:
+	  - actions: list of Profiler Action child rows
+	  - findings: list of Profiler Finding child rows
+	  - total_duration_ms, total_queries, total_query_time_ms,
+	    total_python_ms, total_sql_ms
+	  - name, title, started_at
+
+	Returns a dict ready for the Jinja template (see spec §5.5).
+	"""
+	new_actions = [_action_to_dict(a) for a in (new_session.actions or [])]
+	baseline_actions = [_action_to_dict(a) for a in (baseline_session.actions or [])]
+	new_findings = [_finding_to_dict(f) for f in (new_session.findings or [])]
+	baseline_findings = [_finding_to_dict(f) for f in (baseline_session.findings or [])]
+
+	return {
+		"baseline_info": {
+			"docname": getattr(baseline_session, "name", None),
+			"title": getattr(baseline_session, "title", None),
+			"started_at": str(getattr(baseline_session, "started_at", "")),
+			"duration_ms": getattr(baseline_session, "total_duration_ms", 0),
+			"total_queries": getattr(baseline_session, "total_queries", 0),
+		},
+		"session_delta": {
+			"duration_ms": _delta_dict(
+				getattr(baseline_session, "total_duration_ms", 0),
+				getattr(new_session, "total_duration_ms", 0),
+			),
+			"total_queries": _delta_dict(
+				getattr(baseline_session, "total_queries", 0),
+				getattr(new_session, "total_queries", 0),
+			),
+			"total_query_time_ms": _delta_dict(
+				getattr(baseline_session, "total_query_time_ms", 0),
+				getattr(new_session, "total_query_time_ms", 0),
+			),
+			"total_python_ms": _delta_dict(
+				getattr(baseline_session, "total_python_ms", 0),
+				getattr(new_session, "total_python_ms", 0),
+			),
+			"total_sql_ms": _delta_dict(
+				getattr(baseline_session, "total_sql_ms", 0),
+				getattr(new_session, "total_sql_ms", 0),
+			),
+		},
+		"action_pairs": match_actions(new_actions, baseline_actions),
+		"finding_diff": match_findings(new_findings, baseline_findings),
+	}

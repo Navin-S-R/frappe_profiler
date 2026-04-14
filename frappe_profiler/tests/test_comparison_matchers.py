@@ -184,3 +184,82 @@ def test_match_actions_fallback_to_path():
 	matched = [p for p in pairs if p["status"] == "matched"]
 	assert len(matched) == 1
 	assert matched[0]["delta_ms"] == -460
+
+
+from types import SimpleNamespace
+
+
+def _session(name="PS-001", title="Test", duration_ms=1000, total_queries=100,
+             total_query_time_ms=300, total_python_ms=500, total_sql_ms=300,
+             actions=None, findings=None, started_at="2026-04-13T00:00:00"):
+	return SimpleNamespace(
+		name=name,
+		title=title,
+		started_at=started_at,
+		total_duration_ms=duration_ms,
+		total_queries=total_queries,
+		total_query_time_ms=total_query_time_ms,
+		total_python_ms=total_python_ms,
+		total_sql_ms=total_sql_ms,
+		actions=actions or [],
+		findings=findings or [],
+	)
+
+
+def test_compute_comparison_full_shape():
+	baseline = _session(
+		name="PS-baseline",
+		duration_ms=4200,
+		total_queries=1076,
+		actions=[
+			SimpleNamespace(**_action("POST /save SI", "/api/save", 820, 47, 310)),
+		],
+		findings=[
+			SimpleNamespace(**_finding(
+				"Slow Hot Path", "High", "slow",
+				{"function": "my_app.heavy"}, action_ref="0", impact_ms=600,
+			)),
+		],
+	)
+	new = _session(
+		name="PS-new",
+		duration_ms=2100,
+		total_queries=540,
+		actions=[
+			SimpleNamespace(**_action("POST /save SI", "/api/save", 340, 18, 95)),
+		],
+		findings=[],
+	)
+
+	result = comparison.compute_comparison(new_session=new, baseline_session=baseline)
+
+	assert "baseline_info" in result
+	assert "session_delta" in result
+	assert "action_pairs" in result
+	assert "finding_diff" in result
+
+	assert result["session_delta"]["duration_ms"]["delta"] == -2100
+	assert result["session_delta"]["total_queries"]["delta"] == -536
+
+	assert len(result["action_pairs"]) == 1
+	assert result["action_pairs"][0]["status"] == "matched"
+
+	assert len(result["finding_diff"]["fixed"]) == 1
+	assert result["finding_diff"]["new"] == []
+	assert result["finding_diff"]["unchanged"] == []
+
+
+def test_compute_comparison_with_empty_baseline_findings():
+	baseline = _session(name="PS-b", findings=[], actions=[])
+	new = _session(
+		name="PS-n",
+		findings=[
+			SimpleNamespace(**_finding(
+				"Slow Hot Path", "Medium", "regression",
+				{"function": "x"}, action_ref="0",
+			)),
+		],
+	)
+	result = comparison.compute_comparison(new_session=new, baseline_session=baseline)
+	assert len(result["finding_diff"]["new"]) == 1
+	assert result["finding_diff"]["fixed"] == []
