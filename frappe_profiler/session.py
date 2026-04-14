@@ -178,3 +178,9 @@ def delete_session_state(session_uuid: str) -> None:
 	"""
 	frappe.cache.delete_value(_meta_key(session_uuid))
 	frappe.cache.delete_value(_recordings_key(session_uuid))
+	# v0.5.0: also clean up the frontend metrics blob written by
+	# api.submit_frontend_metrics. Per-recording infra keys
+	# (profiler:infra:<recording_uuid>) are cleaned up alongside
+	# RECORDER_REQUEST_HASH entries when the analyze pipeline walks
+	# the recording UUIDs, so they don't need a separate sweep here.
+	frappe.cache.delete_value(f"profiler:frontend:{session_uuid}")

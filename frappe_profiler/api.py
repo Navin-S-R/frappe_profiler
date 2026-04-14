@@ -344,6 +344,82 @@ def get_active_session() -> dict | None:
 	return session.get_session_meta(active)
 
 
+# ---------------------------------------------------------------------------
+# v0.5.0: frontend metrics receiver
+# ---------------------------------------------------------------------------
+
+SOFT_CAP_FRONTEND_XHR = 1000
+SOFT_CAP_FRONTEND_VITALS = 200
+
+
+@frappe.whitelist(methods=["POST"])
+def submit_frontend_metrics(payload: str) -> dict:
+	"""Receive a batch of frontend metrics (XHR timings + Web Vitals).
+
+	Called by profiler_frontend.js at stop time (via frappe.call) and
+	at beforeunload (via navigator.sendBeacon). Payload is a JSON
+	string because sendBeacon sends raw Blob — Frappe's dict auto-
+	parsing doesn't kick in for sendBeacon, so we take a string and
+	parse explicitly.
+
+	Idempotent: multiple submits for the same session merge into one
+	Redis blob so a sendBeacon flush followed by a normal stop-time
+	flush doesn't duplicate data.
+	"""
+	user = _require_profiler_user()
+
+	try:
+		if isinstance(payload, str):
+			data = frappe.parse_json(payload)
+		else:
+			data = payload
+	except Exception:
+		return {"accepted": False, "reason": "invalid json"}
+
+	if not isinstance(data, dict):
+		return {"accepted": False, "reason": "invalid payload"}
+
+	session_uuid = data.get("session_uuid")
+	if not session_uuid:
+		return {"accepted": False, "reason": "missing session_uuid"}
+
+	# Ownership check: only the user who owns the session can write to
+	# its frontend blob. Silent-drop on missing meta because a
+	# beforeunload beacon can legitimately arrive after the session has
+	# already been stopped and its meta deleted — no log spam.
+	meta = session.get_session_meta(session_uuid) or {}
+	if not meta or meta.get("user") != user:
+		return {"accepted": False, "reason": "session not found"}
+
+	# Tail-preferring cap on the incoming payload. End-of-flow is where
+	# the slow thing probably happened, so on overflow we keep the most
+	# recent entries, not the oldest.
+	xhr = (data.get("xhr") or [])[-SOFT_CAP_FRONTEND_XHR:]
+	vitals = (data.get("vitals") or [])[-SOFT_CAP_FRONTEND_VITALS:]
+
+	key = f"profiler:frontend:{session_uuid}"
+	existing = frappe.cache.get_value(key) or {"xhr": [], "vitals": []}
+
+	merged_xhr = (existing.get("xhr") or []) + xhr
+	merged_vitals = (existing.get("vitals") or []) + vitals
+
+	blob = {
+		"xhr": merged_xhr[-SOFT_CAP_FRONTEND_XHR:],
+		"vitals": merged_vitals[-SOFT_CAP_FRONTEND_VITALS:],
+	}
+
+	frappe.cache.set_value(
+		key,
+		blob,
+		expires_in_sec=session.SESSION_TTL_SECONDS,
+	)
+	return {
+		"accepted": True,
+		"xhr_count": len(blob["xhr"]),
+		"vitals_count": len(blob["vitals"]),
+	}
+
+
 @frappe.whitelist()
 def health() -> dict:
 	"""Lightweight health/metrics endpoint for ops scrapers.
