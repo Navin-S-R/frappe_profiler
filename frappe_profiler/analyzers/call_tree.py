@@ -173,13 +173,98 @@ _FRAMEWORK_FUNCTION_PREFIXES = ("frappe.", "frappe_profiler.")
 
 
 def _is_framework_frame(node_or_frame: dict) -> bool:
-	"""True if a tree node or stack frame looks like framework code."""
+	"""True if a tree node or stack frame looks like framework code.
+
+	Used by SQL-to-Python reconciliation and Slow Hot Path findings,
+	which want to blame user code ABOVE the framework boundary and
+	therefore skip aggressively — everything in frappe/* and
+	frappe_profiler/*.
+
+	For Repeated Hot Frame + hot-frames leaderboard aggregation, use
+	the NARROWER ``_is_pure_helper_frame`` instead. That function keeps
+	application-layer Frappe code (Document lifecycle, permissions,
+	hooks, naming) visible so users can see legitimate optimization
+	targets inside frappe/* — which is a different question than
+	'whose SQL is this.'
+	"""
 	fn = node_or_frame.get("function") or ""
 	for prefix in _FRAMEWORK_FUNCTION_PREFIXES:
 		if fn.startswith(prefix):
 			return True
 	filename = (node_or_frame.get("filename") or "").replace("\\", "/")
 	for frag in _FRAMEWORK_PATH_FRAGMENTS:
+		if frag in filename:
+			return True
+	return False
+
+
+# ---------------------------------------------------------------------------
+# Pure-helper frame detection (v0.5.1 — narrower than framework-frame)
+# ---------------------------------------------------------------------------
+# The semantic question for the Repeated Hot Frame finding is:
+#
+#     "If this function shows up as a hot frame, can the user act on it?"
+#
+# For SQL N+1 / Slow Hot Path, the answer is "walk past frappe/* to blame
+# user code." Repeated Hot Frame is different: it asks "is this function
+# itself worth optimizing?" Document.run_method, permissions.has_permission,
+# naming.make_autoname, and most of frappe/core/* and frappe/model/* are
+# INSIDE frappe/* yet legitimately slow optimization targets — they run
+# the user's hooks, their permission rules, or their custom naming
+# configuration. Surfacing them in the leaderboard is correct.
+#
+# So we skip only:
+#   1. frappe_profiler/*                 — always (our own tool)
+#   2. /frappe/utils/                    — data conversion, password, redis wrapper
+#   3. /frappe/handler.py, /frappe/app.py — request dispatch plumbing
+#   4. Infrastructure libraries          — werkzeug, gunicorn, rq, redis
+#                                          client, pyinstrument, pytz, dateutil
+#
+# Everything else — including most of frappe/*, all of erpnext/*, and
+# all user apps — is KEPT so users see legitimate optimization targets
+# like "Document.run_method consumed 2.4s across 12 actions."
+
+_PURE_HELPER_PATH_FRAGMENTS = (
+	"/frappe_profiler/",
+	"/frappe/utils/",
+	"/frappe/handler.py",
+	"/frappe/app.py",
+	"/werkzeug/",
+	"/gunicorn/",
+	"/rq/",
+	"site-packages/redis/",
+	"/pyinstrument/",
+	"/pytz/",
+	"/dateutil/",
+)
+
+_PURE_HELPER_FUNCTION_PREFIXES = (
+	"frappe_profiler.",
+	"frappe.utils.",
+	"frappe.handler.",
+	"frappe.app.",
+)
+
+
+def _is_pure_helper_frame(node: dict) -> bool:
+	"""Narrower than ``_is_framework_frame``. Returns True only for pure
+	plumbing helpers that users can't optimize. Keeps most of frappe/*
+	so hot-frame findings remain useful when application-layer Frappe
+	code (Document lifecycle, permissions, hooks, naming) is the actual
+	bottleneck — and users who ARE Frappe contributors can see those as
+	legitimate targets too.
+
+	Used by the Repeated Hot Frame aggregator only. Do NOT use this for
+	SQL-to-Python reconciliation or Slow Hot Path — those want the
+	broader ``_is_framework_frame`` so SQL attributes blame to user
+	code above the framework boundary.
+	"""
+	fn = node.get("function") or ""
+	for prefix in _PURE_HELPER_FUNCTION_PREFIXES:
+		if fn.startswith(prefix):
+			return True
+	filename = (node.get("filename") or "").replace("\\", "/")
+	for frag in _PURE_HELPER_PATH_FRAGMENTS:
 		if frag in filename:
 			return True
 	return False
@@ -661,14 +746,20 @@ def _aggregate_hot_frames(per_action_trees: list):
 
 def _walk_for_aggregation(node: dict, action_idx: int, occurrences: dict) -> None:
 	if node.get("kind") == "python":
-		# v0.5.1: skip framework frames entirely. Repeated Hot Frame is
-		# a user-actionable finding ("optimize this function") — framework
-		# wrappers (frappe/*, frappe_profiler/*, werkzeug, gunicorn) can't
-		# be optimized by the user, and previously cluttered the top of
-		# the hot-frames leaderboard with noise like "wrapper" (35
-		# different decorator functions sharing a name) and "handle"
-		# (20 different handler methods sharing a name).
-		if not _is_framework_frame(node):
+		# v0.5.1: skip PURE HELPER frames only, not all framework code.
+		# This is the narrower _is_pure_helper_frame check — we want to
+		# keep Document.run_method, permission checks, naming, and other
+		# application-layer Frappe code in the leaderboard because they
+		# can be legitimate optimization targets (e.g. a slow doc-event
+		# hook bubbles up as Document.run_method). Only frappe/utils/*,
+		# frappe/handler.py, frappe/app.py, and infrastructure libs
+		# (werkzeug, rq, etc.) are suppressed.
+		#
+		# An earlier v0.5.1 draft used the broader _is_framework_frame
+		# here, which hid ALL frappe/* frames — that was too aggressive
+		# and blinded the analyzer to real application-layer bottlenecks
+		# inside Frappe that users could act on.
+		if not _is_pure_helper_frame(node):
 			key = _redacted_module_key(
 				node.get("function", ""),
 				node.get("filename", ""),

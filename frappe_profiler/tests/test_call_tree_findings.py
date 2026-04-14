@@ -236,37 +236,104 @@ def test_repeated_hot_frame_does_not_collapse_same_named_wrappers():
 		)
 
 
-def test_repeated_hot_frame_skips_framework_frames():
-	"""Pass-7 regression guard: framework frames (frappe/*, frappe_profiler/*)
-	must NOT appear in the hot-frames leaderboard or generate findings.
-	Repeated Hot Frame is 'optimize this function in your code' — framework
-	wrappers aren't user code and the user can't act on them. Previously
-	the analyzer happily aggregated every 'handle' and 'wrapper' it saw,
-	including deep Frappe internals like frappe.handler.handle.
+def test_repeated_hot_frame_skips_pure_helpers_only():
+	"""v0.5.1: Repeated Hot Frame aggregator uses the NARROWER
+	_is_pure_helper_frame filter, not the broad _is_framework_frame.
+	Pure plumbing helpers (frappe/handler.py, frappe/utils/, werkzeug,
+	rq, pyinstrument) are suppressed — those are unoptimizable.
 	"""
-	# Same function name, 5 actions, 250ms each — would normally fire
-	# BOTH thresholds (>= 3 actions, >= 500ms). But since it's inside
-	# apps/frappe/, the framework-frame filter must suppress it.
 	per_action_trees = []
 	for _ in range(5):
 		per_action_trees.append(_node("<root>", "", 500, [
+			# frappe/handler.py — pure request-dispatch plumbing
 			_node("handle", "apps/frappe/handler.py", 250, []),
+			# frappe/utils/data.py — type conversion helper
+			_node("cint", "apps/frappe/frappe/utils/data.py", 100, []),
+			# werkzeug — infra lib
+			_node(
+				"inner",
+				"env/lib/python3.14/site-packages/werkzeug/wsgi.py",
+				80,
+				[],
+			),
 		]))
 
 	findings, leaderboard = call_tree._aggregate_hot_frames(per_action_trees)
 
-	# No Repeated Hot Frame finding from the framework frame.
+	# None of the pure-helper frames should appear as findings.
+	suppressed = ("handle", "cint", "inner")
 	repeated = [f for f in findings if f["finding_type"] == "Repeated Hot Frame"]
-	assert repeated == [], (
-		f"framework 'handle' should be suppressed from Repeated Hot "
-		f"Frame findings; got {[f['title'] for f in repeated]}"
-	)
-	# And the leaderboard must not list it either.
+	for f in repeated:
+		for name in suppressed:
+			assert name not in f["title"], (
+				f"pure helper '{name}' leaked into Repeated Hot Frame "
+				f"findings: {f['title']}"
+			)
+
+	# And not in the leaderboard either.
 	for row in leaderboard:
-		assert "handle" not in row["function"], (
-			f"framework 'handle' leaked into hot-frames leaderboard: "
-			f"{row}"
-		)
+		for name in suppressed:
+			assert name not in row["function"], (
+				f"pure helper '{name}' leaked into hot-frames leaderboard: {row}"
+			)
+
+
+def test_repeated_hot_frame_keeps_frappe_application_code():
+	"""v0.5.1 correction (requested in user review): the Repeated Hot
+	Frame aggregator must KEEP most of frappe/* — only pure helpers
+	(utils, handler, app.py) get suppressed. Application-layer Frappe
+	code like Document.run_method, permissions.has_permission, and
+	naming.make_autoname are LEGITIMATE optimization targets even
+	though they're inside frappe/*:
+
+	  - Document.run_method runs user-defined doc-event hooks. A slow
+	    hook bubbles up here and the user CAN optimize it.
+	  - permissions.has_permission evaluates user-defined permission
+	    rules (including custom Permission Query Conditions). Slow
+	    permissions are the user's fault.
+	  - make_autoname runs a naming series; if the user configured a
+	    ledger-heavy naming series it's slow-by-choice and fixable.
+
+	A naive 'skip all frappe/*' filter would hide all of these — wrong.
+	"""
+	per_action_trees = []
+	for _ in range(5):
+		per_action_trees.append(_node("<root>", "", 2000, [
+			# Document.run_method in frappe/model/document.py — keep.
+			_node(
+				"Document.run_method",
+				"apps/frappe/frappe/model/document.py",
+				600,
+				[],
+			),
+			# permissions.has_permission — keep.
+			_node(
+				"has_permission",
+				"apps/frappe/frappe/permissions.py",
+				200,
+				[],
+			),
+		]))
+
+	findings, leaderboard = call_tree._aggregate_hot_frames(per_action_trees)
+
+	# Document.run_method: 5 actions × 600ms = 3000ms, far above threshold.
+	repeated = [f for f in findings if f["finding_type"] == "Repeated Hot Frame"]
+	run_method_hits = [f for f in repeated if "run_method" in f["title"]]
+	assert len(run_method_hits) == 1, (
+		"Document.run_method in frappe/model/document.py MUST be kept "
+		"in the Repeated Hot Frame aggregator. It runs user hooks and "
+		"is a legitimate optimization target."
+	)
+
+	# And both keepers should be in the leaderboard.
+	leaderboard_fns = [r["function"] for r in leaderboard]
+	assert any("run_method" in f for f in leaderboard_fns), (
+		f"Document.run_method missing from leaderboard: {leaderboard_fns}"
+	)
+	assert any("has_permission" in f for f in leaderboard_fns), (
+		f"has_permission missing from leaderboard: {leaderboard_fns}"
+	)
 
 
 def test_repeated_hot_frame_keeps_user_code_finding():
