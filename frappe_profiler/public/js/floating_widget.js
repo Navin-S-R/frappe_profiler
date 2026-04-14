@@ -362,7 +362,7 @@
 						notes: values.notes || "",
 					},
 					callback: (r) => {
-						const data = r.message || {};
+						const data = (r && r.message) || {};
 						if (data.session_uuid) {
 							currentState.active = true;
 							currentState.session_uuid = data.session_uuid;
@@ -380,7 +380,40 @@
 								message: __("Profiler started: {0}", [data.title]),
 								indicator: "green",
 							});
+						} else {
+							// Server returned 200 but no session_uuid in the
+							// response — unexpected. Surface something so
+							// the user knows the click didn't land.
+							frappe.show_alert({
+								message: __("Profiler start returned no session — check Error Log"),
+								indicator: "orange",
+							});
 						}
+					},
+					error: (r) => {
+						// v0.5.1: frappe.call's success callback is NOT
+						// invoked on server errors (4xx/5xx). Without
+						// this error branch, a failed start (permission
+						// denied, server exception, concurrent session,
+						// etc.) would leave the user staring at a
+						// silent inactive pill after the dialog closes —
+						// the exact 'widget not working as expected'
+						// failure mode they'd see if their account
+						// lacked the Profiler User role.
+						//
+						// Frappe already surfaces server errors as its
+						// own alert via _server_messages, so we just
+						// need an additional best-effort toast so the
+						// user sees SOMETHING happened. The dialog has
+						// already been hidden at this point so we can't
+						// keep the user on it for another try.
+						const msg = (r && r._server_messages)
+							? "Profiler start failed — see the Frappe error alert above"
+							: "Profiler start failed — check your role and try again";
+						frappe.show_alert({
+							message: __(msg),
+							indicator: "red",
+						});
 					},
 				});
 			},

@@ -119,6 +119,48 @@ def test_list_js_severity_indicators():
 	assert "Medium severity" in src
 
 
+def test_widget_start_has_error_callback():
+	"""v0.5.1 regression guard: the Start dialog's frappe.call must
+	include an error callback. Without it, any server-side failure of
+	api.start (permission error, concurrent session, server exception)
+	silently closes the dialog with no feedback to the user — the
+	exact 'widget not working as expected' failure mode reported by
+	users who lacked the Profiler User role. The stop API already had
+	an error callback added in an earlier fix; this test forces start
+	to stay symmetric.
+	"""
+	with open(WIDGET_JS) as f:
+		src = f.read()
+
+	# Find the start dialog's primary_action block and verify it
+	# contains both callback: and error:.
+	start_call_idx = src.find("frappe_profiler.api.start")
+	assert start_call_idx > 0, "widget must call frappe_profiler.api.start"
+
+	# Look in the ~2000 chars around the start call for an error: key.
+	window = src[start_call_idx : start_call_idx + 2000]
+	assert "error:" in window or "error: " in window, (
+		"openStartDialog's frappe.call(api.start) must have an error "
+		"callback — without it, permission errors and server exceptions "
+		"leave the widget silently unresponsive after the dialog closes"
+	)
+
+
+def test_widget_stop_has_error_callback():
+	"""Companion to the start-error guard: the Stop call already had an
+	error handler added in an earlier fix. Make sure it stays."""
+	with open(WIDGET_JS) as f:
+		src = f.read()
+
+	stop_call_idx = src.find("frappe_profiler.api.stop")
+	assert stop_call_idx > 0
+	window = src[stop_call_idx : stop_call_idx + 2000]
+	assert "error:" in window, (
+		"confirmAndStop's frappe.call(api.stop) must have an error "
+		"callback so failed stops don't strand the widget in 'Stopping…'"
+	)
+
+
 def test_widget_css_selectors():
 	"""CSS must define the widget root and state classes."""
 	with open(WIDGET_CSS) as f:
