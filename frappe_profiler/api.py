@@ -211,16 +211,10 @@ def _stop_session(user: str, session_uuid: str) -> tuple[str | None, bool]:
 
 	Returns a tuple ``(docname, ran_inline)``:
 	    docname     — the Profiler Session docname, or None if not found
-	    ran_inline  — True if analyze was executed synchronously
-	                  (scheduler-disabled fallback), False otherwise
-
-	v0.5.0 adds the scheduler-disabled safety cap: when
-	``is_scheduler_disabled()`` is True and the session's recording count
-	exceeds ``profiler_inline_analyze_limit`` (default 50), we refuse to
-	run analyze inline because gunicorn would likely kill the request
-	mid-flight. Instead the session is marked Failed with an actionable
-	error message and the user is directed to re-enable the scheduler
-	and use the Retry Analyze button.
+	    ran_inline  — True if the session is already finalized by the time
+	                  we return (analyze ran synchronously or was rejected
+	                  by the inline cap and marked Failed). False means
+	                  analyze will run async.
 	"""
 	# v0.3.0: stop any in-flight pyinstrument session and clear capture
 	# state on this worker before flipping the active flag, so a previous
@@ -241,38 +235,10 @@ def _stop_session(user: str, session_uuid: str) -> tuple[str | None, bool]:
 	if not docname:
 		return None, False
 
-	# v0.5.0: if analyze would have to run inline (scheduler disabled),
-	# refuse large sessions to stay within gunicorn's 120s timeout.
-	from frappe.utils.scheduler import is_scheduler_disabled
-
-	would_run_inline = False
-	try:
-		would_run_inline = bool(is_scheduler_disabled())
-	except Exception:
-		pass
-
-	if would_run_inline:
-		cap = frappe.conf.get("profiler_inline_analyze_limit") or 50
-		count = session.recording_count(session_uuid)
-		if count > cap:
-			frappe.db.set_value(
-				"Profiler Session",
-				docname,
-				{
-					"status": "Failed",
-					"analyze_error": (
-						f"Scheduler is disabled and this session has "
-						f"{count} recordings, exceeding the inline "
-						f"analyze cap of {cap}. Re-enable the scheduler "
-						f"(bench enable-scheduler) and click Retry "
-						f"Analyze on this session's form view."
-					),
-				},
-			)
-			frappe.db.commit()
-			return docname, False
-
-	ran_inline = _enqueue_analyze(session_uuid)
+	# v0.5.0: inline safety cap + scheduler fallback are both inside
+	# _enqueue_analyze now, so every inline-path caller (stop,
+	# retry_analyze, janitor) gets the same protection uniformly.
+	ran_inline = _enqueue_analyze(session_uuid, docname=docname)
 	return docname, ran_inline
 
 
@@ -307,7 +273,7 @@ def _mark_stopping(user: str, session_uuid: str) -> str | None:
 	return docname
 
 
-def _enqueue_analyze(session_uuid: str) -> bool:
+def _enqueue_analyze(session_uuid: str, docname: str | None = None) -> bool:
 	"""Enqueue analyze on the long queue, or run inline if no worker
 	will consume it.
 
@@ -319,18 +285,38 @@ def _enqueue_analyze(session_uuid: str) -> bool:
 	``frappe.enqueue(now=True)`` which executes analyze synchronously
 	inside the current request. See v0.5.0 design spec §6.
 
-	Returns True if analyze ran inline (the caller must report this
-	to the client via ``ran_inline: True`` so the UI can skip the
-	"Analyzing…" state). Returns False if the job was pushed to the
-	queue as usual.
+	Inline analyze has a recording-count safety cap
+	(``profiler_inline_analyze_limit``, default 50) to stay within
+	gunicorn's ~120s request timeout on heavy sessions. When the cap
+	is exceeded, the session is marked Failed with an actionable
+	error and analyze is NOT invoked — the user sees the failure
+	immediately rather than having gunicorn kill the request
+	mid-analyze and strand the session half-analyzed.
+
+	The cap lives here (not in ``_stop_session``) so every caller of
+	this function — ``stop``, ``retry_analyze``, ``janitor._sweep_stale``
+	— gets the same protection. Earlier versions only applied it in
+	``_stop_session``, which meant ``retry_analyze`` on a 200-recording
+	failed session on a scheduler-disabled site would hit the gunicorn
+	timeout.
+
+	Args:
+	    session_uuid: the session to analyze.
+	    docname: the Profiler Session docname for cap-exceeded failure
+	        handling. When provided, cap violations mark this doc Failed
+	        with a user-facing message. When None, the cap is skipped
+	        (internal callers only — all production paths pass docname).
+
+	Returns True if the session is already finalized (Ready or Failed)
+	by the time this call returns — that is, analyze ran synchronously
+	OR was rejected by the inline cap. Returns False when the job was
+	pushed to the async queue and the session is still Stopping.
 
 	Inline execution can fail — analyze.run catches its own exceptions
 	and marks the session as Failed via frappe.db.set_value, then
-	re-raises. We catch the re-raise here so the stop API response
-	isn't a 500 error (which would hit the widget's error callback
-	and show "Failed to stop profiler — try again" — wrong, the
-	stop did work; what failed was analyze). Returning True with the
-	session already marked Failed lets stop() read the final status
+	re-raises. We catch the re-raise here so the caller's response
+	isn't a 500 error. Returning True with the session already
+	marked Failed lets the caller read the final status off the doc
 	and transition the widget to a correct terminal state.
 	"""
 	from frappe.utils.scheduler import is_scheduler_disabled
@@ -342,9 +328,51 @@ def _enqueue_analyze(session_uuid: str) -> bool:
 		frappe.log_error(title="frappe_profiler scheduler check")
 
 	if run_inline:
+		# Inline cap check — refuse huge sessions that would exceed
+		# gunicorn's request timeout. Only applied when docname is
+		# provided (all production callers provide it).
+		if docname:
+			cap = frappe.conf.get("profiler_inline_analyze_limit") or 50
+			try:
+				count = session.recording_count(session_uuid)
+			except Exception:
+				count = 0
+			if count > cap:
+				# IMPORTANT: the field is `analyzer_warnings` (plural,
+				# with -s). An earlier v0.5.0 version wrote to a
+				# phantom `analyze_error` field which doesn't exist
+				# on the doctype, causing MariaDB to raise 'Unknown
+				# column' and the stop API to return 500. The test
+				# suite missed this because FakeDB.set_value accepted
+				# any field name as a no-op.
+				try:
+					frappe.db.set_value(
+						"Profiler Session",
+						docname,
+						{
+							"status": "Failed",
+							"analyzer_warnings": (
+								f"Scheduler is disabled and this session "
+								f"has {count} recordings, exceeding the "
+								f"inline analyze cap of {cap}. "
+								f"Re-enable the scheduler "
+								f"(bench enable-scheduler) and click "
+								f"Retry Analyze on this session's form view."
+							),
+						},
+					)
+					frappe.db.commit()
+				except Exception:
+					frappe.log_error(
+						title="frappe_profiler inline cap mark Failed"
+					)
+				# The session is finalized (Failed). Return True so
+				# the caller treats it like any other inline result.
+				return True
+
 		frappe.logger().warning(
 			f"frappe_profiler: scheduler disabled; running analyze "
-			f"inline for session {session_uuid}. Stop API will block "
+			f"inline for session {session_uuid}. Caller will block "
 			f"until analyze completes."
 		)
 		try:
@@ -356,7 +384,7 @@ def _enqueue_analyze(session_uuid: str) -> bool:
 			)
 		except Exception:
 			# analyze.run already marked the session Failed and
-			# re-raised. Swallow here so stop() returns 200 — the
+			# re-raised. Swallow here so the caller returns 200 — the
 			# caller reads the final status off the doc and reports
 			# it to the widget.
 			frappe.log_error(
@@ -1010,8 +1038,10 @@ def retry_analyze(session_uuid: str) -> dict:
 	# disabled sites would re-hit the exact hung-forever bug that the
 	# v0.5.0 scheduler fallback was designed to fix — Retry would push
 	# to a queue no worker consumes and the session would stay stuck
-	# in Stopping forever.
-	ran_inline = _enqueue_analyze(session_uuid)
+	# in Stopping forever. Passing docname also lets the inline cap
+	# check mark this session Failed (with a clear message) if the
+	# recording count exceeds the inline limit.
+	ran_inline = _enqueue_analyze(session_uuid, docname=doc["name"])
 
 	# Read back the final status if inline analyze ran, so the client
 	# can show the right terminal state (same contract as stop()).

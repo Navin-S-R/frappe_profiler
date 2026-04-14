@@ -28,9 +28,16 @@ def test_stop_returns_ran_inline_flag():
     assert "ran_inline" in src
 
 
-def test_stop_session_honors_inline_analyze_limit():
-    src = inspect.getsource(api._stop_session)
+def test_enqueue_analyze_honors_inline_analyze_limit():
+    # v0.5.1: cap check lives inside _enqueue_analyze now, not
+    # _stop_session. Every inline-path caller (stop, retry_analyze,
+    # janitor) gets the same protection uniformly.
+    src = inspect.getsource(api._enqueue_analyze)
     assert "profiler_inline_analyze_limit" in src
+    # And must NOT have the cap check still in _stop_session — that
+    # would be a duplicate that could diverge.
+    stop_src = inspect.getsource(api._stop_session)
+    assert "profiler_inline_analyze_limit" not in stop_src
 
 
 def test_enqueue_analyze_passes_now_when_scheduler_disabled(monkeypatch):
@@ -175,14 +182,24 @@ def test_stop_returns_final_status_when_inline(monkeypatch):
 	assert '"status"' in src
 
 
-def test_stop_session_blocks_huge_inline_analyze(monkeypatch):
+def test_enqueue_analyze_blocks_huge_inline_session(monkeypatch):
     """Behavioral test for the inline-analyze recording cap.
 
     When scheduler is disabled AND recording_count > profiler_inline_analyze_limit,
-    _stop_session must mark the Profiler Session as Failed with a helpful
-    analyze_error and NOT call _enqueue_analyze. This prevents gunicorn from
-    killing a 200-recording inline analyze partway through, which would
-    leave the session half-analyzed.
+    _enqueue_analyze must:
+      1. Mark the Profiler Session as Failed
+      2. Write an actionable message to analyzer_warnings
+         (NOT 'analyze_error' — that field doesn't exist on the doctype,
+         writing to it would crash with MariaDB 'Unknown column')
+      3. NOT invoke frappe.enqueue
+      4. Return True so the caller treats it like any other inline
+         result and reads the final status off the doc
+
+    v0.5.1: the cap check moved from _stop_session into _enqueue_analyze
+    so ALL inline callers (stop, retry_analyze, janitor) get the same
+    protection uniformly. Earlier versions only applied the cap in
+    _stop_session, leaving retry_analyze vulnerable to the gunicorn
+    timeout on re-runs of large failed sessions.
     """
     import sys
     import types
@@ -200,14 +217,8 @@ def test_stop_session_blocks_huge_inline_analyze(monkeypatch):
     fake_frappe_utils.scheduler = fake_sched_mod
     monkeypatch.setitem(sys.modules, "frappe.utils", fake_frappe_utils)
 
-    # Stub frappe.conf, frappe.db, frappe.cache, session helpers.
-    #
-    # NOTE: FakeConf implements .get() because the planned production
-    # code accesses the cap via `frappe.conf.get("profiler_inline_analyze_limit")`.
-    # If the implementation ever switches to attribute access
-    # (e.g. `frappe.conf.profiler_inline_analyze_limit`), this stub must
-    # be updated to expose the same attribute — otherwise the cap check
-    # would silently fall through to a hardcoded default.
+    # frappe.conf is accessed via .get() in production. FakeConf mirrors
+    # that so a silent switch to attribute access would be caught.
     class FakeConf:
         def get(self, key, default=None):
             return {"profiler_inline_analyze_limit": 50}.get(key, default)
@@ -228,50 +239,32 @@ def test_stop_session_blocks_huge_inline_analyze(monkeypatch):
     monkeypatch.setattr(frappe, "conf", FakeConf(), raising=False)
     monkeypatch.setattr(frappe, "db", FakeDB(), raising=False)
     monkeypatch.setattr(
-        frappe, "local", types.SimpleNamespace(), raising=False
+        frappe, "log_error", lambda *a, **k: None, raising=False
     )
     monkeypatch.setattr(
-        session_mod, "get_active_session_for", lambda user: "test-uuid-huge",
+        frappe, "logger",
+        lambda: types.SimpleNamespace(warning=lambda *a, **k: None),
+        raising=False,
     )
-    monkeypatch.setattr(session_mod, "clear_active_session", lambda user: None)
     monkeypatch.setattr(
         session_mod, "recording_count", lambda session_uuid: 75
     )
 
-    # Stub capture._force_stop_inflight_capture and infra_capture._force_stop_inflight
-    from frappe_profiler import capture
-    monkeypatch.setattr(
-        capture, "_force_stop_inflight_capture", lambda local_proxy: None
-    )
-    from frappe_profiler import infra_capture
-    monkeypatch.setattr(
-        infra_capture, "_force_stop_inflight", lambda local_proxy: None
-    )
-
-    # _mark_stopping internally calls now_datetime() which reads Frappe's
-    # system-timezone setting, a path that needs a real site. Short-circuit
-    # it by returning a fixed docname — we're not testing _mark_stopping
-    # here, only the cap-check branch inside _stop_session.
-    monkeypatch.setattr(
-        api_mod, "_mark_stopping", lambda user, session_uuid: "PS-0001"
-    )
-    monkeypatch.setattr(
-        api_mod, "_clear_active", lambda user: None
-    )
-
-    # Spy on _enqueue_analyze to make sure it's NOT called
+    # frappe.enqueue must NOT be called at all when the cap fires.
     enqueue_calls = []
-    monkeypatch.setattr(
-        api_mod, "_enqueue_analyze",
-        lambda session_uuid: enqueue_calls.append(session_uuid) or False,
-    )
+    def fake_enqueue(*args, **kwargs):
+        enqueue_calls.append((args, kwargs))
+    monkeypatch.setattr(frappe, "enqueue", fake_enqueue)
 
-    docname, ran_inline = api_mod._stop_session("alice@example.com", "test-uuid-huge")
+    ran_inline = api_mod._enqueue_analyze("test-uuid-huge", docname="PS-0001")
 
-    assert docname == "PS-0001"
-    assert ran_inline is False
-    assert enqueue_calls == []  # did NOT enqueue
-    # Session must be marked Failed with the cap message
+    # Return contract: cap-exceeded counts as "session is finalized".
+    assert ran_inline is True
+    # And frappe.enqueue must NOT have been called — the cap check
+    # fires BEFORE the enqueue.
+    assert enqueue_calls == []
+
+    # Session must be marked Failed via set_value.
     status_calls = [
         c for c in set_calls
         if c[0] == "Profiler Session"
@@ -279,7 +272,58 @@ def test_stop_session_blocks_huge_inline_analyze(monkeypatch):
         and c[2].get("status") == "Failed"
     ]
     assert len(status_calls) == 1
-    error_msg = status_calls[0][2].get("analyze_error", "")
+
+    # CRITICAL: the error message must be in `analyzer_warnings`, NOT
+    # `analyze_error`. The doctype has no `analyze_error` field, so
+    # writing to it would crash with MariaDB 'Unknown column' in
+    # production. FakeDB accepts any field name so the test would
+    # silently pass if the code regressed to the wrong field name —
+    # assert explicitly.
+    payload = status_calls[0][2]
+    assert "analyzer_warnings" in payload, (
+        "Cap-exceeded failure must write to analyzer_warnings, not "
+        "analyze_error. analyze_error is NOT a field on Profiler Session "
+        "and writing to it crashes production with Unknown column."
+    )
+    assert "analyze_error" not in payload
+
+    error_msg = payload["analyzer_warnings"]
     assert "75" in error_msg
     assert "50" in error_msg
     assert "enable-scheduler" in error_msg
+
+
+def test_enqueue_analyze_cap_is_called_by_stop_session():
+    """Source-inspection regression guard: _stop_session must pass
+    docname to _enqueue_analyze so the cap check has the doc to
+    update. Earlier versions had the cap check inline in
+    _stop_session — the refactor moved it to _enqueue_analyze, and
+    if _stop_session forgets to pass docname, the cap silently
+    skips.
+    """
+    import inspect
+    from frappe_profiler import api
+
+    stop_src = inspect.getsource(api._stop_session)
+    assert "_enqueue_analyze(session_uuid, docname=" in stop_src or \
+           "_enqueue_analyze(\n\t\tsession_uuid," in stop_src or \
+           "docname=docname" in stop_src, (
+        "_stop_session must pass docname to _enqueue_analyze so the "
+        "inline cap check has the doc to mark Failed"
+    )
+
+
+def test_enqueue_analyze_cap_is_called_by_retry_analyze():
+    """Same guard for retry_analyze. v0.5.1 fix ensures retry
+    applies the same inline cap as stop() — a 200-recording Failed
+    session on a scheduler-disabled site must not run inline
+    without the cap check.
+    """
+    import inspect
+    from frappe_profiler import api
+
+    retry_src = inspect.getsource(api.retry_analyze)
+    assert "_enqueue_analyze" in retry_src
+    assert "docname=" in retry_src, (
+        "retry_analyze must pass docname to _enqueue_analyze"
+    )
