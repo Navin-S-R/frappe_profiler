@@ -244,6 +244,23 @@
 		frappe.call({
 			method: "frappe_profiler.api.status",
 			callback: (r) => {
+				// v0.5.0 pass-4 fix: re-check the display state inside
+				// the callback. The guard at the top of refreshStatus
+				// only prevents NEW polls from firing during transient
+				// states — it doesn't help an in-flight poll whose
+				// frappe.call was already dispatched before the user
+				// clicked Stop. Without this check, a late-arriving
+				// status response would overwrite the "stopping"
+				// display back to "recording" and break the state
+				// machine.
+				if (
+					currentState.display === "stopping"
+					|| currentState.display === "analyzing"
+					|| currentState.display === "ready"
+				) {
+					return;
+				}
+
 				const data = r.message || {};
 				if (data.active) {
 					currentState.active = true;

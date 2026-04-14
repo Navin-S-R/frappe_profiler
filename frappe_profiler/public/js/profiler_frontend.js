@@ -227,11 +227,31 @@
 
 		var body = JSON.stringify(payload);
 
+		// CRITICAL: the server endpoint signature is
+		//   submit_frontend_metrics(payload: str)
+		// where `payload` is the stringified inner JSON.
+		//
+		// For frappe.call this is automatic: args:{payload: body}
+		// becomes form-encoded kwargs and the function receives
+		// payload="<json string>".
+		//
+		// For sendBeacon we're sending raw body bytes as
+		// application/json. Frappe's request handler parses the
+		// JSON body and spreads its top-level keys as form_dict
+		// entries, which become kwargs on the endpoint. So we
+		// MUST wrap our inner JSON as {"payload": body} at the
+		// outer level, or the server would see
+		// submit_frontend_metrics(session_uuid=..., xhr=..., vitals=...)
+		// which doesn't match the signature and fails with
+		// TypeError. Earlier versions shipped without this wrap
+		// and the beacon path silently dropped every payload.
+		var beaconBody = JSON.stringify({ payload: body });
+
 		if (opts.sync && typeof navigator !== "undefined" && navigator.sendBeacon) {
 			try {
 				navigator.sendBeacon(
 					"/api/method/frappe_profiler.api.submit_frontend_metrics",
-					new Blob([body], { type: "application/json" })
+					new Blob([beaconBody], { type: "application/json" })
 				);
 				return;
 			} catch (e) { /* fall through to frappe.call */ }

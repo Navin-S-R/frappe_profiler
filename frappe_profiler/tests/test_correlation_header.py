@@ -67,6 +67,49 @@ def test_inject_correlation_header_idempotent():
     assert expose.count("X-Profiler-Recording-Id") == 1
 
 
+def test_inject_correlation_header_tokenwise_match_not_substring():
+    """Pass-4 regression guard: the idempotency check must split on
+    commas and compare tokens, not do a substring `in` match.
+
+    If another app already set
+    Access-Control-Expose-Headers: X-Profiler-Recording-Id-Legacy
+    a substring `in` check falsely sees our header as present and
+    skips adding it. The REAL header is then never exposed and the
+    browser refuses to surface it to JavaScript, silently breaking
+    the entire frontend correlation feature.
+    """
+    from frappe_profiler.hooks_callbacks import _inject_correlation_header
+
+    headers = {"Access-Control-Expose-Headers": "X-Profiler-Recording-Id-Legacy"}
+    _set_fake_local(headers)
+
+    _inject_correlation_header("rec-uuid-abc123")
+
+    expose = headers["Access-Control-Expose-Headers"]
+    # Both tokens must be present — the legacy one preserved, the
+    # real one appended as a new token.
+    tokens = [t.strip() for t in expose.split(",")]
+    assert "X-Profiler-Recording-Id-Legacy" in tokens
+    assert "X-Profiler-Recording-Id" in tokens
+
+
+def test_inject_correlation_header_case_insensitive_idempotency():
+    """HTTP header names are case-insensitive. The token check must
+    be too — if another app set the expose header in lowercase, we
+    shouldn't add our (same) header with different casing and create
+    a duplicate."""
+    from frappe_profiler.hooks_callbacks import _inject_correlation_header
+
+    headers = {"Access-Control-Expose-Headers": "x-profiler-recording-id"}
+    _set_fake_local(headers)
+
+    _inject_correlation_header("rec-uuid-abc123")
+
+    expose = headers["Access-Control-Expose-Headers"]
+    # Must not add a second entry just because our spelling differs.
+    assert expose.lower().count("x-profiler-recording-id") == 1
+
+
 def test_inject_correlation_header_noop_without_response_headers():
     """If frappe.local has no response_headers attribute (non-HTTP context
     like a script shell), the injector must no-op, not raise."""

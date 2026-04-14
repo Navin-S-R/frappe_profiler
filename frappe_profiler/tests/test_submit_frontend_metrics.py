@@ -241,6 +241,52 @@ def test_atomic_append_survives_simulated_race(mock_frappe):
     assert [d["recording_id"] for d in decoded] == ["r0", "r1", "r2", "r3", "r4"]
 
 
+def test_frontend_js_wraps_beacon_body_for_frappe_routing():
+    """Pass-4 regression guard: the sendBeacon path must wrap its
+    inner JSON body as {"payload": "<json string>"} so the server
+    sees a `payload` kwarg matching the endpoint signature.
+
+    Without the wrap, Frappe's request handler parses the raw body
+    as JSON and flattens the top-level keys into form_dict, so
+    submit_frontend_metrics is called with session_uuid=..., xhr=...,
+    vitals=... — which does NOT match the (payload: str) signature
+    and fails with TypeError. The beacon path silently drops every
+    payload in that case.
+
+    This is a source-inspection check on profiler_frontend.js since
+    we can't actually exercise sendBeacon in a unit test.
+    """
+    import os
+
+    here = os.path.dirname(__file__)
+    jspath = os.path.join(
+        here, "..", "public", "js", "profiler_frontend.js"
+    )
+    with open(jspath) as f:
+        src = f.read()
+
+    # Must construct a beaconBody distinct from the raw frappe.call body.
+    assert "beaconBody" in src, (
+        "profiler_frontend.js must construct a beaconBody wrapped as "
+        "{payload: body} for sendBeacon — see comment explaining the "
+        "server contract"
+    )
+    # Must wrap as {payload: body}.
+    assert "JSON.stringify({ payload: body })" in src or \
+           'JSON.stringify({"payload": body})' in src, (
+        "beaconBody must be JSON.stringify({ payload: body })"
+    )
+    # The Blob constructor used with sendBeacon must reference
+    # beaconBody, not the unwrapped body. Find `new Blob([beaconBody]`
+    # specifically — this string only appears in actual code, not in
+    # the explanatory comment block.
+    assert "new Blob([beaconBody]" in src, (
+        "sendBeacon must send new Blob([beaconBody], ...), not the "
+        "raw body — otherwise Frappe's JSON body flattening mismatches "
+        "the endpoint signature"
+    )
+
+
 def test_read_frontend_data_roundtrip(mock_frappe):
     """_read_frontend_data must decode the list entries back into the
     dict shape the frontend_timings analyzer expects."""

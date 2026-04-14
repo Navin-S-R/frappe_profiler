@@ -436,6 +436,9 @@ def _clear_capture_locals() -> None:
 # instrumentation failure mode.
 
 
+_CORRELATION_HEADER_NAME = "X-Profiler-Recording-Id"
+
+
 def _inject_correlation_header(recording_uuid: str) -> None:
 	"""Attach X-Profiler-Recording-Id to the outgoing response + expose it
 	via Access-Control-Expose-Headers. Called from after_request during
@@ -445,16 +448,24 @@ def _inject_correlation_header(recording_uuid: str) -> None:
 	if headers is None:
 		return
 
-	headers["X-Profiler-Recording-Id"] = recording_uuid
+	headers[_CORRELATION_HEADER_NAME] = recording_uuid
 
 	try:
 		existing = headers.get("Access-Control-Expose-Headers") or ""
 	except Exception:
 		existing = ""
-	if "X-Profiler-Recording-Id" not in existing:
+
+	# Token-by-token check, NOT a substring `in` check. A naive `in`
+	# would falsely match when another app has already added
+	# "X-Profiler-Recording-Id-Legacy" or similar — our real header
+	# would then NOT be appended, the browser would refuse to surface
+	# it to JavaScript, and the entire frontend correlation feature
+	# would silently break. Split on commas and compare case-insensitively.
+	tokens = {t.strip().lower() for t in existing.split(",") if t.strip()}
+	if _CORRELATION_HEADER_NAME.lower() not in tokens:
 		merged = (
-			existing + ", X-Profiler-Recording-Id"
+			existing + ", " + _CORRELATION_HEADER_NAME
 			if existing
-			else "X-Profiler-Recording-Id"
+			else _CORRELATION_HEADER_NAME
 		)
 		headers["Access-Control-Expose-Headers"] = merged
