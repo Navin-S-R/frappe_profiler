@@ -113,3 +113,74 @@ def test_match_findings_session_wide_finding_with_none_action_ref():
 	]
 	result = comparison.match_findings(new, baseline)
 	assert len(result["unchanged"]) == 1
+
+
+def _action(label, path, duration_ms=100, queries=10, query_time_ms=50):
+	return {
+		"action_label": label,
+		"path": path,
+		"http_method": "POST",
+		"event_type": "HTTP Request",
+		"duration_ms": duration_ms,
+		"queries_count": queries,
+		"query_time_ms": query_time_ms,
+	}
+
+
+def test_match_actions_exact_label():
+	baseline = [_action("POST /api/save SI", "/api/save", 800, 47, 310)]
+	new = [_action("POST /api/save SI", "/api/save", 340, 18, 95)]
+	pairs = comparison.match_actions(new, baseline)
+	assert len(pairs) == 1
+	assert pairs[0]["status"] == "matched"
+	assert pairs[0]["delta_ms"] == -460
+	assert pairs[0]["delta_queries"] == -29
+	assert pairs[0]["delta_query_time_ms"] == -215
+
+
+def test_match_actions_positional_duplicates():
+	baseline = [
+		_action("POST /api/save SI", "/api/save", 100),
+		_action("POST /api/save SI", "/api/save", 200),
+		_action("POST /api/save SI", "/api/save", 300),
+	]
+	new = [
+		_action("POST /api/save SI", "/api/save", 50),
+		_action("POST /api/save SI", "/api/save", 150),
+		_action("POST /api/save SI", "/api/save", 250),
+	]
+	pairs = comparison.match_actions(new, baseline)
+	matched = [p for p in pairs if p["status"] == "matched"]
+	assert len(matched) == 3
+	assert matched[0]["delta_ms"] == -50
+	assert matched[1]["delta_ms"] == -50
+	assert matched[2]["delta_ms"] == -50
+
+
+def test_match_actions_only_in_baseline():
+	baseline = [_action("A", "/a", 100), _action("B", "/b", 200)]
+	new = [_action("A", "/a", 80)]
+	pairs = comparison.match_actions(new, baseline)
+	matched = [p for p in pairs if p["status"] == "matched"]
+	only_baseline = [p for p in pairs if p["status"] == "only_in_baseline"]
+	assert len(matched) == 1
+	assert len(only_baseline) == 1
+	assert only_baseline[0]["baseline"]["action_label"] == "B"
+
+
+def test_match_actions_only_in_new():
+	baseline = [_action("A", "/a", 100)]
+	new = [_action("A", "/a", 80), _action("C", "/c", 50)]
+	pairs = comparison.match_actions(new, baseline)
+	only_new = [p for p in pairs if p["status"] == "only_in_new"]
+	assert len(only_new) == 1
+	assert only_new[0]["new"]["action_label"] == "C"
+
+
+def test_match_actions_fallback_to_path():
+	baseline = [_action("Sales Invoice flow v1", "/api/save_si", 800)]
+	new = [_action("Sales Invoice flow v2 RENAMED", "/api/save_si", 340)]
+	pairs = comparison.match_actions(new, baseline)
+	matched = [p for p in pairs if p["status"] == "matched"]
+	assert len(matched) == 1
+	assert matched[0]["delta_ms"] == -460

@@ -160,3 +160,84 @@ def match_findings(new_findings: list, baseline_findings: list) -> dict:
 		fixed.extend(dict(f) for f in remaining)
 
 	return {"fixed": fixed, "new": new, "unchanged": unchanged}
+
+
+def _make_action_pair(status, baseline=None, new=None):
+	"""Build an action-pair dict with computed deltas (or None for unmatched)."""
+	delta_ms = None
+	delta_queries = None
+	delta_query_time_ms = None
+	if status == "matched" and baseline is not None and new is not None:
+		delta_ms = round(
+			(new.get("duration_ms") or 0) - (baseline.get("duration_ms") or 0), 2
+		)
+		delta_queries = (new.get("queries_count") or 0) - (baseline.get("queries_count") or 0)
+		delta_query_time_ms = round(
+			(new.get("query_time_ms") or 0) - (baseline.get("query_time_ms") or 0), 2
+		)
+	return {
+		"status": status,
+		"baseline": baseline,
+		"new": new,
+		"delta_ms": delta_ms,
+		"delta_queries": delta_queries,
+		"delta_query_time_ms": delta_query_time_ms,
+	}
+
+
+def match_actions(new_actions: list, baseline_actions: list) -> list:
+	"""Pair actions from two sessions.
+
+	Matching strategy:
+	  1. Exact action_label match. Positional within duplicates: first
+	     occurrence of a label in new pairs with first occurrence in
+	     baseline.
+	  2. Fallback: match unmatched new actions to unmatched baseline
+	     actions by path alone (covers session-label renames).
+	  3. Anything still unmatched goes to only_in_baseline / only_in_new.
+
+	Returns a flat list of action-pair dicts.
+	"""
+	# Step 1: build per-label queues for baseline
+	baseline_by_label = defaultdict(list)
+	for action in (baseline_actions or []):
+		baseline_by_label[action.get("action_label")].append(action)
+
+	pairs = []
+	new_unmatched = []
+
+	for action in (new_actions or []):
+		label = action.get("action_label")
+		queue = baseline_by_label.get(label)
+		if queue:
+			baseline_action = queue.pop(0)
+			pairs.append(_make_action_pair("matched", baseline_action, action))
+		else:
+			new_unmatched.append(action)
+
+	# Step 2: fallback to path matching for any remaining new actions
+	baseline_remaining_by_path = defaultdict(list)
+	for queue in baseline_by_label.values():
+		for action in queue:
+			baseline_remaining_by_path[action.get("path")].append(action)
+
+	still_new_unmatched = []
+	for action in new_unmatched:
+		path = action.get("path")
+		queue = baseline_remaining_by_path.get(path)
+		if queue:
+			baseline_action = queue.pop(0)
+			pairs.append(_make_action_pair("matched", baseline_action, action))
+		else:
+			still_new_unmatched.append(action)
+
+	# Step 3: emit only_in_baseline for anything left
+	for queue in baseline_remaining_by_path.values():
+		for action in queue:
+			pairs.append(_make_action_pair("only_in_baseline", baseline=action))
+
+	# Emit only_in_new for the remaining unmatched new actions
+	for action in still_new_unmatched:
+		pairs.append(_make_action_pair("only_in_new", new=action))
+
+	return pairs
