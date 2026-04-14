@@ -18,8 +18,20 @@
 (function () {
 	"use strict";
 
+	// v0.5.1 diagnostic: hardcoded build ID bumped on every widget fix.
+	// This lets us confirm (from browser devtools) that the user is
+	// actually running the latest JS, vs a stale cached copy from an
+	// earlier page load. If the build ID in the console / in the
+	// widget's title attribute doesn't match what we think is current,
+	// the user is on cached JS and needs a hard refresh + bench restart.
+	const WIDGET_BUILD_ID = "2026-04-15-stop-fix-v3";
+
 	// LOUD diagnostic so we can SEE this script execute in the browser console.
-	console.log("[frappe_profiler] floating_widget.js LOADED at", new Date().toISOString());
+	console.log(
+		"[frappe_profiler] floating_widget.js LOADED",
+		"build=" + WIDGET_BUILD_ID,
+		"at", new Date().toISOString()
+	);
 
 	// Only run inside Desk (not on web pages or guest sessions).
 	if (typeof frappe === "undefined" || typeof frappe.session === "undefined") {
@@ -183,6 +195,11 @@
 		widget = document.createElement("div");
 		widget.id = "frappe-profiler-widget";
 		widget.className = "fp-state-inactive";
+		// Expose the build ID so a hovering user / dev-tools inspector
+		// can confirm which JS is actually running without opening
+		// the console.
+		widget.title = "Frappe Profiler — build " + WIDGET_BUILD_ID;
+		widget.setAttribute("data-build-id", WIDGET_BUILD_ID);
 		widget.innerHTML = `
 			<span class="fp-dot"></span>
 			<span class="fp-label">Profiler</span>
