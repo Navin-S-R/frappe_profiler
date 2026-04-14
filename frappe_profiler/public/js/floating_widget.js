@@ -352,7 +352,11 @@
 
 	function confirmAndStop() {
 		// No confirmation modal — keep it one-click. Just fire stop().
+		// Update currentState.display BEFORE the API call so refreshStatus()'s
+		// transient-state guard (line ~241) kicks in — otherwise the 5s poll
+		// can race the stop API and flip the widget back to "Recording".
 		setDisplay("stopping", "Stopping…", "");
+		currentState.display = "stopping";
 		stopElapsedTimer();
 		frappe.call({
 			method: "frappe_profiler.api.stop",
@@ -362,6 +366,18 @@
 				frappe.show_alert({
 					message: __("Profiler stopped — analyzing session…"),
 					indicator: "orange",
+				});
+			},
+			error: () => {
+				// Stop failed — recording is still active server-side.
+				// Revert to recording so the user can retry instead of
+				// being stranded on "Stopping…" forever.
+				currentState.display = "recording";
+				setDisplay("recording", "Recording", computeElapsed());
+				startElapsedTimer();
+				frappe.show_alert({
+					message: __("Failed to stop profiler — try again"),
+					indicator: "red",
 				});
 			},
 		});
