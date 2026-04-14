@@ -214,18 +214,45 @@ def _mark_stopping(user: str, session_uuid: str) -> str | None:
 	return docname
 
 
-def _enqueue_analyze(session_uuid: str) -> None:
-	"""Enqueue the background analyze job on the long queue.
+def _enqueue_analyze(session_uuid: str) -> bool:
+	"""Enqueue analyze on the long queue, or run inline if no worker
+	will consume it.
 
-	We use queue="long" because EXPLAIN against many queries on a busy
-	production database can take 30+ seconds for a heavy session. The
-	long queue's 25-minute timeout gives us headroom.
+	When `bench disable-scheduler` is in effect (or the "Enable
+	Scheduler" toggle in System Settings is off), many deployments
+	don't have a `bench worker` processing the RQ queue either, so
+	an enqueued analyze job would sit forever and the session would
+	hang in the "Stopping" state. In that case we fall back to
+	``frappe.enqueue(now=True)`` which executes analyze synchronously
+	inside the current request. See v0.5.0 design spec §6.
+
+	Returns True if analyze ran inline (the caller must report this
+	to the client via ``ran_inline: True`` so the UI can skip the
+	"Analyzing…" state). Returns False if the job was pushed to the
+	queue as usual.
 	"""
+	from frappe.utils.scheduler import is_scheduler_disabled
+
+	run_inline = False
+	try:
+		run_inline = bool(is_scheduler_disabled())
+	except Exception:
+		frappe.log_error(title="frappe_profiler scheduler check")
+
+	if run_inline:
+		frappe.logger().warning(
+			f"frappe_profiler: scheduler disabled; running analyze "
+			f"inline for session {session_uuid}. Stop API will block "
+			f"until analyze completes."
+		)
+
 	frappe.enqueue(
 		"frappe_profiler.analyze.run",
 		queue="long",
 		session_uuid=session_uuid,
+		now=run_inline,
 	)
+	return run_inline
 
 
 @frappe.whitelist()
