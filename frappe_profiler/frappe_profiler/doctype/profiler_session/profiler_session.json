@@ -38,7 +38,10 @@
   "hot_frames_json",
   "session_time_breakdown_json",
   "table_breakdown_json",
-  "analyzer_warnings"
+  "analyzer_warnings",
+  "compared_to_session",
+  "is_baseline",
+  "safe_report_pdf_file"
  ],
  "fields": [
   {
@@ -257,6 +260,29 @@
    "hidden": 1,
    "label": "Analyzer Warnings",
    "read_only": 1
+  },
+  {
+   "fieldname": "compared_to_session",
+   "fieldtype": "Link",
+   "label": "Compared To Session",
+   "options": "Profiler Session",
+   "read_only": 1,
+   "description": "v0.4.0+: baseline session for comparison rendering. When set, the safe + raw reports include comparison sections against this baseline."
+  },
+  {
+   "fieldname": "is_baseline",
+   "fieldtype": "Check",
+   "label": "Is Baseline",
+   "default": 0,
+   "read_only": 1,
+   "description": "v0.4.0+: True when this session is the currently-pinned baseline for its label."
+  },
+  {
+   "fieldname": "safe_report_pdf_file",
+   "fieldtype": "Attach",
+   "label": "Safe Report (PDF, lazy-generated)",
+   "read_only": 1,
+   "description": "v0.4.0+: lazy-generated PDF version of the safe report. Populated on first download_pdf API call and cached thereafter."
   }
  ],
  "index_web_pages_for_search": 0,
