@@ -14,19 +14,67 @@ PROFILER_USER_ROLE = "Profiler User"
 
 
 def after_install():
-	"""Create the Profiler User role if it doesn't already exist."""
-	if frappe.db.exists("Role", PROFILER_USER_ROLE):
-		return
+	"""Create the Profiler User role and auto-assign it to System Managers."""
+	if not frappe.db.exists("Role", PROFILER_USER_ROLE):
+		frappe.get_doc(
+			{
+				"doctype": "Role",
+				"role_name": PROFILER_USER_ROLE,
+				"desk_access": 1,
+				"is_custom": 0,
+			}
+		).insert(ignore_permissions=True)
+		frappe.db.commit()
 
-	frappe.get_doc(
-		{
-			"doctype": "Role",
-			"role_name": PROFILER_USER_ROLE,
-			"desk_access": 1,
-			"is_custom": 0,
-		}
-	).insert(ignore_permissions=True)
-	frappe.db.commit()
+	# v0.4.0: auto-assign the Profiler User role to every existing
+	# System Manager. Idempotent — users who already have it are skipped.
+	# Wrapped in try/except so a failure can't abort the install.
+	try:
+		_assign_profiler_user_to_system_managers()
+	except Exception:
+		try:
+			frappe.log_error(title="frappe_profiler after_install auto-role")
+		except Exception:
+			pass
+
+
+def _assign_profiler_user_to_system_managers():
+	"""Add Profiler User role to every user who has System Manager.
+
+	Idempotent: existing Profiler Users are left untouched. Never removes
+	roles. Safe to call repeatedly.
+	"""
+	user_names = frappe.get_all("User", pluck="name")
+	for name in user_names:
+		user = frappe.get_doc("User", name)
+		role_names = {r.role for r in (user.roles or [])}
+		if "System Manager" not in role_names:
+			continue
+		if PROFILER_USER_ROLE in role_names:
+			continue
+		user.append("roles", {"role": PROFILER_USER_ROLE})
+		user.save(ignore_permissions=True)
+
+
+def on_user_role_change(doc, method=None):
+	"""validate hook on User: auto-add Profiler User when System Manager
+	is present.
+
+	Wired via hooks.py: doc_events["User"]["validate"]. Silent — never
+	raises and never produces a user-facing message. Idempotent.
+	"""
+	try:
+		role_names = {r.role for r in (doc.roles or [])}
+		if "System Manager" not in role_names:
+			return
+		if PROFILER_USER_ROLE in role_names:
+			return
+		doc.append("roles", {"role": PROFILER_USER_ROLE})
+	except Exception:
+		try:
+			frappe.log_error(title="frappe_profiler on_user_role_change")
+		except Exception:
+			pass
 
 
 def before_uninstall():
