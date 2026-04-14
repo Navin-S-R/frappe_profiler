@@ -204,6 +204,29 @@
     .stats { grid-template-columns: repeat(2, 1fr); }
     .container { padding: 12px; }
   }
+
+  /* v0.4.0 — comparison sections */
+  .comparison-card { background: #f8fafc; padding: 16px 20px; border-radius: 8px;
+                     border-left: 4px solid #2563eb; margin-bottom: 20px; }
+  .comparison-card .session-delta { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  .comparison-card .session-delta th { text-align: left; padding: 6px 8px; }
+  .comparison-card .session-delta td { padding: 6px 8px; }
+  .comparison-card .delta.neg { color: #16a34a; font-weight: 600; }
+  .comparison-card .delta.pos { color: #dc2626; font-weight: 600; }
+
+  .comparison-action-diff .delta.neg { color: #16a34a; }
+  .comparison-action-diff .delta.pos { color: #dc2626; }
+
+  .comparison-findings { margin: 20px 0; }
+  .comparison-findings .fixed-findings-header { color: #166534; }
+  .comparison-findings .new-findings-header { color: #b91c1c; }
+  .comparison-findings .unchanged-findings-header { color: #6b7280; }
+  .comparison-findings .fixed-findings li { color: #166534; }
+  .comparison-findings .new-findings li { color: #991b1b; }
+  .comparison-findings .unchanged-findings li { color: #4b5563; }
+  .comparison-findings .delta.improved { color: #16a34a; font-weight: 600; }
+  .comparison-findings .delta.worsened { color: #d97706; font-weight: 600; }
+  .comparison-findings .severity-delta { color: #6b7280; font-style: italic; margin-left: 6px; }
 </style>
 </head>
 <body>
@@ -232,6 +255,32 @@
       <p class="small muted"><strong>Warnings:</strong> {{ session.analyzer_warnings }}</p>
     {% endif %}
   </div>
+
+  {# v0.4.0: SECTION C1 — Session-level delta card #}
+  {% if comparison %}
+  <section class="section comparison-card">
+    <h2>Compared to baseline: {{ comparison.baseline_info.title }}</h2>
+    <p class="muted">Baseline recorded {{ comparison.baseline_info.started_at }}</p>
+    <table class="session-delta">
+      <thead>
+        <tr><th>Metric</th><th>Baseline</th><th>New</th><th>Delta</th></tr>
+      </thead>
+      <tbody>
+        {% for metric, row in comparison.session_delta.items() %}
+        <tr>
+          <td>{{ metric }}</td>
+          <td>{{ row.old }}</td>
+          <td>{{ row.new }}</td>
+          <td class="delta {{ 'neg' if row.delta < 0 else ('pos' if row.delta > 0 else '') }}">
+            {% if row.delta < 0 %}↓{% elif row.delta > 0 %}↑{% endif %}
+            {{ row.delta }} ({{ row.pct }}%)
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
 
   {# --------------- STAT CARDS --------------- #}
   <div class="stats">
@@ -314,6 +363,101 @@
       <p class="empty">No actions were recorded in this session.</p>
     {% endif %}
   </div>
+
+  {# v0.4.0: SECTION C2 — Per-action comparison diff #}
+  {% if comparison and comparison.action_pairs %}
+  <section class="section comparison-action-diff">
+    <h2>Per-action comparison</h2>
+
+    {% set matched = comparison.action_pairs | selectattr("status", "equalto", "matched") | list %}
+    {% if matched %}
+    <table>
+      <thead>
+        <tr>
+          <th>Action</th>
+          <th class="num">Baseline</th>
+          <th class="num">New</th>
+          <th class="num">Delta</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for pair in matched %}
+        <tr>
+          <td>{{ pair.new.action_label }}</td>
+          <td class="num">{{ pair.baseline.duration_ms | round(0) | int }}ms / {{ pair.baseline.queries_count }}q</td>
+          <td class="num">{{ pair.new.duration_ms | round(0) | int }}ms / {{ pair.new.queries_count }}q</td>
+          <td class="num delta {{ 'neg' if pair.delta_ms < 0 else ('pos' if pair.delta_ms > 0 else '') }}">
+            {{ pair.delta_ms | round(0) | int }}ms, {{ pair.delta_queries }}q
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    {% set fixed_actions = comparison.action_pairs | selectattr("status", "equalto", "only_in_baseline") | list %}
+    {% if fixed_actions %}
+    <h3>Gone in new session (possibly fixed)</h3>
+    <ul>
+      {% for pair in fixed_actions %}
+      <li>{{ pair.baseline.action_label }} — was {{ pair.baseline.duration_ms | round(0) | int }}ms</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% set new_actions_only = comparison.action_pairs | selectattr("status", "equalto", "only_in_new") | list %}
+    {% if new_actions_only %}
+    <h3>New in this session (possibly regressed)</h3>
+    <ul>
+      {% for pair in new_actions_only %}
+      <li>{{ pair.new.action_label }} — {{ pair.new.duration_ms | round(0) | int }}ms</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {# v0.4.0: SECTION C3 — Finding diff #}
+  {% if comparison and (comparison.finding_diff.fixed or comparison.finding_diff.new or comparison.finding_diff.unchanged) %}
+  <section class="section comparison-findings">
+    <h2>Findings compared to baseline</h2>
+
+    {% if comparison.finding_diff.fixed %}
+    <h3 class="fixed-findings-header">Fixed ({{ comparison.finding_diff.fixed | length }})</h3>
+    <ul class="fixed-findings">
+      {% for f in comparison.finding_diff.fixed %}
+      <li>✓ {{ f.title }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if comparison.finding_diff.new %}
+    <h3 class="new-findings-header">New ({{ comparison.finding_diff.new | length }})</h3>
+    <ul class="new-findings">
+      {% for f in comparison.finding_diff.new %}
+      <li class="severity-{{ (f.severity or 'medium') | lower }}">{{ f.title }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if comparison.finding_diff.unchanged %}
+    <h3 class="unchanged-findings-header">Unchanged ({{ comparison.finding_diff.unchanged | length }})</h3>
+    <ul class="unchanged-findings">
+      {% for f in comparison.finding_diff.unchanged %}
+      <li>
+        {{ f.title }}
+        {% if f.delta_impact_ms %}
+        <span class="delta {{ 'improved' if f.delta_impact_ms < 0 else 'worsened' }}">
+          ({{ f.delta_impact_ms | round(0) | int }}ms, {{ f.delta_impact_pct }}%)
+        </span>
+        {% endif %}
+        {% if f.delta_severity %}<span class="severity-delta">{{ f.delta_severity }}</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+  {% endif %}
 
   {# --------------- FINDINGS --------------- #}
   <div class="section">
