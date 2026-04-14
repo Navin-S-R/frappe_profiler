@@ -254,6 +254,12 @@
 					currentState.display = "recording";
 					startElapsedTimer();
 					setDisplay("recording", "Recording", computeElapsed());
+					// v0.5.0: expose session UUID on the widget element so
+					// profiler_frontend.js can tag its flush payloads without
+					// a shared global.
+					if (widget) {
+						widget.setAttribute("data-session-uuid", data.session_uuid || "");
+					}
 				} else {
 					if (currentState.display === "recording") {
 						// We thought we were recording but server says no — auto-stop
@@ -264,6 +270,9 @@
 					}
 					if (currentState.display !== "ready") {
 						setDisplay("inactive", "Profiler", "");
+					}
+					if (widget) {
+						widget.removeAttribute("data-session-uuid");
 					}
 				}
 			},
@@ -338,6 +347,10 @@
 							currentState.display = "recording";
 							startElapsedTimer();
 							setDisplay("recording", "Recording", "0:00");
+							// v0.5.0: expose session UUID for profiler_frontend.js.
+							if (widget) {
+								widget.setAttribute("data-session-uuid", data.session_uuid || "");
+							}
 							frappe.show_alert({
 								message: __("Profiler started: {0}", [data.title]),
 								indicator: "green",

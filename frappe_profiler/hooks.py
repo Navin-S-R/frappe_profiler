@@ -23,7 +23,13 @@ required_apps = ["frappe"]
 # pulls the version from __version__ so every release auto-busts.
 from frappe_profiler import __version__ as _frappe_profiler_version
 
-app_include_js = f"/assets/frappe_profiler/js/floating_widget.js?v={_frappe_profiler_version}"
+app_include_js = [
+	f"/assets/frappe_profiler/js/floating_widget.js?v={_frappe_profiler_version}",
+	# v0.5.0: browser-side metrics shim (fetch/XHR wrap + Web Vitals).
+	# Loads after floating_widget.js so the widget is already in the DOM
+	# when profiler_frontend.js reads its data-session-uuid attribute.
+	f"/assets/frappe_profiler/js/profiler_frontend.js?v={_frappe_profiler_version}",
+]
 app_include_css = f"/assets/frappe_profiler/css/floating_widget.css?v={_frappe_profiler_version}"
 
 # Installation
