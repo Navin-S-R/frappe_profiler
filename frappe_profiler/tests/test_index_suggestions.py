@@ -890,6 +890,190 @@ def test_typeerror_from_optimizer_is_also_a_soft_skip(monkeypatch, empty_context
 	assert len(soft) == 1
 
 
+def test_low_per_query_savings_suggestion_is_suppressed(monkeypatch, empty_context):
+	"""Exact production payload: tabDocType.modified flagged with
+	892ms cumulative across 1526 queries = 0.58ms per query, below
+	the 2ms per-query floor. Must suppress the finding entirely and
+	surface a soft warning explaining why."""
+
+	def fake_optimize(query: str):
+		return _FakeDBIndex("tabDocType", "modified")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+
+	# Build 1526 identical queries averaging 892/1526 = 0.585ms each.
+	# Use a single recording to keep the test fast; the analyzer
+	# aggregates by normalized_query which is unique per call here
+	# (we need distinct normalized_queries to count as 1526 separate
+	# optimizer invocations). Actually the analyzer deduplicates by
+	# normalized_query at the input layer, so use ONE normalized
+	# query and set its `duration` high and `count` high directly.
+	# Easier: feed 1526 raw calls with the same normalized_query;
+	# the analyzer folds them into one bucket with count=1526 and
+	# duration=892ms before running the optimizer.
+	calls = [
+		{
+			"query": f"SELECT * FROM `tabDocType` ORDER BY modified DESC LIMIT {i}",
+			"normalized_query": "SELECT * FROM `tabDocType` ORDER BY modified DESC LIMIT ?",
+			"duration": 892.0 / 1526,  # ~0.585ms per query
+			"stack": [],
+		}
+		for i in range(1526)
+	]
+	recording = {
+		"uuid": "ix_low_avg",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 892.0,
+		"calls": calls,
+	}
+
+	result = index_suggestions.analyze([recording], empty_context)
+
+	# No Missing Index finding for tabDocType.modified despite 892ms cumulative.
+	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
+	assert missing == [], (
+		"A suggestion with 0.58ms average savings per query must be "
+		f"suppressed — individual queries are already fast enough. "
+		f"Got findings: {[f['title'] for f in missing]}"
+	)
+
+	# Soft warning explains the suppression.
+	assert any(
+		"Suppressed 1 index suggestion(s) with average savings below" in w
+		for w in result.warnings
+	), f"Expected per-query-floor warning; got: {result.warnings}"
+
+
+def test_low_per_query_skips_classify_lookup(monkeypatch, empty_context):
+	"""The per-query floor check must run BEFORE classify_column, so
+	we don't waste SHOW INDEX / information_schema lookups on
+	suggestions we're going to drop anyway."""
+
+	def fake_optimize(query):
+		return _FakeDBIndex("tabDocType", "modified")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+
+	sql_calls = []
+	import frappe
+
+	class FakeDB:
+		def sql(self, query, params=None, as_dict=False):
+			sql_calls.append(query)
+			return []
+
+	monkeypatch.setattr(frappe, "db", FakeDB(), raising=False)
+	monkeypatch.setattr(frappe, "log_error", lambda *a, **k: None, raising=False)
+
+	calls = [
+		{
+			"query": f"SELECT ... {i}",
+			"normalized_query": "SELECT ? FROM `tabDocType`",
+			"duration": 0.5,  # way below 2ms floor
+			"stack": [],
+		}
+		for i in range(200)
+	]
+	recording = {
+		"uuid": "ix_no_schema_calls",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 100,
+		"calls": calls,
+	}
+	result = index_suggestions.analyze([recording], empty_context)
+	# No findings, and no SHOW INDEX / information_schema call was made.
+	assert result.findings == []
+	for sql in sql_calls:
+		assert "SHOW INDEX" not in sql, (
+			f"Classifier shouldn't run for dropped suggestions; got: {sql}"
+		)
+		assert "information_schema" not in sql, (
+			f"Classifier shouldn't run for dropped suggestions; got: {sql}"
+		)
+
+
+def test_high_per_query_savings_still_emits(monkeypatch, empty_context):
+	"""Positive case: a suggestion with a meaningful per-query
+	average (50ms each × 10 queries = 500ms total) must still fire.
+	The floor suppresses only marginal cases."""
+
+	def fake_optimize(query):
+		return _FakeDBIndex("tabReport", "department")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+	_install_fake_frappe_db(
+		monkeypatch,
+		indexed_columns_by_table={"tabReport": {"name"}},
+		column_types_by_table={
+			"tabReport": {"name": "varchar", "department": "varchar"},
+		},
+	)
+
+	calls = [
+		{
+			"query": f"SELECT * FROM tabReport WHERE department = 'd{i}'",
+			"normalized_query": "SELECT * FROM tabReport WHERE department = ?",
+			"duration": 55.0,  # 55ms per query — well above 2ms floor
+			"stack": [],
+		}
+		for i in range(10)
+	]
+	recording = {
+		"uuid": "ix_high_avg",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 550,
+		"calls": calls,
+	}
+	result = index_suggestions.analyze([recording], empty_context)
+	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
+	assert len(missing) == 1
+	# 550ms > HIGH_IMPACT_MS (500) → High severity
+	assert missing[0]["severity"] == "High"
+
+
+def test_per_query_floor_boundary_at_exactly_2ms(monkeypatch, empty_context):
+	"""Boundary: exactly MIN_AVG_SAVINGS_PER_QUERY_MS (2ms) must
+	still fire. The condition is `< MIN`, not `<=`."""
+	from frappe_profiler.analyzers.index_suggestions import (
+		MIN_AVG_SAVINGS_PER_QUERY_MS,
+	)
+
+	def fake_optimize(query):
+		return _FakeDBIndex("tabAtFloor", "col")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+	_install_fake_frappe_db(
+		monkeypatch,
+		indexed_columns_by_table={"tabAtFloor": {"name"}},
+		column_types_by_table={
+			"tabAtFloor": {"name": "varchar", "col": "varchar"},
+		},
+	)
+
+	calls = [
+		{
+			"query": f"SELECT * FROM tabAtFloor WHERE col = 'v{i}'",
+			"normalized_query": "SELECT * FROM tabAtFloor WHERE col = ?",
+			"duration": MIN_AVG_SAVINGS_PER_QUERY_MS,  # exactly at floor
+			"stack": [],
+		}
+		for i in range(50)
+	]
+	recording = {
+		"uuid": "ix_boundary",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 200,
+		"calls": calls,
+	}
+	result = index_suggestions.analyze([recording], empty_context)
+	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
+	assert len(missing) == 1, (
+		"Suggestion at exactly MIN_AVG_SAVINGS_PER_QUERY_MS must still "
+		"fire (< floor, not <= floor); got: "
+		f"{[f['title'] for f in missing]}"
+	)
+
+
 def test_get_query_type_helper_direct():
 	"""Direct unit test of the _get_query_type helper — covers the
 	regex edge cases without the full analyzer path."""

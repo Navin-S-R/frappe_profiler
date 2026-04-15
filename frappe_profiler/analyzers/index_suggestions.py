@@ -51,6 +51,28 @@ def _scrub_literals(text: str) -> str:
 HIGH_IMPACT_MS = 500
 MEDIUM_IMPACT_MS = 100
 MAX_EXAMPLE_QUERIES = 3
+
+# v0.5.1: minimum average savings per query before a suggestion is worth
+# emitting. Without this floor, the analyzer reports cases like:
+#
+#   "Adding an index to tabDocType.modified would speed up 1526 queries
+#    in this session, saving roughly 892ms total."
+#
+# 892 / 1526 = 0.58ms per query — below MariaDB's per-query overhead.
+# On a small framework table (tabDocType is typically ~800 rows) the
+# table already fits in memory, the scan is effectively free, and
+# adding a btree index yields no measurable improvement. The user
+# spends time on an index migration that saves nothing.
+#
+# The severity thresholds (HIGH_IMPACT_MS, MEDIUM_IMPACT_MS) gate
+# severity based on CUMULATIVE time, but a 2ms-per-query × 1000-query
+# suggestion still crosses the 500ms cumulative threshold while being
+# individually actionable — so we need a separate per-query minimum
+# to distinguish "many tiny queries" from "a few slow queries."
+#
+# 2ms is the floor: below this, query overhead (network roundtrip +
+# MariaDB dispatch) dominates over whatever time the index could save.
+MIN_AVG_SAVINGS_PER_QUERY_MS = 2.0
 # Log the first N failures to the Frappe Error Log; beyond that, we just
 # count. Prevents the Error Log from being flooded by one bad session
 # with thousands of unparseable queries.
@@ -383,10 +405,27 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 	type_cache: dict[str, dict[str, str]] = {}
 	drop_already_indexed = 0
 	drop_unindexable = 0
+	drop_low_per_query = 0
 	unindexable_reasons: list[str] = []
 
 	findings = []
 	for (table, column), bucket in suggestion_buckets.items():
+		# v0.5.1: per-query savings floor. A suggestion's total impact
+		# might be high in aggregate but pointless in practice if each
+		# individual query is already fast. A real production case had
+		# tabDocType.modified flagged with 892ms / 1526 queries =
+		# 0.58ms per query — below MariaDB's per-query overhead.
+		# Indexing would not measurably help the user, so we suppress
+		# the finding entirely. Checked BEFORE classify_column so we
+		# don't waste SHOW INDEX / information_schema queries on
+		# cases we're going to drop anyway.
+		count = bucket["count"]
+		if count > 0:
+			avg_savings_per_query = bucket["duration"] / count
+			if avg_savings_per_query < MIN_AVG_SAVINGS_PER_QUERY_MS:
+				drop_low_per_query += 1
+				continue
+
 		status, ddl_or_reason = _classify_column(
 			table, column, indexed_cache, type_cache
 		)
@@ -487,6 +526,13 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 			"suggestions (BEGIN/COMMIT/SAVEPOINT/SET/DDL/CALL/SHOW). "
 			"These don't benefit from single-column btree index suggestions "
 			"and aren't counted as analysis failures."
+		)
+	if drop_low_per_query:
+		warnings.append(
+			f"Suppressed {drop_low_per_query} index suggestion(s) with "
+			f"average savings below {MIN_AVG_SAVINGS_PER_QUERY_MS:g}ms "
+			"per query. These queries are already running near MariaDB's "
+			"per-query overhead floor — an index wouldn't measurably help."
 		)
 	if drop_already_indexed:
 		warnings.append(
