@@ -42,6 +42,70 @@ import frappe.recorder  # imported at module top so function-local `import frapp
 from frappe_profiler import capture as _capture
 from frappe_profiler import session
 
+# v0.5.1: Skip-list for instrumentation-noise endpoints. Any HTTP request
+# whose ``cmd`` starts with one of these prefixes is NOT recorded against
+# the user's active profiler session, even though everything else about
+# the request (auth, user, active session) would normally mean "record me".
+#
+# Why: these are the profiler's own widget-polling calls and Frappe's own
+# Recorder doctype whitelisted methods. They fire during an active session
+# but represent instrumentation overhead, not application work the user is
+# trying to optimize. Capturing them pollutes:
+#
+#   - per_action rows (N extra "frappe_profiler.api.status" rows per session)
+#   - top_queries / table_breakdown (queries from status polling / recorder
+#     lookups obscure the real hot spots)
+#   - the auto-generated "Steps to Reproduce" bullet list — the widget
+#     polls every ~2s while Recording, so a 30-second flow ends up with
+#     a reproducer list that's 90% status polls
+#   - total wall-clock / total query totals on the Profiler Session form
+#
+# Filtered at capture time (before_request) rather than at display time so
+# ALL downstream analyzers see a clean recording list, not just auto-notes.
+_IGNORED_CMD_PREFIXES = (
+	# The profiler's own whitelisted API — widget poll, metrics submit,
+	# retry, fetch, etc. None of these represent real application work.
+	"frappe_profiler.api.",
+	# Frappe's built-in Recorder doctype. If the user has the Recorder UI
+	# open in another tab while profiling (not uncommon — devs often have
+	# both tools handy), its whitelisted calls (export_data, delete,
+	# get_request_details, pluck, start, stop) would otherwise be captured
+	# and attributed to the profiling session. They're the recorder's own
+	# plumbing, not user code.
+	"frappe.core.doctype.recorder.recorder.",
+)
+
+
+def _should_skip_request() -> bool:
+	"""Return True if the current HTTP request is profiler / Frappe-recorder
+	instrumentation noise that should not be captured into the session.
+
+	Checks ``frappe.form_dict.cmd`` (the canonical place for whitelisted
+	method names) against the skip list. Path-based URLs (e.g. ``/app/...``
+	or ``/api/resource/...``) have no cmd and fall through as 'not noise',
+	which is the intended behavior — we only want to skip endpoints that
+	the profiler / recorder EXPOSES, not general page loads that happen to
+	have 'recorder' in the URL.
+
+	Defensive: a missing or non-dict ``frappe.form_dict`` (edge case during
+	startup, health checks, or OPTIONS preflights) falls through to False
+	rather than raising, because crashing here would take down every
+	request for every user with an active profiler session.
+	"""
+	try:
+		form_dict = getattr(frappe.local, "form_dict", None)
+		if not isinstance(form_dict, dict):
+			return False
+		cmd = form_dict.get("cmd") or ""
+	except Exception:
+		return False
+	if not cmd:
+		return False
+	for prefix in _IGNORED_CMD_PREFIXES:
+		if cmd.startswith(prefix):
+			return True
+	return False
+
 
 def before_request(*args, **kwargs):
 	"""Activate the recorder if the current user has an active profiler session.
@@ -65,6 +129,13 @@ def before_request(*args, **kwargs):
 		session_uuid = session.get_active_session_for(user)
 		if not session_uuid:
 			return  # 99.9% of requests exit here
+
+		# v0.5.1: Skip profiler / Frappe-recorder instrumentation noise.
+		# Checked AFTER the active-session lookup (two Redis GETs gating a
+		# string-prefix check is free) so there's zero cost on the 99.9%
+		# path. See _IGNORED_CMD_PREFIXES for the full rationale.
+		if _should_skip_request():
+			return
 
 		# Tag the request so after_request can pick it up.
 		frappe.local.profiler_session_id = session_uuid
