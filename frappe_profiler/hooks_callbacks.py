@@ -76,29 +76,83 @@ _IGNORED_CMD_PREFIXES = (
 )
 
 
+def _extract_cmd_from_request() -> str:
+	"""Resolve the whitelisted-method name for the current HTTP request,
+	or "" if we can't determine one.
+
+	Two sources, checked in order:
+
+	1. ``frappe.local.form_dict.cmd`` — set by ``make_form_dict`` for
+	   legacy ``?cmd=foo.bar`` RPC calls. Available at before_request
+	   time because ``make_form_dict`` runs BEFORE the hook dispatcher.
+
+	2. ``frappe.local.request.path`` parsed for ``/method/<name>`` — the
+	   only source for modern ``/api/method/foo.bar`` and
+	   ``/api/v2/method/foo.bar`` URLs, because Frappe's REST API routing
+	   (``handle_rpc_call`` in ``frappe/api/v1.py`` and ``v2.py``) only
+	   calls ``frappe.form_dict.cmd = method`` AFTER the before_request
+	   hooks have already fired. Before v0.5.1 the skip filter missed
+	   every modern REST call because it only checked form_dict.cmd,
+	   which was empty at hook time for these URLs.
+
+	Works for both v1 and v2 API paths because both route shapes use
+	``.../method/<name>`` — we find the substring ``/method/`` and take
+	everything after it.
+
+	Returns "" when neither source produces a non-empty cmd — the caller
+	treats that as "don't skip" so that request-path-less contexts
+	(OPTIONS preflights, health checks, pre-init edge cases) fall
+	through to the normal path rather than being filtered.
+	"""
+	# Source 1: form_dict.cmd (legacy ?cmd=foo.bar, always set if present)
+	try:
+		form_dict = getattr(frappe.local, "form_dict", None)
+		if isinstance(form_dict, dict):
+			cmd = form_dict.get("cmd")
+			if cmd:
+				return cmd
+	except Exception:
+		pass
+
+	# Source 2: parse out of request.path for /api/method/<foo> and
+	# /api/v2/method/<foo>. Both use the substring "/method/".
+	try:
+		request = getattr(frappe.local, "request", None)
+		if request is None:
+			return ""
+		path = getattr(request, "path", "") or ""
+		marker = "/method/"
+		idx = path.find(marker)
+		if idx < 0:
+			return ""
+		rest = path[idx + len(marker):]
+		# Defensive: strip any trailing slash and query string (werkzeug
+		# already strips the query from .path, but trailing slashes are
+		# not uncommon on REST URLs).
+		rest = rest.split("?", 1)[0].rstrip("/")
+		return rest
+	except Exception:
+		return ""
+
+
 def _should_skip_request() -> bool:
 	"""Return True if the current HTTP request is profiler / Frappe-recorder
 	instrumentation noise that should not be captured into the session.
 
-	Checks ``frappe.form_dict.cmd`` (the canonical place for whitelisted
-	method names) against the skip list. Path-based URLs (e.g. ``/app/...``
-	or ``/api/resource/...``) have no cmd and fall through as 'not noise',
-	which is the intended behavior — we only want to skip endpoints that
-	the profiler / recorder EXPOSES, not general page loads that happen to
-	have 'recorder' in the URL.
+	Delegates to ``_extract_cmd_from_request`` for the method-name
+	resolution (handles both legacy ``?cmd=foo`` and modern
+	``/api/method/foo`` URL shapes), then does a prefix match against
+	``_IGNORED_CMD_PREFIXES``. Non-method URLs (``/app/...``,
+	``/api/resource/...``, static files) resolve to "" and fall through
+	as 'not noise', which is the intended behavior — we only skip
+	endpoints that the profiler / recorder EXPOSES via whitelisted
+	methods, not general page loads or REST resource access.
 
-	Defensive: a missing or non-dict ``frappe.form_dict`` (edge case during
-	startup, health checks, or OPTIONS preflights) falls through to False
+	Defensive: any exception resolving the cmd falls through to False
 	rather than raising, because crashing here would take down every
 	request for every user with an active profiler session.
 	"""
-	try:
-		form_dict = getattr(frappe.local, "form_dict", None)
-		if not isinstance(form_dict, dict):
-			return False
-		cmd = form_dict.get("cmd") or ""
-	except Exception:
-		return False
+	cmd = _extract_cmd_from_request()
 	if not cmd:
 		return False
 	for prefix in _IGNORED_CMD_PREFIXES:
