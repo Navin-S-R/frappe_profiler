@@ -168,7 +168,20 @@ def _pyi_to_dict_tree(pyi_session_or_dict) -> dict:
 
 # Module path prefixes treated as "framework" — graft points roll back
 # past these so SQL leaves attach under user code, not under helpers.
-_FRAMEWORK_PATH_FRAGMENTS = ("/frappe/", "/frappe_profiler/")
+#
+# v0.5.1: the fragments used to include leading slashes ("/frappe/",
+# "/frappe_profiler/") so the substring `in` check would match an
+# absolute path like /Users/.../apps/frappe/frappe/handler.py. But
+# pyinstrument and our dict-tree normalizer store filenames as
+# RELATIVE paths (e.g. "frappe/handler.py"), which means the filter
+# was a silent no-op for every frame. Slow Hot Path then emitted
+# "99% of time was spent in application" (i.e. frappe/app.py::application)
+# instead of descending past the framework frame to the user code
+# below. Dropping the leading slashes makes the filter work against
+# both relative and absolute filenames — a relative filename like
+# "frappe/handler.py" contains "frappe/", and an absolute filename
+# like "/Users/.../frappe/handler.py" also contains "frappe/".
+_FRAMEWORK_PATH_FRAGMENTS = ("frappe/", "frappe_profiler/")
 _FRAMEWORK_FUNCTION_PREFIXES = ("frappe.", "frappe_profiler.")
 
 
@@ -224,18 +237,55 @@ def _is_framework_frame(node_or_frame: dict) -> bool:
 # all user apps — is KEPT so users see legitimate optimization targets
 # like "Document.run_method consumed 2.4s across 12 actions."
 
-_PURE_HELPER_PATH_FRAGMENTS = (
-	"/frappe_profiler/",
-	"/frappe/utils/",
-	"/frappe/handler.py",
-	"/frappe/app.py",
-	"/werkzeug/",
-	"/gunicorn/",
-	"/rq/",
+# v0.5.1: suffix matches (via endswith). Specific framework plumbing
+# files where every request passes through the same function on its way
+# from gunicorn to the user's endpoint. Surfacing these in the Repeated
+# Hot Frame leaderboard is meaningless — they're always going to be in
+# every action because they ARE the dispatch pipeline. Report on file
+# against ERPNext showed 8 Repeated Hot Frame findings, ALL of them
+# from this list.
+#
+# endswith() works regardless of whether the stored filename is
+# absolute (/Users/.../apps/frappe/frappe/handler.py) or relative
+# (frappe/handler.py) or bench-relative (apps/frappe/frappe/handler.py)
+# — all three end with "frappe/handler.py".
+_PURE_HELPER_PATH_SUFFIXES = (
+	# Frappe WSGI entry + request dispatch
+	"frappe/app.py",
+	"frappe/handler.py",
+	"frappe/middlewares.py",
+	# frappe.call, frappe.get_doc (top-level module dispatchers)
+	"frappe/__init__.py",
+	# REST API routing (v0.5.1 addition — missed before because of the
+	# leading-slash bug, but also needs explicit entries for v1/v2 files)
+	"frappe/api/__init__.py",
+	"frappe/api/v1.py",
+	"frappe/api/v2.py",
+	# Frappe's built-in SQL recorder hook (frappe/recorder.py). This is
+	# the sql() wrapper that sits in front of every database query when
+	# frappe.recorder is active. On a profiling session it's always the
+	# fattest frame by occurrence count but is 100% instrumentation
+	# overhead, not user code.
+	"frappe/recorder.py",
+)
+
+# v0.5.1: substring matches (via `in`). Whole directories of framework
+# helpers / infrastructure libraries. Fragment values MUST NOT have
+# leading slashes — the stored filenames are typically relative
+# (`frappe/utils/foo.py`), and `/frappe/utils/` does not occur as a
+# substring of `frappe/utils/foo.py`. See the comment on
+# _FRAMEWORK_PATH_FRAGMENTS for the full history of this bug.
+_PURE_HELPER_PATH_SUBSTRINGS = (
+	"frappe_profiler/",
+	"frappe/utils/",          # typing_validations, response, redis_wrapper, etc.
+	"werkzeug/",
+	"gunicorn/",
+	"/rq/",                   # rq is inside site-packages/; the leading slash
+	                          # disambiguates from e.g. apps/rq_something/
 	"site-packages/redis/",
-	"/pyinstrument/",
-	"/pytz/",
-	"/dateutil/",
+	"pyinstrument/",
+	"pytz/",
+	"dateutil/",
 )
 
 _PURE_HELPER_FUNCTION_PREFIXES = (
@@ -243,6 +293,8 @@ _PURE_HELPER_FUNCTION_PREFIXES = (
 	"frappe.utils.",
 	"frappe.handler.",
 	"frappe.app.",
+	"frappe.api.",             # v0.5.1 addition
+	"frappe.recorder.",        # v0.5.1 addition
 )
 
 
@@ -264,7 +316,14 @@ def _is_pure_helper_frame(node: dict) -> bool:
 		if fn.startswith(prefix):
 			return True
 	filename = (node.get("filename") or "").replace("\\", "/")
-	for frag in _PURE_HELPER_PATH_FRAGMENTS:
+	if not filename:
+		return False
+	# Specific files by suffix (works on absolute and relative paths).
+	for suffix in _PURE_HELPER_PATH_SUFFIXES:
+		if filename.endswith(suffix):
+			return True
+	# Whole directories by substring.
+	for frag in _PURE_HELPER_PATH_SUBSTRINGS:
 		if frag in filename:
 			return True
 	return False

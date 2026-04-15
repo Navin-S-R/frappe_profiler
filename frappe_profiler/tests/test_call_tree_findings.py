@@ -336,6 +336,174 @@ def test_repeated_hot_frame_keeps_frappe_application_code():
 	)
 
 
+# ---------------------------------------------------------------------------
+# v0.5.1 regression guards: the 8 false-positive Repeated Hot Frame findings
+# from the production report were all framework dispatch plumbing that the
+# pure-helper filter should have caught but didn't. Root cause: the filter
+# fragments used leading slashes (`"/frappe/handler.py"`), but pyinstrument
+# stores filenames as relative paths (`"frappe/handler.py"`). The substring
+# `in` check was a silent no-op.
+# ---------------------------------------------------------------------------
+
+
+def test_is_pure_helper_frame_matches_relative_filenames():
+	"""Core bug: the filter must match filenames as stored by
+	pyinstrument (relative paths, no leading slash). Pre-v0.5.1 the
+	fragments had leading slashes and the `in` check was a no-op."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	# These are the EXACT filenames pyinstrument produces for the
+	# offending framework frames in a production session. All must be
+	# classified as pure helpers.
+	for filename, function in (
+		("frappe/app.py", "application"),
+		("frappe/handler.py", "handle"),
+		("frappe/handler.py", "execute_cmd"),
+		("frappe/__init__.py", "call"),
+		("frappe/recorder.py", "record_sql"),
+		("frappe/api/__init__.py", "handle"),
+		("frappe/api/v1.py", "handle_rpc_call"),
+		("frappe/api/v2.py", "handle_rpc_call"),
+		("frappe/utils/typing_validations.py", "wrapper"),
+		("frappe/utils/response.py", "build_response"),
+		("frappe_profiler/hooks_callbacks.py", "before_request"),
+	):
+		node = {"function": function, "filename": filename, "kind": "python"}
+		assert _is_pure_helper_frame(node) is True, (
+			f"{filename}::{function} must be classified as a pure helper "
+			f"— it's framework plumbing that every request passes through"
+		)
+
+
+def test_is_pure_helper_frame_matches_absolute_filenames():
+	"""Backward compatibility: some environments DO deliver absolute
+	paths from pyinstrument. Those must still match — the filter is
+	position-insensitive (substring / suffix)."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for filename in (
+		"/Users/navin/office/frappe_bench/v16/mariadb/apps/frappe/frappe/app.py",
+		"/Users/navin/office/frappe_bench/v16/mariadb/apps/frappe/frappe/handler.py",
+		"/home/frappe/frappe-bench/apps/frappe/frappe/recorder.py",
+	):
+		node = {"function": "anything", "filename": filename, "kind": "python"}
+		assert _is_pure_helper_frame(node) is True, (
+			f"Absolute path {filename} must still match the pure-helper "
+			f"filter via suffix / substring check."
+		)
+
+
+def test_is_pure_helper_frame_keeps_application_frappe_code():
+	"""Negative cases: application-layer Frappe code must NOT be
+	classified as a pure helper. These are real optimization targets —
+	slow hooks bubble up through Document.run_method, slow permissions
+	through has_permission, etc."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for filename, function in (
+		("frappe/model/document.py", "Document.run_method"),
+		("frappe/model/document.py", "save"),
+		("frappe/permissions.py", "has_permission"),
+		("frappe/model/naming.py", "make_autoname"),
+		("frappe/client.py", "get_list"),  # app-visible REST-ish
+		("frappe/database/mariadb/database.py", "sql"),
+	):
+		node = {"function": function, "filename": filename, "kind": "python"}
+		assert _is_pure_helper_frame(node) is False, (
+			f"{filename}::{function} must NOT be filtered — it's "
+			f"application-layer code users can optimize"
+		)
+
+
+def test_is_pure_helper_frame_keeps_user_code():
+	"""User app code must always pass through the filter."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for filename in (
+		"erpnext/accounts/doctype/sales_invoice/sales_invoice.py",
+		"apps/my_custom_app/handlers.py",
+		"my_app/module.py",
+	):
+		node = {"function": "do_thing", "filename": filename, "kind": "python"}
+		assert _is_pure_helper_frame(node) is False
+
+
+def test_is_framework_frame_matches_relative_filenames():
+	"""Same slash-bug fix applies to the broader _is_framework_frame
+	filter used by Slow Hot Path. Production report showed 'In POST
+	/api/method/..., 99% of time was spent in application' — i.e.
+	frappe/app.py::application. That frame should have been
+	classified as framework so Slow Hot Path descended into user
+	code below it."""
+	from frappe_profiler.analyzers.call_tree import _is_framework_frame
+
+	for filename in (
+		"frappe/app.py",
+		"frappe/handler.py",
+		"frappe/model/document.py",
+		"frappe/permissions.py",
+		"frappe/__init__.py",
+		"frappe_profiler/hooks_callbacks.py",
+	):
+		node = {"function": "anything", "filename": filename, "kind": "python"}
+		assert _is_framework_frame(node) is True, (
+			f"{filename} must be classified as framework (broad filter)"
+		)
+
+	# Negative case: user app code
+	for filename in (
+		"erpnext/accounts/doctype/sales_invoice/sales_invoice.py",
+		"apps/my_custom_app/handlers.py",
+	):
+		node = {"function": "x", "filename": filename, "kind": "python"}
+		assert _is_framework_frame(node) is False
+
+
+def test_production_payload_eight_plumbing_findings_all_filtered():
+	"""End-to-end regression: the exact 8 frames that showed up as
+	Repeated Hot Frame findings in the production report must produce
+	zero Repeated Hot Frame findings after the filter fix."""
+	# Simulate 15 actions where each passes through all 8 plumbing frames.
+	# Without the fix, each would produce a Repeated Hot Frame finding
+	# because 15 >= DEFAULT_REPEATED_FRAME_MIN_ACTIONS and the cumulative
+	# time is well above the total_ms threshold.
+	plumbing_frames = [
+		("application", "frappe/app.py", 1061),
+		("handle", "frappe/handler.py", 805),
+		("execute_cmd", "frappe/handler.py", 805),
+		("call", "frappe/__init__.py", 1117),
+		("record_sql", "frappe/recorder.py", 580),
+		("handle", "frappe/api/__init__.py", 821),
+		("handle_rpc_call", "frappe/api/v1.py", 806),
+		("wrapper", "frappe/utils/typing_validations.py", 1252),
+	]
+	per_action_trees = []
+	for _ in range(15):
+		children = [
+			_node(fn, path, cumulative_ms // 15)
+			for (fn, path, cumulative_ms) in plumbing_frames
+		]
+		per_action_trees.append(_node("<root>", "", 2000, children))
+
+	findings, leaderboard = call_tree._aggregate_hot_frames(per_action_trees)
+	repeated = [f for f in findings if f["finding_type"] == "Repeated Hot Frame"]
+
+	# None of the 8 plumbing frames should produce a finding.
+	assert repeated == [], (
+		"The 8 framework plumbing frames from the production report "
+		"must all be filtered out of Repeated Hot Frame findings. "
+		f"Got: {[f['title'] for f in repeated]}"
+	)
+
+	# And they should not be in the leaderboard either — they'd waste
+	# slots that could go to real user-code hot frames.
+	bad_names = {fn for fn, _, _ in plumbing_frames}
+	for row in leaderboard:
+		assert not any(bad in row["function"] for bad in bad_names), (
+			f"Plumbing frame leaked into leaderboard: {row['function']}"
+		)
+
+
 def test_repeated_hot_frame_keeps_user_code_finding():
 	"""Companion positive test to the two above: user-code frames are
 	still aggregated correctly and still fire findings.
