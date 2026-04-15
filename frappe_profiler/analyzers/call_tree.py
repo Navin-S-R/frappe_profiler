@@ -836,6 +836,59 @@ def _walk_for_aggregation(node: dict, action_idx: int, occurrences: dict) -> Non
 # ---------------------------------------------------------------------------
 
 
+def _strip_profiler_frames(node: dict) -> dict:
+	"""Recursively remove frappe_profiler/* frames from the tree.
+
+	When a profiler frame is found, its CHILDREN are grafted up to the
+	parent in place of the profiler frame itself. This preserves any
+	user-code subtree that happens to be under a profiler frame
+	(pathological but theoretically possible) while removing the
+	profiler frame from view.
+
+	Context: a production report on a fast request
+	(GET /api/method/frappe.realtime.can_subscribe_doctype, 47 ms)
+	showed its call tree as
+
+	    application  (47 ms)
+	     └─ init_request  (31 ms)
+	         └─ call  (31 ms)
+	             └─ before_request  (31 ms)   ← frappe_profiler
+	                 └─ snapshot  (31 ms)     ← frappe_profiler
+	                     └─ _read_db  (13 ms) ← frappe_profiler
+
+	67% of the action's time was attributed to the profiler's own
+	infra snapshot. The root cause was _start_pyi_session being
+	called BEFORE infra_capture.snapshot() in before_request — the
+	snapshot was still on the call stack when pyinstrument began
+	sampling. The primary fix (v0.5.1) reorders the hook so the
+	snapshot happens first. This tree-strip pass is belt-and-
+	suspenders: even with the correct ordering, pyi can still catch
+	a single sample of ``before_request`` returning or a capture
+	wrap frame during the action, and the stored tree should never
+	show profiler frames regardless.
+
+	Modifies the tree in place for performance (per-action trees
+	can be hundreds of kilobytes) and returns the same node for
+	chaining in the analyze pipeline.
+	"""
+	children = node.get("children") or []
+	new_children: list = []
+	for child in children:
+		# Recurse first so grandchildren are rewritten bottom-up.
+		_strip_profiler_frames(child)
+
+		filename = (child.get("filename") or "").replace("\\", "/")
+		if "frappe_profiler/" in filename:
+			# Drop this node; promote its (already-rewritten) children
+			# up to the current parent.
+			new_children.extend(child.get("children") or [])
+		else:
+			new_children.append(child)
+
+	node["children"] = new_children
+	return node
+
+
 def _top_level_app(function: str, filename: str) -> str:
 	"""Return the top-level app name for bucketing the donut.
 
@@ -1000,6 +1053,17 @@ def analyze(recordings: list, context) -> AnalyzerResult:
 			tree = reconcile(pyi, calls, action_wall_time)
 			tree = _prune(tree, action_wall_time or 1, prune_pct)
 			tree = _soft_cap_nodes(tree, node_cap)
+			# v0.5.1: belt-and-suspenders strip of any residual
+			# frappe_profiler/* frames that slipped through the hook
+			# ordering fix. See _strip_profiler_frames docstring for
+			# the full rationale — the short version is that even
+			# with _start_pyi_session now running AFTER infra_capture
+			# .snapshot(), pyinstrument can still sample a single
+			# frame of before_request on its way out, or a capture
+			# wrap frame during the action. Removing them from the
+			# stored tree here ensures they never appear in the
+			# report regardless of sampling luck.
+			tree = _strip_profiler_frames(tree)
 		except Exception:
 			context.warnings.append(
 				f"Reconciliation failed for action {action_idx} (see error log)"

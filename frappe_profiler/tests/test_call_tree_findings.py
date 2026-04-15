@@ -459,6 +459,199 @@ def test_is_framework_frame_matches_relative_filenames():
 		assert _is_framework_frame(node) is False
 
 
+# ---------------------------------------------------------------------------
+# v0.5.1: strip frappe_profiler/* frames from stored call tree
+# ---------------------------------------------------------------------------
+
+
+def test_strip_profiler_frames_removes_snapshot_subtree():
+	"""Exact production payload: the call tree for a 47ms realtime
+	subscribe request had a 31ms frappe_profiler/hooks_callbacks ->
+	snapshot -> _read_db subtree attributed to it, because pyinstrument
+	started INSIDE before_request and captured the infra snapshot as
+	part of the user's action.
+
+	After _strip_profiler_frames, the tree must contain zero nodes
+	from frappe_profiler/*, and the user-visible chain (application →
+	init_request → call) must remain intact."""
+	tree = _node("application", "frappe/app.py", 47.15, [
+		_node("init_request", "frappe/app.py", 31.56, [
+			_node("call", "frappe/__init__.py", 31.56, [
+				_node(
+					"before_request",
+					"frappe_profiler/hooks_callbacks.py",
+					31.56,
+					[
+						_node(
+							"snapshot",
+							"frappe_profiler/infra_capture.py",
+							31.56,
+							[
+								_node(
+									"_read_db",
+									"frappe_profiler/infra_capture.py",
+									13.74,
+									[],
+								),
+							],
+						),
+					],
+				),
+			]),
+		]),
+	])
+
+	call_tree._strip_profiler_frames(tree)
+
+	# Collect every remaining filename in the tree (recursively).
+	def collect(n, out):
+		out.append((n.get("function"), n.get("filename")))
+		for c in n.get("children", []):
+			collect(c, out)
+
+	nodes: list = []
+	collect(tree, nodes)
+
+	# No frappe_profiler/* frame may remain.
+	for fn, filename in nodes:
+		assert "frappe_profiler/" not in (filename or ""), (
+			f"Profiler frame leaked: {fn} @ {filename}"
+		)
+
+	# The user-visible chain must still exist.
+	functions = [fn for fn, _ in nodes]
+	assert "application" in functions
+	assert "init_request" in functions
+	assert "call" in functions
+	# And the profiler chain must be gone.
+	for bad in ("before_request", "snapshot", "_read_db"):
+		assert bad not in functions, (
+			f"Expected '{bad}' stripped from tree; still present"
+		)
+
+
+def test_strip_profiler_frames_grafts_user_code_children_up():
+	"""Edge case: a user-code frame nested BELOW a frappe_profiler
+	frame (e.g. a capture.py wrap that intercepts get_doc and then
+	user's __init__ runs under it). The user-code child must be
+	preserved — grafted up to where the profiler frame was."""
+	tree = _node("<root>", "", 100, [
+		_node("application", "frappe/app.py", 100, [
+			_node(
+				"wrapped_get_doc",
+				"frappe_profiler/capture.py",
+				50,
+				[
+					_node("Document.__init__", "frappe/model/document.py", 50, [
+						_node("compute_total", "apps/myapp/invoice.py", 45, []),
+					]),
+				],
+			),
+		]),
+	])
+
+	call_tree._strip_profiler_frames(tree)
+
+	# Walk and find the expected shape:
+	# <root> -> application -> Document.__init__ -> compute_total
+	def functions_in(n):
+		return [n.get("function")] + [
+			f for c in n.get("children", []) for f in functions_in(c)
+		]
+
+	fns = functions_in(tree)
+	assert "wrapped_get_doc" not in fns, "profiler wrap must be stripped"
+	assert "Document.__init__" in fns, (
+		"user-code descendant of profiler wrap must be preserved"
+	)
+	assert "compute_total" in fns, (
+		"deeper user-code descendant must be preserved"
+	)
+
+
+def test_strip_profiler_frames_no_op_on_clean_tree():
+	"""A tree with no profiler frames must be unchanged (aside from
+	in-place mutation returning the same node)."""
+	tree = _node("application", "frappe/app.py", 100, [
+		_node("save", "frappe/model/document.py", 50, []),
+		_node("compute", "apps/myapp/handlers.py", 40, []),
+	])
+	call_tree._strip_profiler_frames(tree)
+	assert tree["function"] == "application"
+	assert len(tree["children"]) == 2
+	assert tree["children"][0]["function"] == "save"
+	assert tree["children"][1]["function"] == "compute"
+
+
+def test_strip_profiler_frames_handles_absolute_paths():
+	"""Belt-and-suspenders: absolute filenames like
+	/Users/.../apps/frappe_profiler/capture.py must also be stripped.
+	The substring check on 'frappe_profiler/' catches both."""
+	tree = _node("<root>", "", 100, [
+		_node(
+			"before_request",
+			"/Users/navin/office/frappe_bench/apps/frappe_profiler/frappe_profiler/hooks_callbacks.py",
+			50,
+			[],
+		),
+		_node("save", "frappe/model/document.py", 50, []),
+	])
+	call_tree._strip_profiler_frames(tree)
+	fns = [c["function"] for c in tree["children"]]
+	assert "before_request" not in fns
+	assert "save" in fns
+
+
+def test_hooks_callbacks_before_request_snapshot_runs_before_pyi_start():
+	"""Source-inspection guard: the v0.5.1 fix for the profiler-
+	self-capture bug reorders before_request so the infra snapshot
+	runs BEFORE pyinstrument starts. If someone accidentally flips the
+	order back, pyi will once again capture its own 30ms snapshot as
+	part of the user's action.
+
+	Matches on distinctive call-site syntax (``frappe.local
+	.profiler_infra_start =`` for the snapshot, ``_capture
+	._start_pyi_session(`` for pyi start) to avoid false matches
+	against commentary that mentions the function names.
+	"""
+	import inspect
+	from frappe_profiler import hooks_callbacks
+
+	src = inspect.getsource(hooks_callbacks.before_request)
+	# The literal assignment only appears at the actual call site.
+	snapshot_idx = src.find("frappe.local.profiler_infra_start = infra_capture.snapshot()")
+	# The literal call-with-open-paren only appears at the actual call site.
+	pyi_idx = src.find("_capture._start_pyi_session(")
+	assert snapshot_idx > 0, (
+		"before_request must assign infra_capture.snapshot() to "
+		"frappe.local.profiler_infra_start"
+	)
+	assert pyi_idx > 0, "before_request must call _capture._start_pyi_session("
+	assert snapshot_idx < pyi_idx, (
+		"infra_capture.snapshot() must run BEFORE _start_pyi_session in "
+		"before_request, or pyinstrument will capture the snapshot's "
+		"~30ms of SHOW GLOBAL STATUS / psutil work as part of the "
+		"user's action. This was the 67%-of-action-time false attribution "
+		"seen in production."
+	)
+
+
+def test_hooks_callbacks_before_job_snapshot_runs_before_pyi_start():
+	"""Same ordering guard for before_job — background jobs have the
+	same self-capture exposure as HTTP requests."""
+	import inspect
+	from frappe_profiler import hooks_callbacks
+
+	src = inspect.getsource(hooks_callbacks.before_job)
+	snapshot_idx = src.find("frappe.local.profiler_infra_start = infra_capture.snapshot()")
+	pyi_idx = src.find("_capture._start_pyi_session(")
+	assert snapshot_idx > 0 and pyi_idx > 0
+	assert snapshot_idx < pyi_idx, (
+		"infra_capture.snapshot() must run BEFORE _start_pyi_session in "
+		"before_job (same rationale as before_request)."
+	)
+
+
 def test_production_payload_eight_plumbing_findings_all_filtered():
 	"""End-to-end regression: the exact 8 frames that showed up as
 	Repeated Hot Frame findings in the production report must produce

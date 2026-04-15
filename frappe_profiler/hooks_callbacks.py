@@ -209,6 +209,26 @@ def before_request(*args, **kwargs):
 		# (frappe.recorder is imported at module top — see comment there.)
 		frappe.recorder.record(force=True)
 
+		# v0.5.1: snapshot infra metrics FIRST, BEFORE pyinstrument starts.
+		# Pre-v0.5.1 the order was reversed: _start_pyi_session was called
+		# here and THEN infra_capture.snapshot() ran — which meant pyi
+		# captured its own ~30ms SHOW GLOBAL STATUS / psutil work as part
+		# of the user's action. A production report on a 47ms realtime
+		# subscribe request showed 31ms (67%!) attributed to
+		# frappe_profiler/infra_capture.py::_read_db in the call tree,
+		# making it look like the profiler was the bottleneck.
+		#
+		# Moving the snapshot before _start_pyi_session means pyi never
+		# samples the snapshot code path — its first sample lands after
+		# before_request returns, in the actual request handler. Fast
+		# actions (<50ms) now show true user-code time instead of being
+		# dominated by instrumentation overhead.
+		try:
+			from frappe_profiler import infra_capture
+			frappe.local.profiler_infra_start = infra_capture.snapshot()
+		except Exception:
+			frappe.log_error(title="frappe_profiler infra start snapshot")
+
 		# v0.3.0: gate the new pyinstrument + sidecar capture on the
 		# session's capture_python_tree flag. Setting
 		# _profiler_active_session_id is what activates the wraps
@@ -224,15 +244,6 @@ def before_request(*args, **kwargs):
 					or _capture.DEFAULT_SAMPLER_INTERVAL_MS
 				),
 			)
-
-		# v0.5.0: snapshot infra metrics at the start of the request.
-		# The matching after_request snapshot diffs against this and
-		# stores the result under profiler:infra:<recording_uuid>.
-		try:
-			from frappe_profiler import infra_capture
-			frappe.local.profiler_infra_start = infra_capture.snapshot()
-		except Exception:
-			frappe.log_error(title="frappe_profiler infra start snapshot")
 	except Exception:
 		# Never let a profiler bug break a customer request. Log and move on.
 		frappe.log_error(title="frappe_profiler before_request")
@@ -411,6 +422,14 @@ def before_job(method=None, kwargs=None, **rest):
 		# (frappe.recorder is imported at module top — see comment there.)
 		frappe.recorder.record(force=True)
 
+		# v0.5.1: snapshot BEFORE _start_pyi_session — mirrors the order
+		# fix in before_request. See the rationale comment there.
+		try:
+			from frappe_profiler import infra_capture
+			frappe.local.profiler_infra_start = infra_capture.snapshot()
+		except Exception:
+			frappe.log_error(title="frappe_profiler infra start snapshot (job)")
+
 		# v0.3.0: gate the new pyinstrument + sidecar capture on the
 		# session's capture_python_tree flag. Mirrors before_request.
 		meta = session.get_session_meta(session_uuid) or {}
@@ -423,13 +442,6 @@ def before_job(method=None, kwargs=None, **rest):
 					or _capture.DEFAULT_SAMPLER_INTERVAL_MS
 				),
 			)
-
-		# v0.5.0: snapshot infra metrics at job start. Mirrors before_request.
-		try:
-			from frappe_profiler import infra_capture
-			frappe.local.profiler_infra_start = infra_capture.snapshot()
-		except Exception:
-			frappe.log_error(title="frappe_profiler infra start snapshot (job)")
 	except Exception:
 		frappe.log_error(title="frappe_profiler before_job")
 
