@@ -181,3 +181,159 @@ def test_renderer_sanitizes_notes_before_template_context():
 	src = inspect.getsource(renderer.render)
 	assert "sanitize_html" in src or "html.escape" in src or "html_mod.escape" in src
 	assert "notes_html" in src
+
+
+# ---------------------------------------------------------------------------
+# v0.5.1: auto-filled "Steps to Reproduce" from captured actions
+# ---------------------------------------------------------------------------
+# The start dialog no longer prompts for notes. At analyze time, if the
+# user hasn't typed anything on the Profiler Session form, we synthesize
+# a bullet list of the captured actions so reviewers see context when
+# they open the report.
+
+
+def test_auto_notes_empty_recordings_returns_empty_string():
+	"""No recordings → no notes. The caller must be able to skip the
+	assignment entirely rather than setting an empty <ol></ol>."""
+	from frappe_profiler.analyze import _build_auto_notes_html
+
+	assert _build_auto_notes_html([]) == ""
+
+
+def test_auto_notes_produces_ordered_list_with_humanized_labels():
+	"""The helper should run each recording through per_action._label
+	so 'Save Sales Invoice' beats 'POST /api/method/frappe.client.save'
+	in the rendered reproducer."""
+	from frappe_profiler.analyze import _build_auto_notes_html
+
+	recordings = [
+		{
+			"method": "POST",
+			"path": "/api/method/frappe.client.save",
+			"cmd": "frappe.client.save",
+			"form_dict": {"doctype": "Sales Invoice"},
+			"duration": 842.3,
+			"calls": [],
+		},
+		{
+			"method": "GET",
+			"path": "/api/resource/Sales Invoice/INV-00042",
+			"cmd": None,
+			"duration": 58.1,
+			"calls": [],
+		},
+	]
+	html_out = _build_auto_notes_html(recordings)
+
+	# Preamble explains auto-generation and invites editing.
+	assert "Auto-generated" in html_out
+	# Ordered list, not unordered — order matters for reproducers.
+	assert "<ol>" in html_out and "</ol>" in html_out
+	# First recording resolves to "Save Sales Invoice" via per_action._label.
+	assert "Save Sales Invoice" in html_out
+	# Second recording falls through to METHOD + path.
+	assert "GET /api/resource/Sales Invoice/INV-00042" in html_out
+	# Duration rendered in milliseconds (rounded to 1 decimal).
+	assert "842.3 ms" in html_out
+	assert "58.1 ms" in html_out
+
+
+def test_auto_notes_html_escapes_user_controlled_strings():
+	"""A path containing <script> must NOT produce a live <script> tag
+	in the stored value. The renderer also sanitizes on the way out,
+	but defense in depth: escape at emit time too."""
+	from frappe_profiler.analyze import _build_auto_notes_html
+
+	recordings = [{
+		"method": "GET",
+		"path": "/<script>alert(1)</script>",
+		"cmd": None,
+		"duration": 10.0,
+		"calls": [],
+	}]
+	html_out = _build_auto_notes_html(recordings)
+	assert "<script>" not in html_out
+	assert "&lt;script&gt;" in html_out
+
+
+def test_auto_notes_caps_long_sessions_with_overflow_marker():
+	"""A 200-action session shouldn't fill the notes field with 200
+	<li> entries — cap at 50 and surface a '… and N more' marker so
+	users know the list is truncated."""
+	from frappe_profiler.analyze import _build_auto_notes_html, _AUTO_NOTES_MAX_ENTRIES
+
+	recordings = [
+		{"method": "GET", "path": f"/item/{i}", "cmd": None,
+		 "duration": 5.0, "calls": []}
+		for i in range(_AUTO_NOTES_MAX_ENTRIES + 10)
+	]
+	html_out = _build_auto_notes_html(recordings)
+	# Count the <li> entries — should be cap + 1 (for the overflow marker).
+	li_count = html_out.count("<li>")
+	assert li_count == _AUTO_NOTES_MAX_ENTRIES + 1
+	assert "10 more" in html_out
+
+
+def test_auto_notes_unnamed_action_falls_back_gracefully():
+	"""If somehow a recording has no cmd / path / method, the label
+	resolver returns an empty string. The helper must substitute a
+	placeholder rather than emit '<li> — 0 ms</li>'."""
+	from frappe_profiler.analyze import _build_auto_notes_html
+
+	recordings = [{"method": "", "path": "", "cmd": "",
+	               "duration": 0, "calls": []}]
+	html_out = _build_auto_notes_html(recordings)
+	# Must not have a blank label — the per_action._label fallback ends up
+	# as " " (method + " " + path with both empty), so we check the
+	# placeholder OR a non-empty label.
+	assert "<li>" in html_out
+	# The <li> content between <li> and the em-dash separator must be
+	# non-whitespace — otherwise the reproducer is "— 0 ms" which is
+	# useless to a reader.
+	import re
+	m = re.search(r"<li>([^<]*?) — ", html_out)
+	assert m is not None
+	label = m.group(1).strip()
+	assert label, f"Auto-notes emitted blank label: {html_out!r}"
+
+
+def test_persist_auto_fills_notes_when_field_is_empty():
+	"""Source-inspection guard: _persist must check doc.notes and
+	populate it with _build_auto_notes_html when empty, otherwise the
+	whole feature is a dead path."""
+	import inspect
+	from frappe_profiler import analyze
+
+	src = inspect.getsource(analyze._persist)
+	# The guard condition.
+	assert "doc.notes" in src
+	# Must call the helper.
+	assert "_build_auto_notes_html" in src
+	# Must be gated on an emptiness check so existing notes aren't
+	# overwritten.
+	assert "strip()" in src or "not doc.notes" in src
+
+
+def test_start_dialog_no_longer_asks_for_notes():
+	"""The 'Steps to reproduce' field has been removed from the start
+	dialog. Users can still see / edit the auto-generated notes on the
+	Profiler Session form after the session completes."""
+	wpath = os.path.join(
+		HERE, "..", "public", "js", "floating_widget.js"
+	)
+	with open(wpath) as f:
+		widget_src = f.read()
+
+	# The openStartDialog function must NOT define a field with
+	# fieldname: "notes" any more.
+	assert 'fieldname: "notes"' not in widget_src, (
+		"The start dialog still defines a 'notes' field. The v0.5.1 "
+		"design removed it — notes is now auto-filled from captured "
+		"actions during analyze. Delete the dialog entry."
+	)
+	# And the frappe.call args must not pass notes either.
+	assert "notes: values.notes" not in widget_src, (
+		"The start call still passes a `notes` argument. Since the "
+		"dialog no longer collects it, values.notes is always undefined "
+		"— drop the arg from the frappe.call."
+	)

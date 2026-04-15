@@ -656,6 +656,19 @@ def _persist(
 	total_duration_ms = sum(r.get("duration", 0) for r in recordings)
 
 	doc = frappe.get_doc("Profiler Session", docname)
+
+	# v0.5.1: auto-fill "Steps to Reproduce" from the captured actions,
+	# but ONLY if the user hasn't already written notes on the form. The
+	# start dialog no longer prompts for notes (it added friction and
+	# most users just skipped it), so the common path is: field is
+	# empty → we populate it here. Power users who typed something into
+	# the notes field on the doc form between start and stop get their
+	# text left alone.
+	if not (doc.notes or "").strip():
+		auto_notes = _build_auto_notes_html(recordings)
+		if auto_notes:
+			doc.notes = auto_notes
+
 	doc.total_requests = total_requests
 	doc.total_queries = total_queries
 	doc.total_query_time_ms = round(total_query_time_ms, 2)
@@ -764,6 +777,59 @@ def _persist(
 
 	doc.save(ignore_permissions=True)
 	frappe.db.commit()
+
+
+# v0.5.1: auto-generated "Steps to Reproduce" from captured actions. The
+# dialog no longer asks the user to type notes at start time because (a) it
+# added friction to the one-click "start profiling" flow, and (b) the user
+# already performed the steps — the profiler captured them. We synthesize
+# a bullet list from the recordings and write it to the `notes` field ONLY
+# when the user hasn't already provided their own text via the DocType
+# form. The developer can then edit the auto-generated list to add
+# business context (what the user was *trying* to do, not what endpoint
+# was hit) before sharing the report. The template still runs notes_html
+# through sanitize_html(always_sanitize=True), so any HTML we emit is
+# re-sanitized at render time — but we still escape labels here because
+# the stored value is also what appears when someone edits the doc.
+_AUTO_NOTES_MAX_ENTRIES = 50
+_AUTO_NOTES_PREAMBLE = (
+	"<p><em>Auto-generated from captured actions. Edit to add business "
+	"context (what you were trying to accomplish, any steps taken before "
+	"recording started, expected vs. actual behavior).</em></p>"
+)
+
+
+def _build_auto_notes_html(recordings: list[dict]) -> str:
+	"""Render recorded actions as an ordered HTML list for the `notes` field.
+
+	Each list item is ``<label> — <duration> ms``, where ``label`` comes
+	from ``per_action._label`` (the same humanization the report's action
+	table uses, so "Save Sales Invoice" beats "POST /api/method/…"). HTML-
+	escaped before wrapping so a cmd/path containing <, >, or & can't
+	corrupt the emitted markup.
+
+	Returns an empty string when there are no recordings so the caller
+	can skip writing ``doc.notes`` entirely (leaves the Text Editor
+	field in its default empty state rather than filling it with an
+	empty <ol>).
+	"""
+	if not recordings:
+		return ""
+
+	items: list[str] = []
+	for rec in recordings[:_AUTO_NOTES_MAX_ENTRIES]:
+		label = per_action._label(rec) or "(unnamed action)"
+		duration_ms = round(rec.get("duration") or 0, 1)
+		escaped = html.escape(label)
+		items.append(f"<li>{escaped} — {duration_ms:g} ms</li>")
+
+	overflow = len(recordings) - _AUTO_NOTES_MAX_ENTRIES
+	if overflow > 0:
+		items.append(
+			f"<li><em>… and {overflow} more action(s) not shown.</em></li>"
+		)
+
+	return _AUTO_NOTES_PREAMBLE + "<ol>" + "".join(items) + "</ol>"
 
 
 def _compute_top_severity(findings: list[dict]) -> str:
