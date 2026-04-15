@@ -31,6 +31,17 @@ HIGH_ROWS_EXAMINED = 10000
 LOW_FILTERED_THRESHOLD = 10  # percent
 LOW_FILTERED_MIN_ROWS = 100
 
+# Filesort / Temporary Table findings need a row floor for the same
+# reason Low Filter Ratio does: sorting 1 row or materializing a 5-row
+# intermediate is free, and flagging those fills the report with noise.
+# A real production run surfaced "Filesort on tabCustom DocPerm" from a
+# SELECT * FROM tabCustom DocPerm WHERE parent=? ORDER BY creation ASC
+# query where EXPLAIN reported rows=1 (a single-parent lookup with the
+# `parent` index already doing const-ref access). The filesort is on
+# one row — actionable only in the abstract. 100 rows is the same
+# floor LOW_FILTERED_MIN_ROWS uses for the same reason.
+MIN_ROWS_TO_FLAG_SORT = 100
+
 
 def analyze(recordings: list[dict], context) -> AnalyzerResult:
 	# (finding_type, table) → aggregated finding dict
@@ -170,8 +181,11 @@ def _inspect_row(row, normalized_query, action_idx, query_duration, buckets):
 			fix_hint="Add an index on the WHERE/JOIN columns of this query.",
 		)
 
-	# Filesort
-	if "using filesort" in extra:
+	# Filesort — only worth flagging when the sort has enough rows to
+	# actually matter (see MIN_ROWS_TO_FLAG_SORT). Otherwise "Filesort
+	# on tabCustom DocPerm" fires on single-row parent lookups that the
+	# user can't act on.
+	if "using filesort" in extra and rows_examined >= MIN_ROWS_TO_FLAG_SORT:
 		_upsert(
 			buckets,
 			finding_type="Filesort",
@@ -191,8 +205,9 @@ def _inspect_row(row, normalized_query, action_idx, query_duration, buckets):
 			fix_hint="Add an index that covers the ORDER BY columns of this query.",
 		)
 
-	# Temporary table
-	if "using temporary" in extra:
+	# Temporary table — same row floor as Filesort. Materializing a
+	# tiny intermediate table is free; flagging it is noise.
+	if "using temporary" in extra and rows_examined >= MIN_ROWS_TO_FLAG_SORT:
 		_upsert(
 			buckets,
 			finding_type="Temporary Table",

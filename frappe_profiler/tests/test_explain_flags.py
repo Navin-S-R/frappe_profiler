@@ -257,6 +257,138 @@ def test_malformed_row_is_isolated_not_crashing(empty_context):
 	assert any("explain_flags: could not parse" in w for w in result.warnings)
 
 
+# ---------------------------------------------------------------------------
+# v0.5.1: row floor for Filesort / Temporary Table findings
+# ---------------------------------------------------------------------------
+# A real production run flagged "Filesort on tabCustom DocPerm" from a
+# single-row parent lookup:
+#   SELECT * FROM `tabCustom DocPerm` WHERE `parent`=? ORDER BY `creation` ASC
+# with explain rows=1, type=ref, key=parent. The filesort is on ONE row —
+# free in practice, and the user can't act on it anyway because `parent` is
+# already the ref key. Flagging it was pure noise. These tests cover the
+# MIN_ROWS_TO_FLAG_SORT row floor that suppresses the false positive.
+
+
+def test_filesort_on_single_row_is_not_flagged(empty_context):
+	"""Regression guard — exact payload from the production report:
+	a ref lookup on tabCustom DocPerm.parent with rows=1 that happens
+	to filesort the result. Must NOT emit a Filesort finding."""
+	recording = {
+		"uuid": "filesort-tiny",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 5,
+		"calls": [{
+			"query": "SELECT * FROM `tabCustom DocPerm` WHERE `parent`=? ORDER BY `creation` ASC",
+			"normalized_query": "SELECT * FROM `tabCustom DocPerm` WHERE `parent`=? ORDER BY `creation` ASC",
+			"duration": 1.2,
+			"stack": [],
+			"explain_result": [{
+				"id": 1,
+				"select_type": "SIMPLE",
+				"table": "tabCustom DocPerm",
+				"type": "ref",
+				"possible_keys": "parent",
+				"key": "parent",
+				"key_len": "563",
+				"ref": "const",
+				"rows": "1",  # string, as seen in production
+				"Extra": "Using index condition; Using where; Using filesort",
+			}],
+		}],
+	}
+	result = explain_flags.analyze([recording], empty_context)
+	filesorts = [f for f in result.findings if f["finding_type"] == "Filesort"]
+	assert filesorts == [], (
+		"Filesort on a 1-row result is free — must not emit a finding. "
+		f"Got: {filesorts}"
+	)
+
+
+def test_temporary_table_on_tiny_result_is_not_flagged(empty_context):
+	"""Same row floor applies to Temporary Table. Materializing a 5-row
+	intermediate is free."""
+	recording = {
+		"uuid": "temp-tiny",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 5,
+		"calls": [{
+			"query": "SELECT a, SUM(b) FROM tabSmall GROUP BY a",
+			"normalized_query": "SELECT a, SUM(b) FROM tabSmall GROUP BY a",
+			"duration": 2.0,
+			"stack": [],
+			"explain_result": [{
+				"table": "tabSmall",
+				"type": "ALL",
+				"rows": 5,
+				"Extra": "Using temporary; Using filesort",
+			}],
+		}],
+	}
+	result = explain_flags.analyze([recording], empty_context)
+	temps = [f for f in result.findings if f["finding_type"] == "Temporary Table"]
+	filesorts = [f for f in result.findings if f["finding_type"] == "Filesort"]
+	assert temps == [], f"Temporary Table on 5 rows is free; got: {temps}"
+	assert filesorts == [], f"Filesort on 5 rows is free; got: {filesorts}"
+
+
+def test_filesort_at_exactly_the_floor_is_flagged(empty_context):
+	"""Boundary: rows == MIN_ROWS_TO_FLAG_SORT (100) must still be
+	flagged. Sorting 100 rows without an index starts to matter.
+	The condition is `>= MIN_ROWS_TO_FLAG_SORT`, not strict >."""
+	from frappe_profiler.analyzers.explain_flags import MIN_ROWS_TO_FLAG_SORT
+	recording = {
+		"uuid": "filesort-floor",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 20,
+		"calls": [{
+			"query": "SELECT * FROM tabMid WHERE x = ? ORDER BY y",
+			"normalized_query": "SELECT * FROM tabMid WHERE x = ? ORDER BY y",
+			"duration": 15.0,
+			"stack": [],
+			"explain_result": [{
+				"table": "tabMid",
+				"type": "ref",
+				"key": "x",
+				"rows": MIN_ROWS_TO_FLAG_SORT,  # exactly at floor
+				"Extra": "Using where; Using filesort",
+			}],
+		}],
+	}
+	result = explain_flags.analyze([recording], empty_context)
+	filesorts = [f for f in result.findings if f["finding_type"] == "Filesort"]
+	assert len(filesorts) == 1, (
+		f"Filesort at exactly MIN_ROWS_TO_FLAG_SORT={MIN_ROWS_TO_FLAG_SORT} "
+		f"must still fire (>=, not >); got: {filesorts}"
+	)
+
+
+def test_filesort_above_floor_still_flagged(empty_context):
+	"""Positive case: a filesort on 5000 rows (well above the floor)
+	must still produce a finding, so the floor doesn't accidentally
+	suppress legitimate ones."""
+	recording = {
+		"uuid": "filesort-real",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 200,
+		"calls": [{
+			"query": "SELECT * FROM tabBig WHERE org = ? ORDER BY created",
+			"normalized_query": "SELECT * FROM tabBig WHERE org = ? ORDER BY created",
+			"duration": 150.0,
+			"stack": [],
+			"explain_result": [{
+				"table": "tabBig",
+				"type": "ref",
+				"key": "org",
+				"rows": 5000,
+				"Extra": "Using where; Using filesort",
+			}],
+		}],
+	}
+	result = explain_flags.analyze([recording], empty_context)
+	filesorts = [f for f in result.findings if f["finding_type"] == "Filesort"]
+	assert len(filesorts) == 1
+
+
 def test_filtered_as_string_does_not_crash(empty_context):
 	"""`filtered` can also arrive as a string from some drivers.
 	Must coerce cleanly, not crash."""
