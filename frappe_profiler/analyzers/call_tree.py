@@ -837,15 +837,66 @@ def _walk_for_aggregation(node: dict, action_idx: int, occurrences: dict) -> Non
 
 
 def _top_level_app(function: str, filename: str) -> str:
-	"""Return the top-level app name for bucketing the donut."""
-	if not function:
+	"""Return the top-level app name for bucketing the donut.
+
+	v0.5.1: derived from the FILENAME's first path segment, not the
+	function name. Pre-v0.5.1 the bucketer split the function name on
+	``.`` and took the first segment, assuming pyinstrument would give
+	fully qualified names like ``erpnext.selling.validate``. In reality
+	pyinstrument stores BARE function names (``handle``, ``save``,
+	``call``, ``application``, ``init_request``). The split returned a
+	single-element list and every Python frame ended up in its own
+	per-function bucket — the production donut rendered six buckets
+	named ``application``, ``init_request``, ``call``, ``before_request``,
+	``snapshot``, ``[other]``, all showing ``0ms`` because each frame's
+	tiny self_time rounded to integer zero in isolation.
+
+	Bucketing by the filename's first path segment instead produces
+	proper app-level buckets: ``frappe``, ``frappe_profiler``, ``erpnext``,
+	``my_custom_app``. A dozen frames inside ``frappe/`` collapse into
+	one ``frappe`` bucket with the summed time, which is what the donut
+	is meant to show.
+
+	Handles common pyinstrument path shapes:
+	  - ``frappe/handler.py``                        → "frappe"
+	  - ``frappe_profiler/capture.py``               → "frappe_profiler"
+	  - ``erpnext/accounts/tax.py``                  → "erpnext"
+	  - ``apps/erpnext/erpnext/foo.py``             → "erpnext"
+	  - ``/Users/.../apps/frappe/frappe/handler.py`` → "frappe"
+	  - ``env/lib/python3.14/site-packages/werkzeug/wsgi.py`` → "[other]"
+	"""
+	# Synthetic markers from the tree normalizer
+	if not function or function in ("<root>", "<sql>") or function.startswith("["):
 		return "[other]"
-	if function.startswith("[") or function in ("<root>", "<sql>"):
+
+	if not filename:
 		return "[other]"
-	parts = function.split(".", 1)
-	if parts and parts[0]:
-		return parts[0]
-	return "[other]"
+
+	norm = filename.replace("\\", "/")
+
+	# Third-party libraries live under site-packages / dist-packages
+	# and are bucketed together as "[other]". They're not Frappe apps.
+	if "site-packages/" in norm or "dist-packages/" in norm:
+		return "[other]"
+
+	# Bench layout: look for "apps/<name>/" anywhere in the path so
+	# both relative (``apps/frappe/handler.py``) and absolute
+	# (``/Users/.../apps/frappe/frappe/handler.py``) layouts resolve
+	# to "frappe" rather than "Users" or some prefix.
+	idx = norm.find("apps/")
+	if idx >= 0:
+		after = norm[idx + len("apps/"):]
+		name = after.split("/", 1)[0]
+		if name:
+			return name
+
+	# Pyinstrument's ``file_path_short`` usually strips bench prefixes
+	# already, leaving something like ``frappe/handler.py``. Take the
+	# first path segment as the app name.
+	parts = [p for p in norm.lstrip("/").split("/") if p]
+	if not parts:
+		return "[other]"
+	return parts[0]
 
 
 def _build_session_breakdown(per_action_trees: list, sql_total_ms: float) -> dict:

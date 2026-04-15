@@ -540,11 +540,18 @@ def test_hot_frames_leaderboard_top_20_sorted_desc():
 
 
 def test_donut_bucketing_by_top_level_module():
+	"""v0.5.1: bucketing is driven by the FILENAME, not the function
+	name. Pyinstrument produces bare function names (`validate`,
+	`calc`, `save`) without module qualifiers, so the pre-v0.5.1
+	split-on-dot logic returned the function name itself as the
+	bucket. The fix uses the filename's first path segment.
+	"""
 	per_action_trees = [
+		# Bare function names, as pyinstrument actually produces them.
 		_node("<root>", "", 1000, [
-			_node("erpnext.selling.validate", "apps/erpnext/x.py", 400, [], self_ms=400),
-			_node("my_app.discounts.calc", "apps/my_app/d.py", 300, [], self_ms=300),
-			_node("frappe.model.save", "apps/frappe/m.py", 200, [], self_ms=200),
+			_node("validate", "erpnext/selling/validate.py", 400, [], self_ms=400),
+			_node("calc", "my_app/discounts.py", 300, [], self_ms=300),
+			_node("save", "frappe/model/document.py", 200, [], self_ms=200),
 		]),
 	]
 	breakdown = call_tree._build_session_breakdown(per_action_trees, sql_total_ms=100)
@@ -554,6 +561,102 @@ def test_donut_bucketing_by_top_level_module():
 	assert by_app.get("erpnext") == 400
 	assert by_app.get("my_app") == 300
 	assert by_app.get("frappe") == 200
+
+
+def test_top_level_app_uses_filename_not_function_name():
+	"""Direct unit test — covers the bug root cause without going
+	through the full aggregation path."""
+	from frappe_profiler.analyzers.call_tree import _top_level_app
+
+	# Bare function name + typical pyinstrument relative filename
+	assert _top_level_app("handle", "frappe/handler.py") == "frappe"
+	assert _top_level_app("application", "frappe/app.py") == "frappe"
+	assert _top_level_app("call", "frappe/__init__.py") == "frappe"
+	assert _top_level_app("record_sql", "frappe/recorder.py") == "frappe"
+	assert _top_level_app("before_request", "frappe_profiler/hooks_callbacks.py") == "frappe_profiler"
+	assert _top_level_app("snapshot", "frappe_profiler/infra_capture.py") == "frappe_profiler"
+	assert _top_level_app("validate", "erpnext/selling/doctype/sales_invoice.py") == "erpnext"
+	assert _top_level_app("do_thing", "my_custom_app/handlers.py") == "my_custom_app"
+
+	# Bench-layout relative path (apps/<app>/...)
+	assert _top_level_app("save", "apps/frappe/frappe/model/document.py") == "frappe"
+	assert _top_level_app("calc", "apps/erpnext/erpnext/accounts/tax.py") == "erpnext"
+
+	# Absolute path containing the bench layout
+	assert (
+		_top_level_app(
+			"save",
+			"/Users/navin/office/frappe_bench/apps/frappe/frappe/model/document.py",
+		)
+		== "frappe"
+	)
+
+	# Third-party libs
+	assert _top_level_app(
+		"inner", "env/lib/python3.14/site-packages/werkzeug/wsgi.py"
+	) == "[other]"
+	assert _top_level_app("acquire", "site-packages/redis/client.py") == "[other]"
+
+	# Synthetic / empty / skip markers
+	assert _top_level_app("<root>", "frappe/app.py") == "[other]"
+	assert _top_level_app("<sql>", "frappe/app.py") == "[other]"
+	assert _top_level_app("[other]", "frappe/app.py") == "[other]"
+	assert _top_level_app("", "frappe/app.py") == "[other]"
+	assert _top_level_app("handle", "") == "[other]"
+
+
+def test_production_donut_collapses_plumbing_into_frappe_bucket():
+	"""Exact bucket fragmentation from the production report:
+	six separate buckets for framework dispatch functions, each
+	labeled by function name (application, init_request, call,
+	before_request, snapshot, [other]) and each showing 0ms after
+	rounding. The fix must collapse all of them into a single
+	`frappe` / `frappe_profiler` bucket with the summed time."""
+	per_action_trees = [
+		_node("<root>", "", 200, [
+			_node("application", "frappe/app.py", 195, [
+				_node("init_request", "frappe/app.py", 20, [], self_ms=5.0),
+				_node("call", "frappe/__init__.py", 160, [
+					_node("execute_cmd", "frappe/handler.py", 150, [], self_ms=8.0),
+					_node("record_sql", "frappe/recorder.py", 15, [], self_ms=3.0),
+				], self_ms=2.0),
+				_node("before_request", "frappe_profiler/hooks_callbacks.py",
+				      10, [
+					_node("snapshot", "frappe_profiler/infra_capture.py", 8, [], self_ms=4.0),
+				], self_ms=1.0),
+			], self_ms=5.0),
+		]),
+	]
+	breakdown = call_tree._build_session_breakdown(per_action_trees, sql_total_ms=192)
+	by_app = breakdown["by_app"]
+
+	# Before the fix: six buckets — application, init_request, call,
+	# execute_cmd, record_sql, snapshot, before_request — each near 0ms.
+	# After the fix: two buckets (frappe + frappe_profiler) with real totals.
+	assert set(by_app.keys()) <= {"frappe", "frappe_profiler", "[other]"}, (
+		f"Unexpected buckets — should only contain frappe / "
+		f"frappe_profiler / [other]; got: {set(by_app.keys())}"
+	)
+
+	# frappe bucket = 5 (app) + 5 (init_request) + 2 (call) + 8 (execute_cmd)
+	# + 3 (record_sql) = 23 ms
+	assert by_app.get("frappe") == 23, (
+		f"frappe bucket should sum to 23ms (5+5+2+8+3); got {by_app.get('frappe')}"
+	)
+	# frappe_profiler bucket = 1 (before_request) + 4 (snapshot) = 5 ms
+	assert by_app.get("frappe_profiler") == 5, (
+		f"frappe_profiler bucket should sum to 5ms (1+4); "
+		f"got {by_app.get('frappe_profiler')}"
+	)
+
+	# Function names must NOT appear as bucket keys.
+	for bad in ("application", "init_request", "call", "execute_cmd",
+	            "record_sql", "before_request", "snapshot"):
+		assert bad not in by_app, (
+			f"Function name '{bad}' must not be a bucket key — "
+			f"bucketing should be by app (filename), not function name. "
+			f"Got by_app: {by_app}"
+		)
 
 
 def test_analyze_entry_point_reads_pyi_session_and_emits_findings():
