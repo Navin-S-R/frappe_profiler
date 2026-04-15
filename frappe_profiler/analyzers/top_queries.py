@@ -10,7 +10,11 @@ single query > 200ms.
 
 import json
 
-from frappe_profiler.analyzers.base import AnalyzerResult, walk_callsite_str
+from frappe_profiler.analyzers.base import (
+	AnalyzerResult,
+	is_profiler_own_query,
+	walk_callsite_str,
+)
 
 DEFAULT_TOP_N = 20
 SLOW_QUERY_MS = 200
@@ -22,6 +26,13 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 	all_queries = []
 	for action_idx, recording in enumerate(recordings):
 		for call in recording.get("calls") or []:
+			# v0.5.1: drop profiler's own instrumentation queries
+			# (infra_capture SHOW GLOBAL STATUS etc.) from the top-
+			# queries leaderboard. Without this, a slow infra snapshot
+			# could rank above real application queries in the "slowest
+			# queries" panel, wasting the user's attention.
+			if is_profiler_own_query(call.get("stack")):
+				continue
 			all_queries.append(
 				{
 					"normalized_query": (call.get("normalized_query") or call.get("query") or "")[:500],

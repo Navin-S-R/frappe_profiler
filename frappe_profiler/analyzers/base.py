@@ -47,6 +47,64 @@ FRAMEWORK_PREFIXES: tuple[str, ...] = (
 )
 
 
+def is_profiler_own_query(stack: list | None) -> bool:
+	"""Return True if a SQL call's Python stack originates from the
+	profiler's own instrumentation.
+
+	Examples of queries that hit this path:
+
+	- ``frappe_profiler/infra_capture.py:176`` — the ``SHOW GLOBAL
+	  STATUS`` snapshot run inside every ``before_request`` /
+	  ``after_request`` hook. Fired ~2× per captured request.
+	- ``frappe_profiler/infra_capture.py`` — the one-shot ``SHOW
+	  VARIABLES`` for ``max_connections`` (cached after first call).
+	- Anything else the profiler queries as part of its own bookkeeping.
+
+	These queries are real SQL that MariaDB executed, so they show up
+	in the recorder's call list with stack traces. The user can't act
+	on them, though — they're profiler overhead, not application work.
+	Before this helper, n_plus_one would surface them as:
+
+	    "Same query ran 22× at frappe_profiler/infra_capture.py:176"
+
+	and top_queries would include them in the slow-queries leaderboard,
+	both with the profiler's own internal file path as the "blame
+	frame." Filtering them out here keeps the findings user-actionable.
+
+	The rule (walk innermost → outermost):
+
+	- If we find a user frame (not in ``frappe/`` and not in
+	  ``frappe_profiler/``) → return False. The query came from user
+	  code routed through framework helpers — keep it.
+	- If we exhaust the stack seeing only ``frappe/`` and
+	  ``frappe_profiler/`` frames AND at least one was
+	  ``frappe_profiler/`` → return True. The deepest non-frappe frame
+	  is inside the profiler, so the query originated there.
+	- If we exhaust with only ``frappe/`` frames → return False. This
+	  is a legitimate framework query (migration, fixture, internal
+	  bg task) — the ``walk_callsite`` fallback still surfaces it.
+	"""
+	if not stack:
+		return False
+	has_profiler_frame = False
+	for frame in reversed(stack):
+		if not isinstance(frame, dict):
+			continue
+		filename = frame.get("filename") or ""
+		if not filename:
+			continue
+		if filename.startswith("frappe_profiler/"):
+			has_profiler_frame = True
+			continue
+		if filename.startswith("frappe/"):
+			# Keep walking — the profiler or user code may be further out.
+			continue
+		# Non-framework frame — this is user code; the query's origin
+		# is the user's business logic, not our instrumentation.
+		return False
+	return has_profiler_frame
+
+
 def walk_callsite(stack: list | None) -> dict | None:
 	"""Return the deepest non-framework frame that issued a query, or None.
 
@@ -58,10 +116,19 @@ def walk_callsite(stack: list | None) -> dict | None:
 	filename isn't inside a framework directory.
 
 	Returns a dict with keys `filename`, `lineno`, `function` — or None
-	if the stack is empty / malformed. Falls back to the innermost
-	frame if every frame is in the framework (legitimate for queries
-	issued from inside frappe migrations, fixtures, etc.) so we never
-	silently drop a finding.
+	if the stack is empty / malformed / belongs to profiler
+	instrumentation. Falls back to the innermost frame if every frame
+	is in ``frappe/`` (legitimate for queries issued from inside
+	frappe migrations, fixtures, etc.) so we never silently drop a
+	legitimate framework finding.
+
+	v0.5.1: stacks whose deepest non-frappe frame is inside
+	``frappe_profiler/`` (as detected by ``is_profiler_own_query``)
+	return None instead of falling back to the profiler frame. The
+	caller's ``if not callsite: continue`` guard then drops the query
+	— otherwise the profiler's own ``SHOW GLOBAL STATUS`` snapshots
+	show up as "Same query ran 22× at frappe_profiler/infra_capture
+	.py:176" findings, which are noise the user can't act on.
 	"""
 	if not stack:
 		return None
@@ -77,7 +144,14 @@ def walk_callsite(stack: list | None) -> dict | None:
 			continue
 		return frame
 
-	# Fallback: every frame was in the framework. Return the deepest one.
+	# Fallback: every frame was in the framework. If the profiler itself
+	# is in the stack, this is our own instrumentation — drop it.
+	if is_profiler_own_query(stack):
+		return None
+
+	# Pure frappe/* fallback: return the deepest frame so legitimate
+	# framework queries (migrations, fixtures, background tasks) still
+	# produce a finding.
 	last = stack[-1] if isinstance(stack[-1], dict) else None
 	if last and last.get("filename") and last.get("lineno") is not None:
 		return last
