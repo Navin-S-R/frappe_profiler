@@ -771,12 +771,49 @@ def _persist(
 	for action in context.actions:
 		doc.append("actions", action)
 
+	# v0.5.1: safety net for Profiler Finding.title's 140-char Frappe
+	# limit. Individual analyzers already shorten filenames in titles
+	# (see n_plus_one + call_tree), but pathological inputs — unusual
+	# function names, very high occurrence counts, unexpected formats
+	# from future analyzers — can still push past the limit and crash
+	# the whole persist with CharacterLengthExceededError. We clamp
+	# here so a single too-long title never destroys the entire
+	# analyze run.
+	_truncate_finding_titles(context.findings)
+
 	doc.set("findings", [])
 	for finding in context.findings:
 		doc.append("findings", finding)
 
 	doc.save(ignore_permissions=True)
 	frappe.db.commit()
+
+
+# Profiler Finding.title is a Frappe Data field — VARCHAR(140). Titles
+# that exceed this length raise CharacterLengthExceededError at save
+# time, taking down the whole analyze pipeline. We clamp in-place as a
+# safety net: 137 visible chars + the "..." ellipsis marker fits the
+# limit exactly, and the full information remains in the finding's
+# technical_detail_json for navigation.
+_FINDING_TITLE_MAX_CHARS = 140
+_FINDING_TITLE_ELLIPSIS = "..."
+
+
+def _truncate_finding_titles(findings: list[dict]) -> None:
+	"""Clamp every finding's title to <= _FINDING_TITLE_MAX_CHARS chars.
+
+	Mutates the findings list in place. Intended as a defense-in-depth
+	guard: analyzers should produce short titles to begin with (see
+	analyzers/base.short_filename), but pathological data can still
+	produce over-long titles on corner cases the analyzers didn't
+	anticipate. Rather than crash the whole persist, we clamp and
+	keep the full information in technical_detail_json.
+	"""
+	for finding in findings:
+		title = finding.get("title") or ""
+		if len(title) > _FINDING_TITLE_MAX_CHARS:
+			keep = _FINDING_TITLE_MAX_CHARS - len(_FINDING_TITLE_ELLIPSIS)
+			finding["title"] = title[:keep].rstrip() + _FINDING_TITLE_ELLIPSIS
 
 
 # v0.5.1: auto-generated "Steps to Reproduce" from captured actions. The

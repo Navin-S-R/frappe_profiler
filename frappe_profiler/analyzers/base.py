@@ -166,6 +166,59 @@ def walk_callsite_str(stack: list | None) -> str | None:
 	return f"{frame.get('filename', '?')}:{frame.get('lineno', '?')}"
 
 
+# ---------------------------------------------------------------------------
+# Filename display helper (v0.5.1)
+# ---------------------------------------------------------------------------
+# Used by analyzers that embed filenames in user-visible finding TITLES.
+#
+# Frappe's DocType Data field caps at 140 characters. Apps with deeply-
+# nested module paths push titles over that limit and crash the analyze
+# pipeline with CharacterLengthExceededError. A production session on
+# jewellery_erpnext hit this with an N+1 title:
+#
+#   Same query ran 65× at jewellery_erpnext/jewellery_erpnext/jewellery_
+#   erpnext/doctype/parent_manufacturing_order/parent_manufacturing_order
+#   .py:503
+#
+# That's 144 chars — just past the 140 limit. Shortening the filename to
+# its last 2 path segments yields:
+#
+#   Same query ran 65× at parent_manufacturing_order/parent_manufacturing
+#   _order.py:503
+#
+# ~90 chars — well under the limit — and still uniquely identifies the
+# file for navigation. The full absolute path remains in the finding's
+# technical_detail_json so the developer can jump to it directly.
+#
+# Analyzers should use this for TITLES only; customer_description and
+# technical_detail_json can keep the full path for disambiguation.
+
+
+def short_filename(filename: str, keep_segments: int = 2) -> str:
+	"""Return the last ``keep_segments`` path components of ``filename``.
+
+	Examples::
+
+	    short_filename("frappe/model/document.py")                    → "model/document.py"
+	    short_filename("a/b/c/d/e.py")                                → "d/e.py"
+	    short_filename("erpnext.py")                                  → "erpnext.py"
+	    short_filename("/Users/.../apps/frappe/frappe/handler.py")    → "frappe/handler.py"
+	    short_filename("")                                            → ""
+
+	The returned value is always <=  sum of the last N segment lengths
+	plus (N - 1) slashes, which for typical Python files is 40-60 chars.
+	"""
+	if not filename:
+		return ""
+	norm = filename.replace("\\", "/")
+	parts = [p for p in norm.split("/") if p]
+	if not parts:
+		return ""
+	if len(parts) <= keep_segments:
+		return "/".join(parts)
+	return "/".join(parts[-keep_segments:])
+
+
 @dataclass
 class AnalyzerResult:
 	"""Output from a single analyzer."""

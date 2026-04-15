@@ -151,6 +151,106 @@ def test_severity_scales_with_count_and_time(empty_context):
 # the user can optimize. Same goes for top_queries.
 
 
+def test_title_fits_in_140_chars_for_deeply_nested_module_paths(empty_context):
+	"""Profiler Finding.title is VARCHAR(140). Apps with deeply-nested
+	module paths (jewellery_erpnext has /doctype/<name>/<name>.py with
+	three 'jewellery_erpnext' segments in the path) produce N+1 titles
+	that overflow the limit and crash the analyze pipeline with
+	CharacterLengthExceededError.
+
+	v0.5.1 shortens the filename in the TITLE to the last two path
+	segments; the full path is still in customer_description and
+	technical_detail_json for navigation.
+	"""
+	long_filename = (
+		"jewellery_erpnext/jewellery_erpnext/jewellery_erpnext/"
+		"doctype/parent_manufacturing_order/parent_manufacturing_order.py"
+	)
+	recording = {
+		"uuid": "overlong-title",
+		"path": "/",
+		"cmd": None,
+		"method": "GET",
+		"event_type": "HTTP Request",
+		"duration": 800,
+		"calls": [
+			{
+				"query": "SELECT * FROM tabChild WHERE parent = ?",
+				"normalized_query": "SELECT * FROM tabChild WHERE parent = ?",
+				"duration": 5.0,
+				"stack": [{
+					"filename": long_filename,
+					"lineno": 503,
+					"function": "process_batch",
+				}],
+			}
+		] * 65,  # 65 occurrences — matches production error count
+	}
+	result = n_plus_one.analyze([recording], empty_context)
+	assert len(result.findings) == 1
+	f = result.findings[0]
+
+	# Must fit in the 140-char Profiler Finding.title limit.
+	assert len(f["title"]) <= 140, (
+		f"Title must fit in 140 chars; got {len(f['title'])}: {f['title']!r}"
+	)
+
+	# Title should still reference the filename (shortened) so the
+	# developer can navigate to it.
+	assert "parent_manufacturing_order" in f["title"]
+	assert "503" in f["title"]
+
+	# Full path still present in the customer_description and detail
+	# for disambiguation.
+	assert long_filename in f["customer_description"]
+	detail = json.loads(f["technical_detail_json"])
+	assert detail["callsite"]["filename"] == long_filename
+	assert detail["callsite"]["lineno"] == 503
+
+
+def test_short_filename_helper_unit():
+	"""Direct unit test of the base.short_filename helper."""
+	from frappe_profiler.analyzers.base import short_filename
+
+	# Typical case: keep last 2 segments
+	assert short_filename("frappe/model/document.py") == "model/document.py"
+	assert short_filename("a/b/c/d/e.py") == "d/e.py"
+
+	# Already short enough
+	assert short_filename("erpnext.py") == "erpnext.py"
+	assert short_filename("model/document.py") == "model/document.py"
+
+	# Absolute path — drop leading slash, keep last 2 segments
+	assert (
+		short_filename(
+			"/Users/navin/office/frappe_bench/apps/frappe/frappe/handler.py"
+		)
+		== "frappe/handler.py"
+	)
+
+	# The exact production payload
+	long_fn = (
+		"jewellery_erpnext/jewellery_erpnext/jewellery_erpnext/"
+		"doctype/parent_manufacturing_order/parent_manufacturing_order.py"
+	)
+	assert (
+		short_filename(long_fn)
+		== "parent_manufacturing_order/parent_manufacturing_order.py"
+	)
+
+	# Windows-style path separator
+	assert short_filename("a\\b\\c.py") == "b/c.py"
+
+	# Edge cases
+	assert short_filename("") == ""
+	assert short_filename("/") == ""
+	assert short_filename("x.py") == "x.py"
+
+	# Custom keep_segments
+	assert short_filename("a/b/c/d.py", keep_segments=1) == "d.py"
+	assert short_filename("a/b/c/d.py", keep_segments=3) == "b/c/d.py"
+
+
 def test_profiler_infra_capture_query_is_not_flagged(empty_context):
 	"""Exact production payload: 22 SHOW GLOBAL STATUS calls from
 	infra_capture.py:176. Must NOT produce an N+1 finding."""

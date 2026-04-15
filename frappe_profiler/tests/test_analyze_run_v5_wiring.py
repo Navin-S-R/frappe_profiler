@@ -62,3 +62,58 @@ def test_persist_writes_v5_aggregate_json():
 		"infra_timeline" in src
 		and "frontend_xhr_matched" in src
 	)
+
+
+
+def test_truncate_finding_titles_clamps_overlong():
+	"""Safety net: _persist clamps any finding.title that exceeds the
+	140-char Profiler Finding.title limit. Analyzers are supposed to
+	produce short titles (via base.short_filename), but pathological
+	inputs from future analyzers or unexpected data shapes could still
+	push past the limit. Clamping prevents CharacterLengthExceededError
+	from destroying the whole analyze pipeline."""
+	findings = [
+		# Under the limit — untouched.
+		{"title": "Short title"},
+		# Exactly at the limit — untouched.
+		{"title": "A" * 140},
+		# One over the limit — must be clamped to 140 and end with "...".
+		{"title": "B" * 141},
+		# Far over the limit — must be clamped to exactly 140.
+		{"title": "C" * 500},
+		# The production payload that started this bug.
+		{
+			"title": (
+				"Same query ran 65× at "
+				"jewellery_erpnext/jewellery_erpnext/jewellery_erpnext/"
+				"doctype/parent_manufacturing_order/"
+				"parent_manufacturing_order.py:503"
+			)
+		},
+	]
+	analyze._truncate_finding_titles(findings)
+
+	assert findings[0]["title"] == "Short title"
+	assert findings[1]["title"] == "A" * 140
+	assert len(findings[1]["title"]) == 140
+
+	assert len(findings[2]["title"]) == 140
+	assert findings[2]["title"].endswith("...")
+
+	assert len(findings[3]["title"]) == 140
+	assert findings[3]["title"].endswith("...")
+
+	# Production payload — was 144 chars, must now be <= 140.
+	assert len(findings[4]["title"]) <= 140
+
+
+def test_truncate_finding_titles_ignores_missing_title_key():
+	"""A finding dict missing the title key must not crash the
+	truncator. It should treat None/empty as untouched."""
+	findings = [{}, {"title": None}, {"title": ""}]
+	# Must not raise.
+	analyze._truncate_finding_titles(findings)
+	# Missing / None / empty → unchanged.
+	assert findings[0] == {}
+	assert findings[1]["title"] is None
+	assert findings[2]["title"] == ""

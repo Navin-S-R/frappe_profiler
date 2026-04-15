@@ -65,7 +65,11 @@ def test_builder_output_flows_through_n_plus_one(empty_context):
 	# 15 copies of the same query from the same callsite → one N+1 finding
 	assert len(result.findings) == 1
 	assert result.findings[0]["affected_count"] == 15
-	assert "apps/myapp/loop.py" in result.findings[0]["title"]
+	# v0.5.1: title uses short_filename (last 2 segments), not the full
+	# path. Full path is still in customer_description and technical
+	# detail for navigation.
+	assert "myapp/loop.py" in result.findings[0]["title"]
+	assert "apps/myapp/loop.py" in result.findings[0]["customer_description"]
 
 
 def test_build_explain_row_with_all_flags():

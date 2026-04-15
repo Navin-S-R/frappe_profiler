@@ -24,6 +24,7 @@ from frappe_profiler.analyzers.base import (
 	FRAMEWORK_PREFIXES,  # noqa: F401  (kept for any external importers)
 	SEVERITY_ORDER,
 	AnalyzerResult,
+	short_filename,
 	walk_callsite,
 )
 
@@ -104,11 +105,18 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 		action_idx = occurrences[0]["action_idx"]
 		severity = _severity(count, total_time)
 
+		# v0.5.1: shorten filename in the TITLE only. Deeply-nested module
+		# paths (e.g. jewellery_erpnext/jewellery_erpnext/jewellery_erpnext/
+		# doctype/parent_manufacturing_order/parent_manufacturing_order.py)
+		# push the 140-char Profiler Finding.title limit and crash analyze
+		# with CharacterLengthExceededError. customer_description and
+		# technical_detail_json keep the full filename for navigation.
+		short_fn = short_filename(filename)
 		findings.append(
 			{
 				"finding_type": "N+1 Query",
 				"severity": severity,
-				"title": f"Same query ran {count}× at {filename}:{lineno}",
+				"title": f"Same query ran {count}× at {short_fn}:{lineno}",
 				"customer_description": (
 					f"We noticed the same query was repeated {count} times in a row "
 					f"from the same line of code ({filename}:{lineno}), costing about "
