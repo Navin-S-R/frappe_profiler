@@ -56,6 +56,34 @@ MAX_EXAMPLE_QUERIES = 3
 # with thousands of unparseable queries.
 MAX_LOGGED_FAILURES = 3
 
+# v0.5.1: Classify exceptions from DBOptimizer / sql_metadata.
+#
+# sql_metadata is a third-party SQL parser with well-known limitations: it
+# trips on correlated subqueries, complex ORDER BY expressions containing
+# functions (if/locate/coalesce), window functions, CTEs, and a few other
+# shapes Frappe apps legitimately emit. When it can't parse a query, it
+# raises either ``ValueError: too many values to unpack`` (from an internal
+# tuple unpacking) or ``TypeError`` (from an unexpected None in its
+# token stream). These are PARSER LIMITATIONS — the user cannot rewrite
+# their query to make sql_metadata happy, and they cannot add an index to
+# fix a parse failure anyway.
+#
+# Pre-v0.5.1 the analyzer logged every parse failure to Frappe's Error
+# Log and emitted a loud "Could not analyze N of M queries" warning.
+# For a production session running ERPNext's item search dialog (which
+# has the exact offending query shape above), this filled the Error Log
+# with TypeError / ValueError tracebacks that looked like profiler bugs,
+# and the warning made the user think they were missing optimization
+# opportunities they could act on.
+#
+# v0.5.1: parser-limitation exceptions are counted but NOT logged to
+# the Error Log, and the user-facing warning is softer — it explains
+# that sql_metadata can't parse these shapes and there's nothing to fix.
+# Real errors (AttributeError, ProgrammingError, RuntimeError, etc.)
+# still go to the Error Log and still produce the loud warning, because
+# those might indicate a profiler bug worth investigating.
+_PARSER_LIMITATION_EXCEPTIONS = (ValueError, TypeError)
+
 # v0.5.1: only these SQL statement types get fed to DBOptimizer. Anything
 # else (BEGIN/COMMIT/SAVEPOINT/RELEASE SAVEPOINT, SET autocommit, SHOW,
 # DDL, stored-procedure CALL) does not benefit from index suggestions,
@@ -294,16 +322,25 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 	suggestion_buckets: dict[tuple, dict] = defaultdict(
 		lambda: {"duration": 0.0, "count": 0, "queries": []}
 	)
-	failures_by_type: Counter = Counter()
-	logged = 0
+	parser_limit_failures: Counter = Counter()
+	real_failures: Counter = Counter()
+	logged_real = 0
 	for normalized, info in unique_queries.items():
 		try:
 			# DBOptimizer parses with sql_metadata which doesn't care about
 			# literal values, so passing the normalized query is fine.
 			index = _optimize_query(info["raw"])
+		except _PARSER_LIMITATION_EXCEPTIONS as e:
+			# Expected path for complex queries sql_metadata can't parse.
+			# Count but don't log — the user can't act on these.
+			parser_limit_failures[type(e).__name__] += 1
+			continue
 		except Exception as e:
-			failures_by_type[type(e).__name__] += 1
-			if logged < MAX_LOGGED_FAILURES:
+			# Unexpected path — this might indicate a real profiler bug.
+			# Count, log the first few to Error Log (so they're discoverable
+			# for investigation), and continue.
+			real_failures[type(e).__name__] += 1
+			if logged_real < MAX_LOGGED_FAILURES:
 				try:
 					import frappe
 
@@ -317,7 +354,7 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 					)
 				except Exception:
 					pass
-				logged += 1
+				logged_real += 1
 			continue
 		if not index or not index.table or not index.column:
 			continue
@@ -408,16 +445,36 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 	findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 3), -f["estimated_impact_ms"]))
 
 	warnings: list[str] = []
-	total_failures = sum(failures_by_type.values())
-	if total_failures:
+
+	# v0.5.1: Real errors (unexpected exception types from DBOptimizer) get
+	# the loud "you should investigate" warning + Error Log entries.
+	total_real = sum(real_failures.values())
+	if total_real:
 		failure_summary = ", ".join(
-			f"{n}× {name}" for name, n in failures_by_type.most_common(3)
+			f"{n}× {name}" for name, n in real_failures.most_common(3)
 		)
 		warnings.append(
-			f"Could not analyze {total_failures} of {len(unique_queries)} "
+			f"Could not analyze {total_real} of {len(unique_queries)} "
 			f"SELECT statements for index suggestions ({failure_summary}). "
 			"The report may be missing some optimization opportunities — "
 			"see Error Log for the first few failed queries."
+		)
+
+	# v0.5.1: Parser limitations (sql_metadata can't parse this shape) get
+	# a soft informational line, no Error Log noise, and explicit language
+	# telling the user there's nothing to fix. Production sessions on
+	# ERPNext frequently hit this for the item search dialog's complex
+	# query (correlated subquery + ORDER BY if/locate/coalesce expression)
+	# and a few reporting queries with window functions — neither of
+	# which is user-actionable.
+	total_parser_limit = sum(parser_limit_failures.values())
+	if total_parser_limit:
+		warnings.append(
+			f"Skipped {total_parser_limit} query(ies) whose shape "
+			"exceeds the DBOptimizer heuristic's sql_metadata parser "
+			"(correlated subqueries, complex ORDER BY expressions, window "
+			"functions). These aren't actionable — index suggestions "
+			"require a simpler WHERE/JOIN shape the parser can analyze."
 		)
 	# v0.5.1: separate informational line about non-SELECT statements that
 	# were deliberately skipped, so users understand the distinction between

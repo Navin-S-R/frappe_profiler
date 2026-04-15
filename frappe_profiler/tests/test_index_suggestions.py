@@ -86,13 +86,28 @@ def test_single_suggestion_per_table_column(monkeypatch, empty_context):
 	assert "ALTER TABLE" in detail["suggested_ddl"]
 
 
-def test_optimizer_exception_produces_warning(monkeypatch, empty_context):
-	"""Fix #9: failures must surface as warnings, not be silently dropped."""
+def test_parser_limitation_valueerror_gets_soft_warning(monkeypatch, empty_context):
+	"""v0.5.1: ValueError from sql_metadata is a parser limitation, not
+	a bug we should scream about. It must produce the soft "Skipped N
+	queries whose shape exceeds the parser" warning — NOT the loud
+	"Could not analyze" warning that tells users to check Error Log.
+	And it must NOT write to frappe.log_error."""
 
 	def fake_optimize(query: str):
 		raise ValueError("synthetic parse error")
 
 	_install_fake_recorder_module(monkeypatch, fake_optimize)
+
+	# Track whether log_error was called — parser limitations must NOT
+	# end up in Frappe's Error Log.
+	log_error_calls = []
+	import frappe
+	monkeypatch.setattr(
+		frappe,
+		"log_error",
+		lambda *a, **k: log_error_calls.append((a, k)),
+		raising=False,
+	)
 
 	recording = {
 		"uuid": "ix2",
@@ -118,9 +133,63 @@ def test_optimizer_exception_produces_warning(monkeypatch, empty_context):
 	}
 	result = index_suggestions.analyze([recording], empty_context)
 	assert result.findings == []
+	# Soft warning, not the loud one.
 	assert len(result.warnings) == 1
-	assert "Could not analyze" in result.warnings[0]
-	assert "ValueError" in result.warnings[0]
+	assert "exceeds the DBOptimizer heuristic" in result.warnings[0], (
+		f"Expected soft parser-limit warning; got: {result.warnings}"
+	)
+	assert "Could not analyze" not in result.warnings[0], (
+		"ValueError is a parser limitation — must not use the "
+		"loud 'Could not analyze / see Error Log' phrasing"
+	)
+	# And crucially: no Error Log entry for parser limitations.
+	assert log_error_calls == [], (
+		f"Parser limitations must not be written to frappe.log_error. "
+		f"Calls recorded: {log_error_calls}"
+	)
+
+
+def test_real_error_still_produces_loud_warning_and_logs(monkeypatch, empty_context):
+	"""Unexpected exception types (not ValueError/TypeError) may indicate
+	a profiler bug — those still get the loud warning + Error Log entries
+	so the team can investigate."""
+
+	def fake_optimize(query: str):
+		raise RuntimeError("unexpected internal optimizer error")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+
+	log_error_calls = []
+	import frappe
+	monkeypatch.setattr(
+		frappe,
+		"log_error",
+		lambda *a, **k: log_error_calls.append((a, k)),
+		raising=False,
+	)
+
+	recording = {
+		"uuid": "ix_real_err",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 10,
+		"calls": [{
+			"query": "SELECT 1",
+			"normalized_query": "SELECT ?",
+			"duration": 5.0,
+			"stack": [],
+		}],
+	}
+	result = index_suggestions.analyze([recording], empty_context)
+	assert result.findings == []
+	# Loud warning for real errors.
+	loud = [w for w in result.warnings if "Could not analyze" in w]
+	assert len(loud) == 1
+	assert "RuntimeError" in loud[0]
+	# And DID log to Error Log.
+	assert len(log_error_calls) >= 1, (
+		"Real errors must be written to frappe.log_error so they're "
+		"discoverable for investigation."
+	)
 
 
 def test_no_suggestion_when_optimizer_returns_none(monkeypatch, empty_context):
@@ -643,6 +712,182 @@ def test_select_with_leading_comment_is_still_recognised(monkeypatch, empty_cont
 		f"SELECT prefixed with a /* comment */ must still be analyzed; "
 		f"got findings={missing}, warnings={result.warnings}"
 	)
+
+
+# ---------------------------------------------------------------------------
+# v0.5.1 regression guard: exact production payload from ERPNext item search
+# ---------------------------------------------------------------------------
+# ERPNext's item search dialog issues a query sql_metadata can't parse:
+# correlated subquery in WHERE IN, ORDER BY with if(locate(...), locate(...))
+# expressions. DBOptimizer's tuple unpacking then raises:
+#
+#   ValueError: too many values to unpack (expected 2, got 4)
+#
+# Pre-fix: this showed up as an Error Log entry ("frappe_profiler optimizer
+# failure") AND a loud "Could not analyze 1 of N queries — see Error Log"
+# warning. Neither is actionable — the user cannot rewrite the ERPNext
+# core query and cannot add an index to fix a parse failure. v0.5.1
+# classifies these as parser limitations (soft informational warning, no
+# Error Log noise).
+
+
+_ERPNEXT_ITEM_SEARCH_QUERY = """
+SELECT tabItem.name,
+       item_name,
+       item_group,
+       customer_code,
+       if(length(tabItem.description) > ?, concat(substr(tabItem.description, ?, ?), ?), description) AS description
+FROM tabItem
+WHERE tabItem.docstatus < ?
+  AND tabItem.disabled=?
+  AND tabItem.has_variants=?
+  AND (tabItem.end_of_life > ?
+       OR coalesce(tabItem.end_of_life, ?)=?)
+  AND (item_name like ?
+       OR description like ?
+       OR item_group like ?
+       OR customer_code like ?
+       OR name like ?
+       OR item_code like ?
+       OR tabItem.item_code IN
+         (SELECT parent
+          FROM `tabItem Barcode`
+          WHERE barcode LIKE ?)
+       OR tabItem.description LIKE ?)
+  AND `tabItem`.`is_sales_item`=?
+  AND `tabItem`.`has_variants`=?
+ORDER BY if(locate(?, name), locate(?, name), ?),
+         if(locate(?, item_name), locate(?, item_name), ?),
+         idx DESC,
+         name,
+         item_name
+LIMIT ?,
+      ?
+"""
+
+
+def test_erpnext_item_search_valueerror_is_soft_skip(monkeypatch, empty_context):
+	"""Exact production payload: the ERPNext item-search query triggers
+	``ValueError: too many values to unpack (expected 2, got 4)`` inside
+	sql_metadata. The analyzer must:
+
+	  1. Not crash (continue processing other queries)
+	  2. Not write to frappe.log_error — it's not a profiler bug
+	  3. Emit the soft 'Skipped N queries whose shape exceeds…' warning
+	  4. Still produce index suggestions for OTHER queries in the same
+	     session that DO parse cleanly
+	"""
+
+	def fake_optimize(query: str):
+		# The complex query raises exactly the production error.
+		if "tabItem.item_code IN" in query:
+			raise ValueError("too many values to unpack (expected 2, got 4)")
+		# A simpler query succeeds so we can assert mixed-behavior works.
+		return _FakeDBIndex("tabLead", "status")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+	_install_fake_frappe_db(
+		monkeypatch,
+		indexed_columns_by_table={"tabLead": {"name"}},
+		column_types_by_table={
+			"tabLead": {"name": "varchar", "status": "varchar"},
+		},
+	)
+
+	log_error_calls = []
+	import frappe
+	monkeypatch.setattr(
+		frappe,
+		"log_error",
+		lambda *a, **k: log_error_calls.append((a, k)),
+		raising=False,
+	)
+
+	recording = {
+		"uuid": "ix_erpnext_item_search",
+		"path": "/",
+		"cmd": None,
+		"method": "GET",
+		"event_type": "HTTP Request",
+		"duration": 500,
+		"calls": [
+			{
+				"query": _ERPNEXT_ITEM_SEARCH_QUERY,
+				"normalized_query": _ERPNEXT_ITEM_SEARCH_QUERY,
+				"duration": 180.0,
+				"stack": [],
+			},
+			# A clean query that DOES produce a suggestion, alongside
+			# the problematic one — verifies mixed behavior.
+			{
+				"query": "SELECT * FROM tabLead WHERE status = 'Open'",
+				"normalized_query": "SELECT * FROM tabLead WHERE status = ?",
+				"duration": 50.0,
+				"stack": [],
+			},
+		],
+	}
+
+	result = index_suggestions.analyze([recording], empty_context)
+
+	# 1. No crash, the clean query still produced its suggestion.
+	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
+	assert len(missing) == 1
+	assert "tabLead" in missing[0]["title"]
+
+	# 2. No Error Log entry for the ValueError.
+	assert log_error_calls == [], (
+		f"Parser-limit ValueError must not log to frappe.log_error. "
+		f"Calls recorded: {log_error_calls}"
+	)
+
+	# 3. Soft warning present, loud warning absent.
+	soft = [w for w in result.warnings if "exceeds the DBOptimizer heuristic" in w]
+	loud = [w for w in result.warnings if "Could not analyze" in w]
+	assert len(soft) == 1, (
+		f"Expected soft parser-limit warning; got warnings={result.warnings}"
+	)
+	assert loud == [], (
+		f"Loud 'Could not analyze' warning must not fire for parser "
+		f"limitations; got: {loud}"
+	)
+	# And the soft warning must count exactly one skipped query.
+	assert "Skipped 1 " in soft[0]
+
+
+def test_typeerror_from_optimizer_is_also_a_soft_skip(monkeypatch, empty_context):
+	"""TypeError is another sql_metadata failure mode (unexpected None
+	in its token stream). Must be classified as a parser limitation
+	alongside ValueError."""
+
+	def fake_optimize(query: str):
+		raise TypeError("'NoneType' object is not subscriptable")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+
+	log_error_calls = []
+	import frappe
+	monkeypatch.setattr(
+		frappe, "log_error",
+		lambda *a, **k: log_error_calls.append((a, k)),
+		raising=False,
+	)
+
+	recording = {
+		"uuid": "ix_type_err",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 10,
+		"calls": [{
+			"query": "SELECT 1",
+			"normalized_query": "SELECT ?",
+			"duration": 5.0,
+			"stack": [],
+		}],
+	}
+	result = index_suggestions.analyze([recording], empty_context)
+	assert log_error_calls == []
+	soft = [w for w in result.warnings if "exceeds the DBOptimizer heuristic" in w]
+	assert len(soft) == 1
 
 
 def test_get_query_type_helper_direct():
