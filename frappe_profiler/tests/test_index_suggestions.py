@@ -492,3 +492,176 @@ def test_severity_scales_with_savings(monkeypatch, empty_context):
 	assert len(result.findings) == 1
 	# 1000ms > HIGH_IMPACT_MS (500)
 	assert result.findings[0]["severity"] == "High"
+
+
+# ---------------------------------------------------------------------------
+# v0.5.1 regression guards: filter non-SELECT statements BEFORE the optimizer.
+# A real production session showed 47% "parse failures" (334 of 705) because
+# transaction markers (BEGIN/COMMIT/SAVEPOINT/SET) were being fed to sql_metadata.
+# None of those benefit from an index suggestion, and most raise ValueError.
+# The fix: filter by leading keyword before ever calling _optimize_query.
+# ---------------------------------------------------------------------------
+
+
+def test_non_select_statements_are_skipped_without_failures(monkeypatch, empty_context):
+	"""BEGIN/COMMIT/SAVEPOINT/SET/etc. must never reach _optimize_query.
+
+	Pre-v0.5.1, these were counted as 'parse failures' and polluted the
+	report with a warning saying 'Could not analyze 47% of your queries',
+	which was misleading — the queries weren't optimization targets to
+	begin with.
+	"""
+	optimize_call_count = {"n": 0}
+
+	def fake_optimize(query: str):
+		optimize_call_count["n"] += 1
+		# If this is called at all on a non-SELECT, the filter is broken.
+		return None
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+
+	recording = {
+		"uuid": "ix_non_select",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 100,
+		"calls": [
+			# All statement types that caused ValueError in production:
+			{"query": "BEGIN", "normalized_query": "BEGIN",
+			 "duration": 0.5, "stack": []},
+			{"query": "COMMIT", "normalized_query": "COMMIT",
+			 "duration": 0.3, "stack": []},
+			{"query": "ROLLBACK", "normalized_query": "ROLLBACK",
+			 "duration": 0.2, "stack": []},
+			{"query": "SAVEPOINT sp1", "normalized_query": "SAVEPOINT sp1",
+			 "duration": 0.1, "stack": []},
+			{"query": "RELEASE SAVEPOINT sp1",
+			 "normalized_query": "RELEASE SAVEPOINT sp1",
+			 "duration": 0.1, "stack": []},
+			{"query": "SET autocommit = 0",
+			 "normalized_query": "SET autocommit = 0",
+			 "duration": 0.1, "stack": []},
+			{"query": "SHOW TABLES", "normalized_query": "SHOW TABLES",
+			 "duration": 1.0, "stack": []},
+			{"query": "CALL some_proc()", "normalized_query": "CALL some_proc()",
+			 "duration": 5.0, "stack": []},
+			{"query": "ALTER TABLE tabFoo ADD COLUMN x INT",
+			 "normalized_query": "ALTER TABLE tabFoo ADD COLUMN x INT",
+			 "duration": 10.0, "stack": []},
+		],
+	}
+
+	result = index_suggestions.analyze([recording], empty_context)
+
+	# The optimizer must not have been called at all — everything was
+	# filtered by query type first.
+	assert optimize_call_count["n"] == 0, (
+		f"Non-SELECT statements must be skipped before reaching "
+		f"_optimize_query; got {optimize_call_count['n']} optimizer calls"
+	)
+
+	# No findings (nothing was analyzed).
+	assert result.findings == []
+
+	# The skipped count must surface as an informational warning,
+	# separately from 'parse failures'.
+	assert any("Skipped" in w and "non-SELECT" in w for w in result.warnings), (
+		f"Expected a 'Skipped N non-SELECT' warning; got: {result.warnings}"
+	)
+
+	# And crucially — there must NOT be a "Could not analyze" parse-failure
+	# warning, because nothing actually failed.
+	assert not any("Could not analyze" in w for w in result.warnings), (
+		f"Non-SELECT skips must not be reported as parse failures; "
+		f"got: {result.warnings}"
+	)
+
+
+def test_select_statements_still_analyzed_alongside_skips(monkeypatch, empty_context):
+	"""Positive case: mix SELECTs with non-SELECTs. The SELECTs get
+	analyzed; the non-SELECTs get skipped; the counts are reported
+	separately."""
+
+	def fake_optimize(query: str):
+		# Only reachable for the SELECT statements.
+		assert query.strip().upper().startswith("SELECT"), (
+			f"Only SELECTs should reach the optimizer; got: {query!r}"
+		)
+		return _FakeDBIndex("tabLead", "status")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+
+	recording = {
+		"uuid": "ix_mixed",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 100,
+		"calls": [
+			{"query": "BEGIN", "normalized_query": "BEGIN",
+			 "duration": 0.5, "stack": []},
+			{"query": "SELECT * FROM tabLead WHERE status = 'Open'",
+			 "normalized_query": "SELECT * FROM tabLead WHERE status = ?",
+			 "duration": 50.0, "stack": []},
+			{"query": "COMMIT", "normalized_query": "COMMIT",
+			 "duration": 0.3, "stack": []},
+		],
+	}
+
+	result = index_suggestions.analyze([recording], empty_context)
+	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
+	assert len(missing) == 1, (
+		f"SELECT should still produce a finding; got {missing}"
+	)
+	# 2 non-SELECTs skipped.
+	assert any("Skipped 2" in w for w in result.warnings), (
+		f"Expected 'Skipped 2 non-SELECT' warning; got: {result.warnings}"
+	)
+
+
+def test_select_with_leading_comment_is_still_recognised(monkeypatch, empty_context):
+	"""Frappe prepends `/* comment */` to some queries for tracing.
+	The query-type filter must see through comments and recognise the
+	underlying SELECT, otherwise we'd skip legitimate optimization
+	targets."""
+
+	def fake_optimize(query: str):
+		return _FakeDBIndex("tabCommented", "key_col")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+
+	recording = {
+		"uuid": "ix_comment",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 100,
+		"calls": [{
+			"query": "/* app: frappe */ SELECT * FROM tabCommented WHERE key_col = ?",
+			"normalized_query": "/* app: frappe */ SELECT * FROM tabCommented WHERE key_col = ?",
+			"duration": 50.0, "stack": [],
+		}],
+	}
+	result = index_suggestions.analyze([recording], empty_context)
+	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
+	assert len(missing) == 1, (
+		f"SELECT prefixed with a /* comment */ must still be analyzed; "
+		f"got findings={missing}, warnings={result.warnings}"
+	)
+
+
+def test_get_query_type_helper_direct():
+	"""Direct unit test of the _get_query_type helper — covers the
+	regex edge cases without the full analyzer path."""
+	from frappe_profiler.analyzers.index_suggestions import _get_query_type
+
+	assert _get_query_type("SELECT 1") == "SELECT"
+	assert _get_query_type("  select *  from foo") == "SELECT"
+	assert _get_query_type("BEGIN") == "BEGIN"
+	assert _get_query_type("commit") == "COMMIT"
+	assert _get_query_type("SAVEPOINT sp1") == "SAVEPOINT"
+	assert _get_query_type("RELEASE SAVEPOINT sp1") == "RELEASE"
+	assert _get_query_type("SET autocommit = 0") == "SET"
+	assert _get_query_type("SHOW TABLES") == "SHOW"
+	assert _get_query_type("/* comment */ SELECT 1") == "SELECT"
+	assert _get_query_type("/* multi\nline\ncomment */ select 1") == "SELECT"
+	# Empty / None / garbage:
+	assert _get_query_type("") == ""
+	assert _get_query_type(None) == ""
+	assert _get_query_type("   ") == ""
+	assert _get_query_type("/* only comment */") == ""

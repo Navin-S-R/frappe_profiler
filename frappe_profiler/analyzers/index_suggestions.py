@@ -56,6 +56,34 @@ MAX_EXAMPLE_QUERIES = 3
 # with thousands of unparseable queries.
 MAX_LOGGED_FAILURES = 3
 
+# v0.5.1: only these SQL statement types get fed to DBOptimizer. Anything
+# else (BEGIN/COMMIT/SAVEPOINT/RELEASE SAVEPOINT, SET autocommit, SHOW,
+# DDL, stored-procedure CALL) does not benefit from index suggestions,
+# and sql_metadata raises ValueError on many of them. The pre-v0.5.1
+# version fed everything to the optimizer and reported ~47% 'parse
+# failures' on real sessions — most of which were transaction markers
+# and connection-state statements, noise the user couldn't act on.
+_OPTIMIZABLE_QUERY_TYPES = frozenset({"SELECT"})
+
+# Leading-keyword regex tolerant of whitespace and C-style /* ... */
+# comments at the start of the statement (Frappe prepends comments in
+# some paths). DOTALL handles multi-line comments.
+_SQL_LEADING_KEYWORD_RE = re.compile(
+	r"^\s*(?:/\*.*?\*/\s*)*(\w+)",
+	re.IGNORECASE | re.DOTALL,
+)
+
+
+def _get_query_type(sql: str) -> str:
+	"""Return the leading SQL keyword in uppercase, or empty string if
+	the statement doesn't start with a parseable keyword."""
+	if not sql:
+		return ""
+	m = _SQL_LEADING_KEYWORD_RE.match(sql)
+	if not m:
+		return ""
+	return m.group(1).upper()
+
 # v0.5.1: prefix length for text/blob column indexes. MariaDB requires
 # a length hint for TEXT/BLOB columns and for VARCHARs that would
 # exceed the 767-byte index-key limit. 255 is a safe default for
@@ -227,15 +255,33 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 
 	# Aggregate by unique normalized query so we only ask the optimizer once
 	# per shape, regardless of how many times the shape was executed.
+	#
+	# v0.5.1: filter to SELECT statements only at aggregation time, before
+	# we ever reach _optimize_query. Non-SELECT statements (BEGIN, COMMIT,
+	# SAVEPOINT, SET, DDL, CALL, SHOW) can't benefit from a single-column
+	# btree index suggestion and make sql_metadata raise ValueError, which
+	# shows up in the report as 'Could not analyze N of M queries' noise.
+	# Counting those as 'failures' misled users into thinking half their
+	# queries had parse issues when actually half their queries weren't
+	# optimization targets to begin with.
 	unique_queries: dict[str, dict] = {}
+	skipped_by_type: int = 0
+
 	for recording in recordings:
 		for call in recording.get("calls") or []:
 			normalized = call.get("normalized_query")
 			if not normalized:
 				continue
+
+			raw = call.get("query") or normalized
+			qtype = _get_query_type(raw) or _get_query_type(normalized)
+			if qtype not in _OPTIMIZABLE_QUERY_TYPES:
+				skipped_by_type += 1
+				continue
+
 			entry = unique_queries.setdefault(
 				normalized,
-				{"duration": 0.0, "count": 0, "raw": call.get("query") or normalized},
+				{"duration": 0.0, "count": 0, "raw": raw},
 			)
 			entry["duration"] += call.get("duration", 0)
 			entry["count"] += 1
@@ -369,9 +415,21 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 		)
 		warnings.append(
 			f"Could not analyze {total_failures} of {len(unique_queries)} "
-			f"queries for index suggestions ({failure_summary}). "
+			f"SELECT statements for index suggestions ({failure_summary}). "
 			"The report may be missing some optimization opportunities — "
 			"see Error Log for the first few failed queries."
+		)
+	# v0.5.1: separate informational line about non-SELECT statements that
+	# were deliberately skipped, so users understand the distinction between
+	# 'we tried to analyze and failed' (above) and 'we didn't try because
+	# the statement type isn't optimizable' (below). Not a warning — more
+	# of a 'here's what the 705-query number breaks down to.'
+	if skipped_by_type:
+		warnings.append(
+			f"Skipped {skipped_by_type} non-SELECT statement(s) for index "
+			"suggestions (BEGIN/COMMIT/SAVEPOINT/SET/DDL/CALL/SHOW). "
+			"These don't benefit from single-column btree index suggestions "
+			"and aren't counted as analysis failures."
 		)
 	if drop_already_indexed:
 		warnings.append(

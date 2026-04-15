@@ -35,6 +35,8 @@ LOW_FILTERED_MIN_ROWS = 100
 def analyze(recordings: list[dict], context) -> AnalyzerResult:
 	# (finding_type, table) → aggregated finding dict
 	buckets: dict[tuple, dict] = {}
+	row_errors = 0
+	first_error_reasons: list[str] = []
 
 	for action_idx, recording in enumerate(recordings):
 		for call in recording.get("calls") or []:
@@ -46,17 +48,103 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 			for row in explain_rows:
 				if not isinstance(row, dict):
 					continue
-				_inspect_row(row, normalized, action_idx, query_duration, buckets)
+				# v0.5.1: wrap per-row inspection in try/except so a single
+				# bad row (e.g. an EXPLAIN JSON nested structure from an
+				# unusual MariaDB version, a Decimal value that doesn't
+				# coerce cleanly, a field with an unexpected type) doesn't
+				# kill the whole analyzer. Previously a single crash in
+				# _inspect_row caused the analyze.run outer try/except to
+				# log 'analyzer failed' and drop ALL Full Table Scan /
+				# Filesort / Temporary Table / Low Filter Ratio findings
+				# for the entire session.
+				try:
+					_inspect_row(row, normalized, action_idx, query_duration, buckets)
+				except Exception as e:
+					row_errors += 1
+					if len(first_error_reasons) < 3:
+						first_error_reasons.append(
+							f"{type(e).__name__}: {e} "
+							f"(row keys: {sorted(list(row.keys()))[:10]})"
+						)
 
 	findings = list(buckets.values())
 	findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 3), -f["estimated_impact_ms"]))
-	return AnalyzerResult(findings=findings)
+
+	warnings: list[str] = []
+	if row_errors:
+		warnings.append(
+			f"explain_flags: could not parse {row_errors} EXPLAIN row(s). "
+			f"First reasons: {'; '.join(first_error_reasons)}. "
+			"The report may be missing some optimization opportunities."
+		)
+		# Surface the first few to the Error Log as well so operators can
+		# pattern-match across sessions.
+		try:
+			import frappe
+
+			for reason in first_error_reasons:
+				frappe.log_error(
+					title="frappe_profiler explain_flags row parse",
+					message=reason,
+				)
+		except Exception:
+			pass
+
+	return AnalyzerResult(findings=findings, warnings=warnings)
+
+
+# ---------------------------------------------------------------------------
+# Numeric coercion
+# ---------------------------------------------------------------------------
+# MariaDB's `rows` and `filtered` columns come back as int/float in the
+# typical PyMySQL path, but certain driver versions and EXPLAIN FORMAT
+# variants have been observed to return Decimal, str, or even None — any
+# of which would crash a Python 3 `>` comparison with a numeric literal.
+# v0.5.1 adds explicit coercion helpers so one weird row doesn't take out
+# the whole session.
+
+
+def _to_int(val) -> int:
+	"""Coerce EXPLAIN numeric fields to int. Returns 0 on any failure
+	(None, unparseable string, unexpected type)."""
+	if val is None:
+		return 0
+	if isinstance(val, bool):
+		# bool is a subclass of int — treat False as 0, True as 1
+		return int(val)
+	if isinstance(val, int):
+		return val
+	if isinstance(val, float):
+		return int(val)
+	try:
+		return int(val)
+	except (TypeError, ValueError):
+		try:
+			return int(float(val))
+		except (TypeError, ValueError):
+			return 0
+
+
+def _to_float(val):
+	"""Coerce EXPLAIN `filtered` to float. Returns None on failure so the
+	filtered-threshold check can cleanly skip."""
+	if val is None:
+		return None
+	if isinstance(val, bool):
+		return float(val)
+	if isinstance(val, (int, float)):
+		return float(val)
+	try:
+		return float(val)
+	except (TypeError, ValueError):
+		return None
 
 
 def _inspect_row(row, normalized_query, action_idx, query_duration, buckets):
 	"""Check one EXPLAIN row against four red-flag patterns."""
 	table = row.get("table") or "?"
-	rows_examined = row.get("rows") or 0
+	# v0.5.1: explicit coercion — see _to_int docstring.
+	rows_examined = _to_int(row.get("rows"))
 	extra = (row.get("Extra") or row.get("extra") or "").lower()
 	type_ = (row.get("type") or "").lower()
 
@@ -128,9 +216,11 @@ def _inspect_row(row, normalized_query, action_idx, query_duration, buckets):
 	# of rows examined are actually returned after filtering. Values under
 	# 10 mean the query is reading 10x or more of what it needs — the WHERE
 	# clause isn't selective enough (or isn't using an index to filter).
-	filtered = row.get("filtered")
+	# v0.5.1: coerce explicitly so Decimal/str values from unusual drivers
+	# don't silently fall through the isinstance guard.
+	filtered = _to_float(row.get("filtered"))
 	if (
-		isinstance(filtered, (int, float))
+		filtered is not None
 		and filtered < LOW_FILTERED_THRESHOLD
 		and rows_examined > LOW_FILTERED_MIN_ROWS
 	):
