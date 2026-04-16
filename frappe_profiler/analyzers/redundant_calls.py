@@ -108,18 +108,35 @@ def _to_hashable(value):
 
 
 def _is_framework_filename(filename: str) -> bool:
-	"""True if the given filename is inside frappe/* or frappe_profiler/*.
+	"""True if the given filename is inside code the user can't
+	modify from their application: frappe/*, frappe_profiler/*, OR
+	any third-party pip-installed library.
 
 	Used to filter Redundant Call findings whose loop lives in
-	framework code. walk_callsite's fallback returns the deepest
-	frame even when every frame is framework, so relying on its
-	None return alone isn't enough — we additionally inspect the
-	filename.
+	framework / infra code. Production report had 3 of 4 redundant
+	findings pointing at ``env/lib/python3.14/site-packages/
+	werkzeug/serving.py`` — werkzeug's WSGI loop. 'Cache looked up
+	25 times in serving.py:370' isn't a real loop — it's once per
+	request across 25 requests — and even if it were, the user
+	can't patch werkzeug.
 	"""
 	if not filename:
 		return False
 	norm = filename.replace("\\", "/")
-	return "frappe/" in norm or "frappe_profiler/" in norm
+	# Frappe-ecosystem framework
+	if "frappe/" in norm or "frappe_profiler/" in norm:
+		return True
+	# v0.5.2: third-party libs. Any pip-installed package lives
+	# under site-packages/ or dist-packages/ (Debian). Also catch
+	# common ones by name in case sys.path was manipulated to
+	# bypass the site-packages indirection.
+	if "site-packages/" in norm or "dist-packages/" in norm:
+		return True
+	for lib in ("werkzeug/", "gunicorn/", "/rq/", "pyinstrument/",
+	            "pytz/", "dateutil/", "MySQLdb/", "pymysql/"):
+		if lib in norm:
+			return True
+	return False
 
 
 def analyze(recordings: list, context) -> AnalyzerResult:
@@ -170,11 +187,30 @@ def analyze(recordings: list, context) -> AnalyzerResult:
 	# And how many had no caller stack at all (sidecars captured before
 	# v0.5.2 when caller_stack wasn't recorded).
 	drop_no_caller_stack = 0
+	# v0.5.2 round 2: buckets whose count threshold was only reached by
+	# summing ACROSS many actions (e.g. "25 calls" that turned out to
+	# be 1 call in each of 25 requests — not a loop, just a call that
+	# naturally fires once per request).
+	drop_cross_request_spread = 0
 
 	for (fn_name, safe_key), occurrences in buckets.items():
 		threshold = _threshold_for(fn_name)
 		count = len(occurrences)
 		if count < threshold:
+			continue
+
+		# v0.5.2 round 2: a "redundant call" is a LOOP, meaning the
+		# threshold must be reached WITHIN a single action. Cross-
+		# request aggregation (25 separate requests each calling cache
+		# once) isn't a loop — it's a framework call that naturally
+		# fires once per request. Production report had 3 "Redundant
+		# cache lookup: … (25 times)" / "(36 times)" findings from
+		# werkzeug/serving.py:370 — each was 1 call per request across
+		# 25/36 requests, not a repeated in-loop lookup.
+		action_counts = Counter(idx for idx, _, _ in occurrences)
+		max_in_any_action = action_counts.most_common(1)[0][1]
+		if max_in_any_action < threshold:
+			drop_cross_request_spread += 1
 			continue
 
 		# v0.5.2: callsite-based filtering. Use the first occurrence's
@@ -213,10 +249,21 @@ def analyze(recordings: list, context) -> AnalyzerResult:
 		high_multiplier = _conf_int(
 			"profiler_redundant_high_multiplier", DEFAULT_REDUNDANT_HIGH_MULTIPLIER
 		)
-		severity = "High" if count >= threshold * high_multiplier else "Medium"
+		# v0.5.2 round 2: severity based on max-in-any-action, not
+		# total count. Because count was established above to reflect
+		# loop density within a single action, using it for severity
+		# misleads ("100 cross-request cache calls" looks worse than
+		# "100 cache calls in one loop in one request"). Use
+		# max_in_any_action instead.
+		severity = (
+			"High"
+			if max_in_any_action >= threshold * high_multiplier
+			else "Medium"
+		)
 
 		# Action ref = the action containing the most occurrences
-		action_counts = Counter(idx for idx, _, _ in occurrences)
+		# (already computed in action_counts above as part of the
+		# per-action threshold check).
 		top_action_idx, _ = action_counts.most_common(1)[0]
 
 		identifier_safe = safe_key
@@ -254,13 +301,23 @@ def analyze(recordings: list, context) -> AnalyzerResult:
 			"action_ref": str(top_action_idx),
 		})
 
+	if drop_cross_request_spread:
+		context.warnings.append(
+			f"Suppressed {drop_cross_request_spread} Redundant Call "
+			"candidate(s) where the threshold was reached only by "
+			"summing across multiple requests (e.g. one cache lookup "
+			"per request × 25 requests). That's not a loop — it's a "
+			"call that naturally fires once per request. A real "
+			"redundant loop has the threshold met WITHIN a single "
+			"action."
+		)
 	if drop_framework_callsite:
 		context.warnings.append(
 			f"Suppressed {drop_framework_callsite} Redundant Call "
 			"finding(s) whose loop lives inside Frappe framework code "
-			"(users can't act on those). The hot ones still show up in "
-			"the Repeated Hot Frame leaderboard if they represent "
-			"significant time."
+			"or a third-party library (users can't act on those). "
+			"The hot ones still show up in the Repeated Hot Frame "
+			"leaderboard if they represent significant time."
 		)
 
 	if drop_no_caller_stack:

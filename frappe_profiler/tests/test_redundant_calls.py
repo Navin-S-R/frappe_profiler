@@ -227,6 +227,99 @@ def test_user_callsite_finding_is_kept():
 	assert td["callsite"]["filename"] == "apps/myapp/controllers/bulk.py"
 
 
+def test_third_party_lib_callsite_filters_finding():
+	"""v0.5.2 round 2: werkzeug / site-packages / gunicorn / rq are
+	infrastructure users can't modify. Production report had 3
+	Redundant Cache Lookup findings in
+	env/lib/python3.14/site-packages/werkzeug/serving.py — the user
+	can't patch werkzeug. Must filter."""
+	werkzeug_stack = [
+		{"filename": "frappe/app.py", "lineno": 120, "function": "application"},
+		{
+			"filename": "env/lib/python3.14/site-packages/werkzeug/serving.py",
+			"lineno": 370,
+			"function": "run_wsgi",
+		},
+	]
+	recording = {
+		"uuid": "rec-1",
+		"calls": [],
+		"sidecar": [
+			_sidecar_entry(
+				"cache_get",
+				f"session-key-{i}",
+				"hash-werkzeug",
+				caller_stack=werkzeug_stack,
+			)
+			for i in range(15)  # above cache threshold
+		],
+		"pyi_session": None,
+	}
+	ctx = AnalyzeContext(session_uuid="t", docname="t")
+	result = redundant_calls.analyze([recording], ctx)
+	rc = [f for f in result.findings if f["finding_type"] == "Redundant Call"]
+	assert rc == [], (
+		"werkzeug/site-packages callsite must be suppressed. "
+		f"Got: {[f['title'] for f in rc]}"
+	)
+
+
+def test_cross_request_spread_does_not_count_as_redundant():
+	"""v0.5.2 round 2: a cache lookup called ONCE per request
+	across 25 requests isn't a loop — it's framework code that
+	naturally fires once per request. Production report had
+	findings like 'Redundant cache lookup (25 times)' where each
+	of the 25 was a separate request, 1 call each. Filter these
+	with a per-action threshold check."""
+	# 20 recordings, each with exactly ONE cache_get for the same key.
+	# Total = 20 (above threshold of 10), but per-action max = 1.
+	recordings = []
+	for i in range(20):
+		recordings.append({
+			"uuid": f"rec-{i}",
+			"calls": [],
+			"sidecar": [
+				_sidecar_entry("cache_get", "user_lang:x", "hash-spread")
+			],
+			"pyi_session": None,
+		})
+	ctx = AnalyzeContext(session_uuid="t", docname="t")
+	result = redundant_calls.analyze(recordings, ctx)
+	rc = [f for f in result.findings if f["finding_type"] == "Redundant Call"]
+	assert rc == [], (
+		"Cross-request spread (1 call × 20 requests) must NOT be "
+		"flagged as a redundant loop. "
+		f"Got: {[f['title'] for f in rc]}"
+	)
+	# Warning should explain the suppression.
+	assert any(
+		"summing across multiple requests" in w
+		for w in ctx.warnings
+	), f"Expected cross-request-spread warning; got: {ctx.warnings}"
+
+
+def test_single_request_loop_still_fires():
+	"""Positive case: 15 calls from a SINGLE request still fires
+	(real loop in user code). The per-action threshold must not
+	over-filter."""
+	recording = {
+		"uuid": "rec-1",
+		"calls": [],
+		"sidecar": [
+			_sidecar_entry("cache_get", "user_lang:x", "hash-loop")
+			for _ in range(15)  # 15 in ONE action
+		],
+		"pyi_session": None,
+	}
+	ctx = AnalyzeContext(session_uuid="t", docname="t")
+	result = redundant_calls.analyze([recording], ctx)
+	rc = [f for f in result.findings if f["finding_type"] == "Redundant Call"]
+	assert len(rc) == 1, (
+		"A 15-call loop in a single request must still fire. "
+		f"Got: {[f['title'] for f in rc]}"
+	)
+
+
 def test_missing_caller_stack_is_dropped_with_warning():
 	"""v0.5.2 requires caller_stack. Sidecar entries without it
 	(recorded pre-v0.5.2 or capture-time error) are dropped rather
