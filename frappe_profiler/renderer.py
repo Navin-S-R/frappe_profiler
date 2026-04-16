@@ -601,16 +601,28 @@ def build_donut_data(breakdown: dict, mode: str, allowed_prefixes: tuple) -> lis
 
 	Safe mode collapses non-allowed app names into a single "Python (custom apps)"
 	bucket. Raw mode shows each app by name.
+
+	v0.5.1: hides slices that round to 0ms in display. A session with
+	148ms of SQL and only a handful of sub-ms Python self-times was
+	rendering seven "Python (…) — 0ms" entries, all noise. The
+	threshold catches both (a) genuinely tiny buckets and (b) buckets
+	that leaked through imperfect routing (stdlib files, third-party
+	libs that the bucketer should have caught but missed).
 	"""
 	if not breakdown:
 		return []
+
+	# v0.5.1: buckets under this threshold display as "0ms" after the
+	# integer-ms display formatting, so they're worse than useless —
+	# they just add visual clutter. Hide them.
+	DONUT_DISPLAY_MIN_MS = 1.0
 
 	allowed = HARDCODED_ALLOWED_PREFIXES + tuple(allowed_prefixes or ())
 	allowed_app_names = {p.rstrip(".") for p in allowed}
 
 	slices = []
 	sql_ms = breakdown.get("sql_ms", 0)
-	if sql_ms > 0:
+	if sql_ms >= DONUT_DISPLAY_MIN_MS:
 		slices.append(("SQL", sql_ms, _DONUT_COLORS[0]))
 
 	by_app = breakdown.get("by_app", {})
@@ -620,16 +632,19 @@ def build_donut_data(breakdown: dict, mode: str, allowed_prefixes: tuple) -> lis
 		custom_total = 0.0
 		for app, ms in by_app.items():
 			if app in allowed_app_names:
-				color = _DONUT_COLORS[(len(slices)) % len(_DONUT_COLORS)]
-				slices.append((f"Python ({app})", ms, color))
+				if ms >= DONUT_DISPLAY_MIN_MS:
+					color = _DONUT_COLORS[(len(slices)) % len(_DONUT_COLORS)]
+					slices.append((f"Python ({app})", ms, color))
 			else:
 				custom_total += ms
-		if custom_total > 0:
+		if custom_total >= DONUT_DISPLAY_MIN_MS:
 			color = _DONUT_COLORS[(len(slices)) % len(_DONUT_COLORS)]
 			slices.append(("Python (custom apps)", custom_total, color))
 	else:
-		# Raw mode: every app named
+		# Raw mode: every app named, subject to the display threshold.
 		for app, ms in by_app.items():
+			if ms < DONUT_DISPLAY_MIN_MS:
+				continue
 			color = _DONUT_COLORS[(len(slices)) % len(_DONUT_COLORS)]
 			slices.append((f"Python ({app})", ms, color))
 

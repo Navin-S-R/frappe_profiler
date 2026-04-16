@@ -756,6 +756,81 @@ def test_donut_bucketing_by_top_level_module():
 	assert by_app.get("frappe") == 200
 
 
+def test_top_level_app_rejects_stdlib_and_third_party(monkeypatch):
+	"""v0.5.1: production donut showed Python(inspect.py),
+	Python(functools.py), Python(MySQLdb), Python(<built-in>) as
+	separate buckets — all noise. Single-segment filenames (stdlib),
+	site-packages paths, and angle-bracketed synthetic markers must
+	all collapse to [other]. First-segment paths that AREN'T a
+	known installed Frappe app (MySQLdb etc.) also collapse to
+	[other] once frappe.get_installed_apps is consulted.
+	"""
+	from frappe_profiler.analyzers.call_tree import _top_level_app
+
+	# Simulate a real site with a small installed-apps list. In
+	# production get_installed_apps returns e.g.
+	# ["frappe", "erpnext", "frappe_profiler"]. The call is made
+	# inside _top_level_app so the monkeypatch intercepts it for
+	# the whole test.
+	import frappe
+	monkeypatch.setattr(
+		frappe,
+		"get_installed_apps",
+		lambda: ["frappe", "frappe_profiler", "erpnext"],
+		raising=False,
+	)
+
+	# Python stdlib — single-segment filename
+	assert _top_level_app("getmembers", "inspect.py") == "[other]"
+	assert _top_level_app("reduce", "functools.py") == "[other]"
+	assert _top_level_app("_bootstrap", "threading.py") == "[other]"
+
+	# Third-party library — pyinstrument stripped site-packages/
+	# prefix and left just the lib/file form. Rejected because
+	# "MySQLdb" isn't in the installed-apps list.
+	assert _top_level_app("query", "MySQLdb/connections.py") == "[other]"
+	assert _top_level_app("execute", "pymysql/cursors.py") == "[other]"
+
+	# Full site-packages path (caught even before the installed-apps
+	# check by the site-packages/ substring filter).
+	assert _top_level_app(
+		"request",
+		"env/lib/python3.14/site-packages/requests/api.py",
+	) == "[other]"
+
+	# Pyinstrument synthetic — angle-bracketed function name
+	assert _top_level_app("<built-in>", "<built-in>") == "[other]"
+	assert _top_level_app("<module>", "<string>") == "[other]"
+	assert _top_level_app("<lambda>", "frappe/utils.py") == "[other]"
+
+	# Real Frappe apps still pass through
+	assert _top_level_app("handle", "frappe/handler.py") == "frappe"
+	assert _top_level_app("save", "apps/frappe/frappe/model/document.py") == "frappe"
+	assert _top_level_app("compute", "erpnext/accounts/tax.py") == "erpnext"
+
+
+def test_top_level_app_falls_back_when_installed_apps_unavailable(monkeypatch):
+	"""When frappe.get_installed_apps fails (no site context, unit
+	test environment), accept the first-segment as the bucket name.
+	This is the legacy behavior — a conservative fallback that
+	preserves the pre-v0.5.1 unit tests, which don't mock frappe."""
+	from frappe_profiler.analyzers.call_tree import _top_level_app
+
+	import frappe
+
+	def _raise(*a, **k):
+		raise RuntimeError("no site context")
+
+	monkeypatch.setattr(frappe, "get_installed_apps", _raise, raising=False)
+
+	# With the fallback, MySQLdb passes through as its first segment
+	# (acceptable for unit tests — real production always has a site).
+	# The stdlib filters still fire: inspect.py has no / so → [other].
+	assert _top_level_app("reduce", "functools.py") == "[other]"
+	# Multi-segment path: legacy first-segment fallback.
+	assert _top_level_app("handle", "frappe/handler.py") == "frappe"
+
+
 def test_top_level_app_uses_filename_not_function_name():
 	"""Direct unit test — covers the bug root cause without going
 	through the full aggregation path."""

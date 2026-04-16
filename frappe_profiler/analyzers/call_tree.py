@@ -892,34 +892,52 @@ def _strip_profiler_frames(node: dict) -> dict:
 def _top_level_app(function: str, filename: str) -> str:
 	"""Return the top-level app name for bucketing the donut.
 
-	v0.5.1: derived from the FILENAME's first path segment, not the
-	function name. Pre-v0.5.1 the bucketer split the function name on
-	``.`` and took the first segment, assuming pyinstrument would give
-	fully qualified names like ``erpnext.selling.validate``. In reality
-	pyinstrument stores BARE function names (``handle``, ``save``,
-	``call``, ``application``, ``init_request``). The split returned a
-	single-element list and every Python frame ended up in its own
-	per-function bucket — the production donut rendered six buckets
-	named ``application``, ``init_request``, ``call``, ``before_request``,
-	``snapshot``, ``[other]``, all showing ``0ms`` because each frame's
-	tiny self_time rounded to integer zero in isolation.
+	v0.5.1: derived from the FILENAME's first path segment (not the
+	function name), with additional filters to keep Python stdlib /
+	synthetic / third-party frames from polluting the bucket list.
 
-	Bucketing by the filename's first path segment instead produces
-	proper app-level buckets: ``frappe``, ``frappe_profiler``, ``erpnext``,
-	``my_custom_app``. A dozen frames inside ``frappe/`` collapse into
-	one ``frappe`` bucket with the summed time, which is what the donut
-	is meant to show.
+	A real production donut showed these noise buckets — all 0ms each:
 
-	Handles common pyinstrument path shapes:
+	    Python (inspect.py)    — Python stdlib (single-segment filename)
+	    Python (functools.py)  — Python stdlib
+	    Python (MySQLdb)       — third-party, pyinstrument stripped
+	                             "site-packages/" so the substring
+	                             filter missed it
+	    Python (<built-in>)    — pyinstrument synthetic for C builtins
+
+	All four should collapse to the ``[other]`` catch-all. The rules
+	that route them correctly:
+
+	  1. Synthetic function names (``<root>``, ``<sql>``, ``<built-in>``,
+	     ``<string>``, anything wrapped in angle brackets) → [other]
+	  2. Synthetic filenames wrapped in angle brackets → [other]
+	  3. Filenames containing ``site-packages/`` or ``dist-packages/``
+	     (third-party libs) → [other]
+	  4. Single-segment filenames (``inspect.py``, ``functools.py``) —
+	     these are stdlib or loose scripts, not Frappe apps → [other]
+	  5. ``apps/<name>/`` marker → ``<name>``
+	  6. First path segment of a multi-segment filename, filtered to
+	     actual installed Frappe apps via ``frappe.get_installed_apps()``
+	     when available — otherwise accept the first segment (legacy
+	     behavior, used by unit tests that can't import frappe)
+
+	Handles the common pyinstrument path shapes:
 	  - ``frappe/handler.py``                        → "frappe"
 	  - ``frappe_profiler/capture.py``               → "frappe_profiler"
 	  - ``erpnext/accounts/tax.py``                  → "erpnext"
 	  - ``apps/erpnext/erpnext/foo.py``             → "erpnext"
 	  - ``/Users/.../apps/frappe/frappe/handler.py`` → "frappe"
 	  - ``env/lib/python3.14/site-packages/werkzeug/wsgi.py`` → "[other]"
+	  - ``MySQLdb/connections.py``                   → "[other]"
+	  - ``inspect.py``                               → "[other]"
+	  - ``<built-in>``                               → "[other]"
 	"""
 	# Synthetic markers from the tree normalizer
 	if not function or function in ("<root>", "<sql>") or function.startswith("["):
+		return "[other]"
+	# Angle-bracketed function names from pyinstrument: <built-in>,
+	# <string>, <module>, <frozen importlib._bootstrap>, etc.
+	if function.startswith("<") and function.endswith(">"):
 		return "[other]"
 
 	if not filename:
@@ -927,9 +945,19 @@ def _top_level_app(function: str, filename: str) -> str:
 
 	norm = filename.replace("\\", "/")
 
+	# Angle-bracketed synthetic filenames
+	if norm.startswith("<") and norm.endswith(">"):
+		return "[other]"
+
 	# Third-party libraries live under site-packages / dist-packages
-	# and are bucketed together as "[other]". They're not Frappe apps.
+	# (caught when pyinstrument left the prefix intact).
 	if "site-packages/" in norm or "dist-packages/" in norm:
+		return "[other]"
+
+	# Single-segment filenames like ``inspect.py`` or ``functools.py``
+	# are Python stdlib or top-level scripts, NOT Frappe apps.
+	stripped = norm.lstrip("/")
+	if "/" not in stripped:
 		return "[other]"
 
 	# Bench layout: look for "apps/<name>/" anywhere in the path so
@@ -945,11 +973,30 @@ def _top_level_app(function: str, filename: str) -> str:
 
 	# Pyinstrument's ``file_path_short`` usually strips bench prefixes
 	# already, leaving something like ``frappe/handler.py``. Take the
-	# first path segment as the app name.
-	parts = [p for p in norm.lstrip("/").split("/") if p]
+	# first path segment as the app name — but only if it looks like
+	# an actually installed Frappe app. Third-party libs (``MySQLdb/
+	# connections.py``) otherwise produce a first-segment bucket like
+	# "MySQLdb" that has nothing to do with the user's code.
+	parts = [p for p in stripped.split("/") if p]
 	if not parts:
 		return "[other]"
-	return parts[0]
+	first = parts[0]
+
+	# Intersect with installed apps when we're running inside a real
+	# Frappe site. When frappe isn't importable (unit tests on an
+	# isolated machine) or get_installed_apps fails, fall back to
+	# accepting any first-segment — the legacy behavior that keeps
+	# the pre-v0.5.1 tests green without requiring a mocked frappe.
+	try:
+		import frappe
+		installed = set(frappe.get_installed_apps() or [])
+	except Exception:
+		installed = None
+
+	if installed is not None and installed and first not in installed:
+		return "[other]"
+
+	return first
 
 
 def _build_session_breakdown(per_action_trees: list, sql_total_ms: float) -> dict:

@@ -112,6 +112,67 @@ def test_build_donut_data_handles_empty_breakdown():
 	assert slices == []
 
 
+def test_build_donut_data_hides_sub_millisecond_buckets():
+	"""v0.5.1: buckets under 1ms round to "0ms" at display time and
+	just add visual clutter. Production report showed seven "Python
+	(…) — 0ms" entries (inspect.py, functools.py, <built-in>,
+	MySQLdb, etc.) — all noise. Sub-ms buckets must be hidden."""
+	breakdown = {
+		"sql_ms": 148,
+		"python_ms": 0.8,  # tiny Python total
+		"by_app": {
+			"frappe": 0.3,         # below 1ms — HIDE
+			"erpnext": 0.2,        # below 1ms — HIDE
+			"[other]": 0.3,        # below 1ms — HIDE
+		},
+	}
+	slices = renderer.build_donut_data(breakdown, mode="raw", allowed_prefixes=())
+	labels = [s[0] for s in slices]
+	# Only SQL appears — all Python buckets are too small.
+	assert labels == ["SQL"], (
+		f"Sub-ms Python buckets must not render; got labels: {labels}"
+	)
+
+
+def test_build_donut_data_safe_mode_also_hides_tiny_buckets():
+	"""Same threshold applies in safe mode: allowed apps with <1ms
+	don't get their own slice, and the custom-apps rollup ignores
+	sub-ms custom apps too."""
+	breakdown = {
+		"sql_ms": 100,
+		"python_ms": 0.5,
+		"by_app": {
+			"frappe": 0.3,          # <1ms — HIDE
+			"my_custom": 0.2,       # <1ms — would roll to custom but still <1 total
+		},
+	}
+	slices = renderer.build_donut_data(breakdown, mode="safe", allowed_prefixes=())
+	labels = [s[0] for s in slices]
+	assert labels == ["SQL"]
+	assert "Python (frappe)" not in labels
+	assert "Python (custom apps)" not in labels
+
+
+def test_build_donut_data_renders_buckets_above_threshold():
+	"""Positive case — buckets above 1ms are still rendered. The
+	threshold only kills noise, not real signal."""
+	breakdown = {
+		"sql_ms": 200,
+		"python_ms": 50,
+		"by_app": {
+			"frappe": 30,
+			"erpnext": 15,
+			"[other]": 5,
+		},
+	}
+	slices = renderer.build_donut_data(breakdown, mode="raw", allowed_prefixes=())
+	labels = [s[0] for s in slices]
+	assert "SQL" in labels
+	assert "Python (frappe)" in labels
+	assert "Python (erpnext)" in labels
+	assert "Python ([other])" in labels
+
+
 # ---------------------------------------------------------------------------
 # build_hot_frames_table
 # ---------------------------------------------------------------------------
