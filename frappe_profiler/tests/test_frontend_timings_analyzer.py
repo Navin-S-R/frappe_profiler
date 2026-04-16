@@ -164,6 +164,174 @@ def test_missing_frontend_data_attribute_is_safe():
     assert result.findings == []
 
 
+# ---------------------------------------------------------------------------
+# v0.5.1 regression guards: action_label + backend_ms come from
+# context.actions, not from the raw recording dict. Real production
+# recordings don't have either field — they have `path`, `method`,
+# `cmd`, `duration` — so the pre-v0.5.1 code fell through to the
+# synthetic "action_N" label and `backend_ms = 0` every time.
+# ---------------------------------------------------------------------------
+
+
+def _production_shape_recordings():
+	"""Mimics the dict shape Frappe's recorder actually produces — no
+	action_label, no duration_ms, just path/method/cmd/duration."""
+	return [
+		{
+			"uuid": "rec-a",
+			"path": "/api/method/frappe.desk.form.save.savedocs",
+			"method": "POST",
+			"cmd": "frappe.desk.form.save.savedocs",
+			"duration": 180.0,  # NOT duration_ms
+			"event_type": "HTTP Request",
+			"calls": [],
+		},
+		{
+			"uuid": "rec-b",
+			"path": "/api/resource/Sales Invoice/SI-001",
+			"method": "GET",
+			"cmd": "",
+			"duration": 95.0,
+			"event_type": "HTTP Request",
+			"calls": [],
+		},
+	]
+
+
+def _context_with_per_action_output(recordings):
+	"""Simulate what context.actions looks like AFTER per_action.analyze
+	has run — humanized action_label and real duration_ms."""
+	from frappe_profiler.analyzers.base import AnalyzeContext
+	ctx = AnalyzeContext(session_uuid="t", docname="t")
+	ctx.frontend_data = {"xhr": [], "vitals": []}
+	ctx.actions = [
+		{
+			"action_label": "Save Sales Invoice",
+			"duration_ms": 180.0,
+			"path": "/api/method/frappe.desk.form.save.savedocs",
+		},
+		{
+			"action_label": "GET /api/resource/Sales Invoice/SI-001",
+			"duration_ms": 95.0,
+			"path": "/api/resource/Sales Invoice/SI-001",
+		},
+	]
+	return ctx
+
+
+def test_action_label_comes_from_context_actions(monkeypatch):
+	"""v0.5.1 fix: per-XHR rows must use the humanized label
+	(e.g. 'Save Sales Invoice') from context.actions, not the
+	synthetic action_N fallback that pre-v0.5.1 always hit because
+	raw recordings don't carry action_label.
+	"""
+	from frappe_profiler.analyzers import frontend_timings
+
+	recordings = _production_shape_recordings()
+	ctx = _context_with_per_action_output(recordings)
+	ctx.frontend_data = {
+		"xhr": [
+			{
+				"recording_id": "rec-a",
+				"url": "/api/method/frappe.desk.form.save.savedocs",
+				"duration_ms": 250,
+				"status": 200,
+				"response_size_bytes": 500,
+				"transport": "xhr",
+				"timestamp": 0,
+			},
+			{
+				"recording_id": "rec-b",
+				"url": "/api/resource/Sales Invoice/SI-001",
+				"duration_ms": 130,
+				"status": 200,
+				"response_size_bytes": 800,
+				"transport": "xhr",
+				"timestamp": 0,
+			},
+		],
+		"vitals": [],
+	}
+
+	result = frontend_timings.analyze(recordings, ctx)
+	matched = result.aggregate["frontend_xhr_matched"]
+	labels = [m["action_label"] for m in matched]
+
+	# Humanized labels from context.actions, NOT action_0 / action_1.
+	assert "Save Sales Invoice" in labels
+	assert "GET /api/resource/Sales Invoice/SI-001" in labels
+	assert not any(lbl.startswith("action_") for lbl in labels), (
+		f"synthetic action_N labels leaked: {labels}"
+	)
+
+
+def test_backend_ms_comes_from_context_actions():
+	"""v0.5.1 fix: backend_ms is context.actions[idx].duration_ms, not
+	recording.duration_ms (which doesn't exist). Pre-v0.5.1 this
+	field was always 0 in production, which made
+	network_delta_ms == xhr_ms and every XHR looked like it had
+	100% network overhead."""
+	from frappe_profiler.analyzers import frontend_timings
+
+	recordings = _production_shape_recordings()
+	ctx = _context_with_per_action_output(recordings)
+	ctx.frontend_data = {
+		"xhr": [
+			{
+				"recording_id": "rec-a",
+				"url": "/api/method/foo",
+				"duration_ms": 220,
+				"status": 200,
+				"response_size_bytes": 100,
+				"transport": "xhr",
+				"timestamp": 0,
+			},
+		],
+		"vitals": [],
+	}
+	result = frontend_timings.analyze(recordings, ctx)
+	matched = result.aggregate["frontend_xhr_matched"]
+	assert len(matched) == 1
+	# context.actions[0].duration_ms == 180, xhr_ms == 220, delta == 40
+	assert matched[0]["backend_ms"] == 180.0
+	assert matched[0]["xhr_ms"] == 220
+	assert matched[0]["network_delta_ms"] == 40
+
+
+def test_falls_back_to_method_and_path_when_context_actions_missing():
+	"""If per_action hasn't run (context.actions empty), don't crash
+	and don't emit the ugly synthetic 'action_N'. Build a readable
+	label from the recording's own method + path."""
+	from frappe_profiler.analyzers import frontend_timings
+	from frappe_profiler.analyzers.base import AnalyzeContext
+
+	recordings = _production_shape_recordings()
+	ctx = AnalyzeContext(session_uuid="t", docname="t")
+	# Deliberately do NOT set ctx.actions.
+	ctx.frontend_data = {
+		"xhr": [
+			{
+				"recording_id": "rec-a",
+				"url": "/api/method/foo",
+				"duration_ms": 220,
+				"status": 200,
+				"response_size_bytes": 100,
+				"transport": "xhr",
+				"timestamp": 0,
+			},
+		],
+		"vitals": [],
+	}
+	result = frontend_timings.analyze(recordings, ctx)
+	matched = result.aggregate["frontend_xhr_matched"]
+	# Fallback: "POST /api/method/frappe.desk.form.save.savedocs"
+	assert matched[0]["action_label"] == (
+		"POST /api/method/frappe.desk.form.save.savedocs"
+	)
+	# backend_ms also falls back to the recording's `duration` field.
+	assert matched[0]["backend_ms"] == 180.0
+
+
 def test_lcp_below_threshold_does_not_fire():
     from frappe_profiler.analyzers import frontend_timings
 

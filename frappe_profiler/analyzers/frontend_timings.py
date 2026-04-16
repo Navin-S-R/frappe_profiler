@@ -38,6 +38,41 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
         if rec_id:
             rec_index[rec_id] = idx
 
+    # v0.5.1: humanized labels (e.g. "Save Sales Invoice" instead of
+    # "POST /api/method/frappe.client.save") are built by
+    # per_action._build_action and live on context.actions, NOT on the
+    # raw `recordings` list. Pre-v0.5.1 this analyzer read from
+    # recordings[action_idx] so action.get("action_label") always
+    # returned None and every XHR row showed up as "action_0",
+    # "action_1", etc. in the report. Pull the label from
+    # context.actions instead, fall back through the recording's
+    # raw method+path, and only then to the synthetic "action_N".
+    ctx_actions = getattr(context, "actions", None) or []
+
+    def _label_for(idx: int) -> str:
+        # 1. Preferred: the humanized label per_action.analyze built
+        #    on context.actions.
+        if idx < len(ctx_actions):
+            lbl = ctx_actions[idx].get("action_label")
+            if lbl:
+                return lbl
+        # 2. Fallback: synthesize from the recording's method + path,
+        #    which IS present on the raw recording dict. Still
+        #    readable if per_action hasn't run yet or the actions
+        #    list is shorter than recordings for any reason.
+        if idx < len(recordings):
+            rec = recordings[idx]
+            method = rec.get("method") or ""
+            path = (rec.get("path") or "").split("?", 1)[0]
+            if path:
+                return f"{method} {path}".strip()
+            cmd = rec.get("cmd")
+            if cmd:
+                return str(cmd)
+        # 3. Last resort: synthetic marker so the report never
+        #    shows an empty string.
+        return f"action_{idx}"
+
     matched = []
     orphans = []
     total_backend_ms = 0
@@ -59,7 +94,24 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 
         action_idx = rec_index[rid]
         action = recordings[action_idx]
-        backend_ms = _num(action.get("duration_ms")) or 0
+        # v0.5.1: backend time lives on the per_action row
+        # (context.actions[idx].duration_ms), NOT on the raw
+        # recording dict. Pre-v0.5.1 this read `action.get("duration_ms")`
+        # from the recording and always got None, so backend_ms was
+        # always 0 in production — making every XHR look like 100%
+        # network overhead. Prefer context.actions[idx].duration_ms,
+        # then fall back through the recording's duration_ms (test
+        # fixtures occasionally put it here) and finally the
+        # recording's `duration` (ms, per recorder convention).
+        backend_ms = 0.0
+        if action_idx < len(ctx_actions):
+            backend_ms = _num(ctx_actions[action_idx].get("duration_ms")) or 0.0
+        if not backend_ms:
+            backend_ms = (
+                _num(action.get("duration_ms"))
+                or _num(action.get("duration"))
+                or 0.0
+            )
         xhr_ms = _num(x.get("duration_ms")) or 0
         delta = xhr_ms - backend_ms
         if delta < 0:
@@ -67,7 +119,7 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 
         entry = {
             "action_idx": action_idx,
-            "action_label": action.get("action_label") or f"action_{action_idx}",
+            "action_label": _label_for(action_idx),
             "backend_ms": backend_ms,
             "xhr_ms": xhr_ms,
             "network_delta_ms": delta,
