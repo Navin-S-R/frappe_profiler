@@ -44,11 +44,18 @@
 	}
 	console.log("[frappe_profiler] proceeding for user:", frappe.session.user);
 
-	const POLL_INTERVAL_MS = 5000;
+	// v0.5.1: HTTP polling of frappe_profiler.api.status is GONE. The
+	// widget now drives its state from realtime events pushed by the
+	// server (profiler_session_stopping / analyzing / ready / failed)
+	// plus a one-shot rehydrate fetch on page load and on tab visibility
+	// change. This eliminates the continuous /api/method/frappe_profiler
+	// .api.status traffic that was showing up as the top-QPS endpoint
+	// on busy sites. POLL_INTERVAL_MS is kept as a legacy constant (some
+	// external integrations may reference it) but no timer uses it.
+	const POLL_INTERVAL_MS = 0;
 	const REQUIRED_ROLES = ["System Manager", "Profiler User", "Administrator"];
 
 	let widget = null;
-	let pollHandle = null;
 	let elapsedHandle = null;
 	let currentState = {
 		active: false,
@@ -85,8 +92,12 @@
 		// side of always mounting; users without the role will see a
 		// permission error if they actually click Start.
 		mountWidget();
+		// v0.5.1: one-shot rehydrate on page load. Covers the case
+		// where the user reloaded / navigated back to the Desk while
+		// a session was already active. After this initial call,
+		// state is driven entirely by realtime events + visibility
+		// changes. No interval polling.
 		try { refreshStatus(); } catch (e) { /* noop */ }
-		try { startPolling(); } catch (e) { /* noop */ }
 		try { subscribeRealtime(); } catch (e) { /* noop */ }
 		try { subscribeVisibility(); } catch (e) { /* noop */ }
 		try { maybeShowOnboardingToast(); } catch (e) { /* noop */ }
@@ -157,28 +168,17 @@
 		setTimeout(dismiss, 15000);
 	}
 
-	function startPolling() {
-		if (pollHandle) return;
-		pollHandle = setInterval(refreshStatus, POLL_INTERVAL_MS);
-	}
-
-	function stopPolling() {
-		if (pollHandle) {
-			clearInterval(pollHandle);
-			pollHandle = null;
-		}
-	}
-
 	function subscribeVisibility() {
-		// Pause polling when the tab is hidden to avoid wasting API calls
-		// in background tabs. Resume (and refresh immediately) when the
-		// tab becomes visible again.
+		// v0.5.1: no more polling — but we still want to refresh state
+		// ONCE when the tab becomes visible again, to catch TTL-based
+		// auto-stop that happens silently (Redis active-pointer expired
+		// while the tab was hidden) and any realtime events the Socket
+		// .IO client might have missed during tab sleep. Browser
+		// Background Fetch / Socket.IO idle throttling can occasionally
+		// drop events; a one-shot rehydrate on return-to-tab covers it.
 		document.addEventListener("visibilitychange", () => {
-			if (document.hidden) {
-				stopPolling();
-			} else {
+			if (!document.hidden) {
 				refreshStatus();
-				startPolling();
 			}
 		});
 	}
@@ -574,15 +574,65 @@
 	}
 
 	function subscribeRealtime() {
+		// v0.5.1: realtime is now the PRIMARY state-transition channel
+		// (polling is gone). Server emits:
+		//
+		//   profiler_session_stopping   — user clicked Stop on another tab
+		//   profiler_session_analyzing  — analyze.run started
+		//   profiler_progress           — percent + description during analyze
+		//   profiler_session_ready      — analyze finished, report available
+		//   profiler_session_failed     — analyze crashed
+		//
+		// The widget rehydrates state from these events so a session
+		// driven from tab A is visible in tabs B, C, D without any tab
+		// issuing an HTTP poll.
 		if (!frappe.realtime || !frappe.realtime.on) {
 			return;
 		}
-		frappe.realtime.on("profiler_session_ready", (data) => {
-			if (!data || !data.session_uuid) return;
-			// Match against our current session if we have one in flight
-			if (currentState.session_uuid && data.session_uuid !== currentState.session_uuid) {
-				return;
+
+		// Helper: skip events for sessions the widget isn't tracking.
+		function matchesCurrentSession(data) {
+			if (!data || !data.session_uuid) return false;
+			if (
+				currentState.session_uuid
+				&& data.session_uuid !== currentState.session_uuid
+			) {
+				return false;
 			}
+			return true;
+		}
+
+		frappe.realtime.on("profiler_session_stopping", (data) => {
+			if (!matchesCurrentSession(data)) return;
+			// Another tab clicked Stop. Transition this tab out of
+			// Recording so the user doesn't see stale state.
+			if (currentState.display === "recording") {
+				currentState.display = "stopping";
+				stopElapsedTimer();
+				setDisplay("stopping", "Stopping…", "");
+			}
+		});
+
+		frappe.realtime.on("profiler_session_analyzing", (data) => {
+			if (!matchesCurrentSession(data)) return;
+			currentState.display = "analyzing";
+			currentState.docname = data.docname || currentState.docname;
+			setDisplay("analyzing", "Analyzing…", "0%");
+		});
+
+		frappe.realtime.on("profiler_session_failed", (data) => {
+			if (!matchesCurrentSession(data)) return;
+			currentState.display = "ready";  // reuse ready slot so click opens the doc
+			currentState.docname = data.docname || currentState.docname;
+			setDisplay("ready", "Analyze failed", "click to view");
+			frappe.show_alert({
+				message: __("Profiler analyze failed — check Error Log"),
+				indicator: "red",
+			});
+		});
+
+		frappe.realtime.on("profiler_session_ready", (data) => {
+			if (!matchesCurrentSession(data)) return;
 			currentState.display = "ready";
 			currentState.docname = data.docname;
 			setDisplay("ready", "Report ready", "click to view");
@@ -594,10 +644,7 @@
 
 		// Round 2 fix #17: show live progress during analyze
 		frappe.realtime.on("profiler_progress", (data) => {
-			if (!data || !data.session_uuid) return;
-			if (currentState.session_uuid && data.session_uuid !== currentState.session_uuid) {
-				return;
-			}
+			if (!matchesCurrentSession(data)) return;
 			if (currentState.display !== "analyzing") return;
 			const pct = typeof data.percent === "number" ? Math.round(data.percent) : 0;
 			setDisplay("analyzing", `Analyzing ${pct}%`, data.description || "");

@@ -235,11 +235,60 @@ def _stop_session(user: str, session_uuid: str) -> tuple[str | None, bool]:
 	if not docname:
 		return None, False
 
+	# v0.5.1: notify any open widgets on this user's session that
+	# we're transitioning out of Recording. Second, third, fourth
+	# tabs will all switch their displays simultaneously without
+	# polling. The stop-click itself runs on ONE tab; the others
+	# learn about the stop via this event.
+	_publish_session_event(
+		"profiler_session_stopping",
+		session_uuid=session_uuid,
+		docname=docname,
+		user=user,
+	)
+
 	# v0.5.0: inline safety cap + scheduler fallback are both inside
 	# _enqueue_analyze now, so every inline-path caller (stop,
 	# retry_analyze, janitor) gets the same protection uniformly.
 	ran_inline = _enqueue_analyze(session_uuid, docname=docname)
 	return docname, ran_inline
+
+
+def _publish_session_event(
+	event_name: str,
+	*,
+	session_uuid: str,
+	docname: str | None,
+	user: str,
+	**extra,
+) -> None:
+	"""Publish a session-state realtime event to ALL the user's Desk
+	tabs via Frappe's Socket.IO bridge.
+
+	Used to drive the floating widget state machine without HTTP
+	polling. The widget in floating_widget.js subscribes to these
+	event names via ``frappe.realtime.on(...)``:
+
+	  profiler_session_stopping    — user clicked Stop
+	  profiler_session_analyzing   — analyze.run starting (may be delayed)
+	  profiler_session_ready       — analyze finished successfully
+	  profiler_session_failed      — analyze crashed
+
+	All events carry ``session_uuid`` and ``docname`` so a widget with
+	multiple open tabs can match on the session it's currently tracking.
+
+	Best-effort: publish failures log but never interrupt the caller's
+	business logic. Frappe's publish_realtime already swallows most
+	errors but we double-wrap in case the Socket.IO bridge is down
+	(dev environment without a running redis-socketio)."""
+	payload = {"session_uuid": session_uuid, "docname": docname}
+	payload.update(extra)
+	try:
+		frappe.publish_realtime(event_name, payload, user=user)
+	except Exception:
+		# Don't log — realtime is best-effort, the widget falls back
+		# to its on-visibility-change status fetch.
+		pass
 
 
 def _clear_active(user: str) -> None:

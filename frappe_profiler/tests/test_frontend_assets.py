@@ -68,12 +68,21 @@ def test_widget_has_state_machine_constants():
 
 
 def test_widget_has_visibility_listener():
-	"""Fix #13: widget must pause polling on tab hide."""
+	"""v0.5.1: polling is gone, but the visibilitychange handler
+	remains so the widget can issue a one-shot refreshStatus()
+	when the tab becomes visible again. This covers TTL-based
+	auto-stop (Redis expiry while the tab was hidden) and any
+	realtime events the Socket.IO client dropped during tab
+	sleep.
+	"""
 	with open(WIDGET_JS) as f:
 		src = f.read()
 	assert "visibilitychange" in src
-	assert "document.hidden" in src
-	assert "stopPolling" in src
+	# v0.5.1: no more stopPolling — the handler just re-fetches
+	# state on visibility return. The polling-pause machinery was
+	# removed; see test_realtime_session_events for the new
+	# realtime contract.
+	assert "refreshStatus" in src
 
 
 def test_widget_role_check():

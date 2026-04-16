@@ -145,6 +145,51 @@ def _publish_progress(percent: float, description: str, session_uuid: str):
 		pass
 
 
+def _publish_session_event(
+	event_name: str,
+	*,
+	session_uuid: str,
+	docname: str | None,
+	**extra,
+) -> None:
+	"""Publish a session-state transition event to the session owner's
+	Desk tabs.
+
+	Called from the background analyze job, which runs without a
+	request-scoped user — so we look the user up from the Profiler
+	Session row itself. Mirrors ``api._publish_session_event`` but
+	with doctype-driven user resolution.
+
+	v0.5.1: drives the floating widget state machine without HTTP
+	polling. Events emitted from analyze.run:
+
+	  profiler_session_analyzing  — right after status becomes Analyzing
+	  profiler_session_ready      — success; the widget navigates to the
+	                                 report (kept under its original name
+	                                 for backward compat with v0.3.0+
+	                                 subscribers)
+	  profiler_session_failed     — uncaught exception during analyze
+
+	Best-effort and isolated — a publish failure cannot derail the
+	analyze pipeline. Realtime is a UX convenience; the state is always
+	durable on the Profiler Session row.
+	"""
+	try:
+		user = None
+		if docname:
+			try:
+				user = frappe.db.get_value(
+					"Profiler Session", docname, "user"
+				)
+			except Exception:
+				user = None
+		payload = {"session_uuid": session_uuid, "docname": docname}
+		payload.update(extra)
+		frappe.publish_realtime(event_name, payload, user=user)
+	except Exception:
+		pass
+
+
 def run(session_uuid: str):
 	"""Background-job entry point. Called from api.stop() via frappe.enqueue."""
 	# Round 2 fix #6: mark this request-context as "analyzing" so our
@@ -168,6 +213,16 @@ def run(session_uuid: str):
 		# Phase: Analyzing
 		frappe.db.set_value("Profiler Session", docname, "status", "Analyzing")
 		frappe.db.commit()
+		# v0.5.1: push "analyzing" to any open widgets on this user's
+		# session. Without this the widget would either have to poll
+		# status() to learn about the transition, or rely on the inline
+		# path (which only applies when scheduler is disabled). Pushing
+		# from the background analyze worker covers the enqueued path too.
+		_publish_session_event(
+			"profiler_session_analyzing",
+			session_uuid=session_uuid,
+			docname=docname,
+		)
 		_publish_progress(5, "Fetching recordings", session_uuid)
 
 		recording_uuids = session.get_recordings(session_uuid)
@@ -281,16 +336,15 @@ def run(session_uuid: str):
 		frappe.db.commit()
 		_publish_progress(100, "Report ready", session_uuid)
 
-		# Notify the UI so the floating widget can navigate the user to the report.
-		try:
-			user = frappe.db.get_value("Profiler Session", docname, "user")
-			frappe.publish_realtime(
-				"profiler_session_ready",
-				{"session_uuid": session_uuid, "docname": docname},
-				user=user,
-			)
-		except Exception:
-			pass  # realtime is best-effort, never block the analyze
+		# Notify the UI so the floating widget can navigate the user to
+		# the report. v0.5.1: routed through _publish_session_event so
+		# it looks up the user consistently with the other state
+		# transitions (analyzing / failed).
+		_publish_session_event(
+			"profiler_session_ready",
+			session_uuid=session_uuid,
+			docname=docname,
+		)
 
 	except Exception:
 		frappe.db.rollback()
@@ -298,6 +352,18 @@ def run(session_uuid: str):
 		try:
 			frappe.db.set_value("Profiler Session", docname, "status", "Failed")
 			frappe.db.commit()
+		except Exception:
+			pass
+		# v0.5.1: push "failed" to any open widgets so they transition
+		# out of "Analyzing…" immediately instead of hanging forever.
+		# Best-effort and isolated so a publish failure can't mask the
+		# original exception the outer `raise` is about to re-raise.
+		try:
+			_publish_session_event(
+				"profiler_session_failed",
+				session_uuid=session_uuid,
+				docname=docname,
+			)
 		except Exception:
 			pass
 		raise
