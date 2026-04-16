@@ -17,20 +17,55 @@ required_apps = ["frappe"]
 # JS itself checks for the System Manager / Profiler User role before showing,
 # so users without permission see nothing.
 
-# NOTE: the ?v=... query string is a cache-buster. Frappe's dev server
-# sends Cache-Control: max-age=43200 (12h) on static assets, so without
-# a versioned URL the browser never re-fetches updated JS. v0.4.0+
-# pulls the version from __version__ so every release auto-busts.
+# v0.5.2: cache-buster is now the file's mtime + __version__ combined.
+# Pre-v0.5.2 we used __version__ alone, which meant any JS/CSS change
+# between releases shipped invisibly to browsers still holding the
+# previous version's cached file (Frappe's dev server sends
+# Cache-Control: max-age=43200, 12h). A real user report showed
+# realtime-event code shipped in v0.5.2 was still running the v0.5.1
+# HTTP-polling code in the browser because the cache-buster URL
+# /assets/.../floating_widget.js?v=0.5.1 was unchanged — the version
+# wasn't bumped when JS was edited. Using mtime auto-invalidates on
+# every file edit during development, and still includes __version__
+# so release-to-release upgrades invalidate cleanly on production
+# (where mtimes are stable but version differs).
 from frappe_profiler import __version__ as _frappe_profiler_version
+import os as _os
+
+
+def _asset_version(relative_path: str) -> str:
+	"""Return ``<__version__>.<mtime>`` for a file under public/, or
+	just ``<__version__>`` if the file can't be stat'd (unlikely on a
+	healthy install — defensive so the hooks file never fails to
+	load).
+
+	The mtime component means ANY edit to the JS/CSS auto-invalidates
+	the browser cache without a manual __version__ bump. Production
+	deploys stat the file at hooks.py import time, so bench restart
+	after a deploy captures the new mtime automatically.
+	"""
+	try:
+		full_path = _os.path.join(
+			_os.path.dirname(__file__), "public", relative_path
+		)
+		mtime = int(_os.path.getmtime(full_path))
+		return f"{_frappe_profiler_version}.{mtime}"
+	except Exception:
+		return _frappe_profiler_version
+
+
+_widget_js_v = _asset_version("js/floating_widget.js")
+_frontend_js_v = _asset_version("js/profiler_frontend.js")
+_widget_css_v = _asset_version("css/floating_widget.css")
 
 app_include_js = [
-	f"/assets/frappe_profiler/js/floating_widget.js?v={_frappe_profiler_version}",
+	f"/assets/frappe_profiler/js/floating_widget.js?v={_widget_js_v}",
 	# v0.5.0: browser-side metrics shim (fetch/XHR wrap + Web Vitals).
 	# Loads after floating_widget.js so the widget is already in the DOM
 	# when profiler_frontend.js reads its data-session-uuid attribute.
-	f"/assets/frappe_profiler/js/profiler_frontend.js?v={_frappe_profiler_version}",
+	f"/assets/frappe_profiler/js/profiler_frontend.js?v={_frontend_js_v}",
 ]
-app_include_css = f"/assets/frappe_profiler/css/floating_widget.css?v={_frappe_profiler_version}"
+app_include_css = f"/assets/frappe_profiler/css/floating_widget.css?v={_widget_css_v}"
 
 # Installation
 # ------------

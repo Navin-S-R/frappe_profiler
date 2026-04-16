@@ -24,7 +24,7 @@
 	// earlier page load. If the build ID in the console / in the
 	// widget's title attribute doesn't match what we think is current,
 	// the user is on cached JS and needs a hard refresh + bench restart.
-	const WIDGET_BUILD_ID = "2026-04-15-stop-fix-v3";
+	const WIDGET_BUILD_ID = "2026-04-16-realtime-no-poll";
 
 	// LOUD diagnostic so we can SEE this script execute in the browser console.
 	console.log(
