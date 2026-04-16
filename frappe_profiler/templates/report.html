@@ -546,6 +546,51 @@
     {% endif %}
   </div>
 
+  {# --------------- OBSERVATIONS (v0.5.2) --------------- #}
+  {# Informational findings: framework-level issues, system-level
+     infrastructure pressure, hot-frame observations. Still shown
+     for transparency — just separated from the main "what to fix"
+     action list because the user doesn't have a direct code change
+     to make for these. #}
+  {% if observational_findings %}
+  <div class="section">
+    <h2>Observations</h2>
+    <p class="small muted">
+      Informational signals that don't have a concrete fix in your application code —
+      framework-level activity, system-level infrastructure pressure, and hot-frame
+      observations. Listed for transparency; investigate if something here surprises you.
+    </p>
+    {% for f in observational_findings %}
+    <div class="finding severity-{{ f.severity | lower }}">
+      <div class="finding-header">
+        <span class="severity-badge {{ f.severity | lower }}">{{ f.severity }}</span>
+        <span class="finding-title">{{ f.title }}</span>
+        <span class="finding-impact">~{{ "%.0f" | format(f.estimated_impact_ms) }}ms{% if f.affected_count > 1 %} &middot; {{ f.affected_count }}×{% endif %}</span>
+      </div>
+      <div class="finding-description">{{ f.customer_description }}</div>
+
+      {% if f.technical_detail %}
+      <div class="finding-detail">
+        {% set detail = f.technical_detail %}
+        {% if detail.callsite %}
+          <span class="label">Callsite</span>
+          <code>{{ detail.callsite.filename }}:{{ detail.callsite.lineno }}{% if detail.callsite.function %} <span class="muted">({{ detail.callsite.function }})</span>{% endif %}</code>
+        {% endif %}
+        {% if detail.normalized_query %}
+          <span class="label">Query (normalized)</span>
+          <pre>{{ detail.normalized_query }}</pre>
+        {% endif %}
+        {% if detail.fix_hint %}
+          <span class="label">Context</span>
+          <p>{{ detail.fix_hint }}</p>
+        {% endif %}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
   {# --------------- v0.5.0: SERVER RESOURCE PANEL --------------- #}
   {% if infra_timeline %}
   <div class="section">

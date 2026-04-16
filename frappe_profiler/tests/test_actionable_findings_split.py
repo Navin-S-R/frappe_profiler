@@ -1,0 +1,137 @@
+# Copyright (c) 2026, Frappe Profiler contributors
+# For license information, please see license.txt
+
+"""Tests for v0.5.2 split of findings into
+"Findings — what to fix" (actionable, concrete fixes) vs
+"Observations" (framework/system/informational — no direct fix).
+
+Per user feedback: "In Findings — what to fix, Show only the valid
+fixes." The split keeps the main action-list tight and reads as a
+punchlist while the Observations section preserves full-picture
+transparency.
+"""
+
+import inspect
+
+from frappe_profiler import renderer
+
+
+def test_actionable_finding_types_has_concrete_fixes_only():
+	"""_ACTIONABLE_FINDING_TYPES must include the finding types where
+	the customer_description ends with a concrete, shippable fix
+	(add THIS index, refactor THIS loop, trim THIS response).
+	Informational / framework / system finding types must NOT be in
+	the set."""
+	expected_actionable = {
+		"N+1 Query",
+		"Missing Index",
+		"Full Table Scan",
+		"Filesort",
+		"Temporary Table",
+		"Low Filter Ratio",
+		"Slow Query",
+		"Slow Hot Path",
+		"Hook Bottleneck",
+		"Redundant Call",
+		"Slow Frontend Render",
+		"Heavy Response",
+	}
+	assert renderer._ACTIONABLE_FINDING_TYPES == expected_actionable, (
+		"_ACTIONABLE_FINDING_TYPES drifted from the expected set. "
+		"Adding a new actionable finding type? Add it to the "
+		"expected set here AND verify its customer_description "
+		"gives a concrete fix (add <index>, refactor <loop>). "
+		"Adding an observational type (system metric, framework-"
+		"level issue)? It should NOT be in this set."
+	)
+
+	# Explicit NEGATIVE assertions on known observation-only types.
+	for informational in (
+		"Framework N+1",              # loop inside frappe/*
+		"Repeated Hot Frame",         # needs investigation, no shippable fix
+		"Resource Contention",        # system CPU
+		"Memory Pressure",            # worker RSS / swap
+		"DB Pool Saturation",         # infra pool
+		"Background Queue Backlog",   # infra queue
+		"Network Overhead",           # client/proxy path
+	):
+		assert informational not in renderer._ACTIONABLE_FINDING_TYPES, (
+			f"{informational!r} is informational — users can't act on it "
+			"with a shippable fix. It must NOT be in _ACTIONABLE_FINDING_TYPES."
+		)
+
+
+def test_render_splits_findings_into_actionable_and_observational():
+	"""Source-inspection guard: renderer.render must partition
+	session_doc.findings into `findings` (actionable) and
+	`observational_findings` (everything else) via the allowlist.
+	Without this split, observational noise re-pollutes the main
+	'Findings — what to fix' section."""
+	src = inspect.getsource(renderer.render)
+
+	# The partition must use _ACTIONABLE_FINDING_TYPES.
+	assert "_ACTIONABLE_FINDING_TYPES" in src, (
+		"render() must reference _ACTIONABLE_FINDING_TYPES to split "
+		"findings into actionable + observational buckets."
+	)
+
+	# Both bucket variable names must appear.
+	assert "actionable_findings" in src
+	assert "observational_findings" in src
+
+	# Template context must expose the observations separately.
+	assert '"observational_findings": observational_findings' in src, (
+		"render()'s template context must pass observational_findings "
+		"as a separate key so the template can render the Observations "
+		"section independently."
+	)
+
+
+def test_template_has_observations_section():
+	"""The report template must include a separate Observations
+	section that renders observational_findings. Without it the
+	information disappears from the report entirely."""
+	import os
+	here = os.path.dirname(__file__)
+	tpath = os.path.join(here, "..", "templates", "report.html")
+	with open(tpath) as f:
+		template = f.read()
+
+	# The Observations h2 heading must exist.
+	assert "Observations" in template, (
+		"report.html must have an Observations section heading"
+	)
+	# It must loop over observational_findings.
+	assert "observational_findings" in template, (
+		"report.html must iterate observational_findings"
+	)
+	# And it's separate from — below — the Findings section.
+	findings_idx = template.find("Findings &mdash; what to fix")
+	obs_idx = template.find(">Observations<")
+	assert findings_idx > 0 and obs_idx > 0
+	assert obs_idx > findings_idx, (
+		"Observations must render BELOW the Findings section"
+	)
+
+
+def test_severity_counts_reflect_only_actionable_findings():
+	"""The session's severity summary (shown in the stats card +
+	consumed by the top_severity computation) must count only the
+	actionable findings. Mixing in observations would make 'High:
+	3' include 2 framework issues that the user can't fix —
+	misleading."""
+	src = inspect.getsource(renderer.render)
+	# The severity_counts dict is computed from `findings`, which
+	# v0.5.2 sets to actionable_findings. The comment in the
+	# render() source explains this explicitly.
+	assert "severity_counts" in src
+	# Check that the count comprehension runs over `findings` (the
+	# actionable list after v0.5.2 rebind), not `all_findings`.
+	# Find the severity_counts block and verify it uses `findings`.
+	sc_idx = src.find('"severity_counts"')
+	assert sc_idx > 0
+	sc_block = src[sc_idx:sc_idx + 600]
+	assert "for f in findings" in sc_block, (
+		"severity_counts must iterate `findings` (the actionable "
+		"list after the v0.5.2 split), not the full pre-split list"
+	)

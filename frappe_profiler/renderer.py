@@ -308,7 +308,7 @@ def render(
 			recordings_by_uuid[uid] = redacted
 
 	actions = [_action_to_dict(a) for a in (session_doc.actions or [])]
-	findings = [_finding_to_dict(f) for f in (session_doc.findings or [])]
+	all_findings = [_finding_to_dict(f) for f in (session_doc.findings or [])]
 
 	try:
 		top_queries = json.loads(session_doc.top_queries_json or "[]")
@@ -319,13 +319,39 @@ def render(
 	except Exception:
 		table_breakdown = []
 
-	# Sort findings: highest severity first, then highest impact
-	findings.sort(
+	# Sort all findings: highest severity first, then highest impact.
+	all_findings.sort(
 		key=lambda f: (
 			SEVERITY_ORDER.get(f["severity"], 3),
 			-(f["estimated_impact_ms"] or 0),
 		)
 	)
+
+	# v0.5.2: split findings into two buckets per user feedback
+	# ("In Findings — what to fix, Show only the valid fixes").
+	#
+	# ACTIONABLE: findings with a concrete fix the user can ship —
+	# add an index, refactor a loop, trim a response. These go into
+	# the main "Findings — what to fix" section so the list reads
+	# as a punchlist.
+	#
+	# OBSERVATIONS: informational findings that surface signal but
+	# don't prescribe a fix the user can act on (framework N+1 where
+	# the loop lives inside Frappe, system-level CPU/memory/queue
+	# pressure, repeated hot frames that need further investigation).
+	# These go into a separate "Observations" section — still
+	# visible for users who want the full picture, but no longer
+	# cluttering the action list.
+	actionable_findings = [
+		f for f in all_findings if f["finding_type"] in _ACTIONABLE_FINDING_TYPES
+	]
+	observational_findings = [
+		f for f in all_findings if f["finding_type"] not in _ACTIONABLE_FINDING_TYPES
+	]
+	# Back-compat: some template paths still reference `findings`.
+	# Point it at the actionable list so the main section shows
+	# only the punchlist. Observations are exposed separately.
+	findings = actionable_findings
 
 	# v0.3.0: load donut + hot frames data from the new fields. Each
 	# helper degrades to empty/None if the field is missing (old session).
@@ -426,14 +452,21 @@ def render(
 	context = {
 		"session": session_doc,
 		"actions": actions,
+		# v0.5.2: "findings" holds actionable items only (shown in
+		# "Findings — what to fix"). The severity counts and the
+		# summary reflect ACTIONABLE findings — not the observations
+		# — so the session status shows what the user needs to ship,
+		# not infra noise.
 		"findings": findings,
+		"observational_findings": observational_findings,
 		"top_queries": top_queries,
 		"table_breakdown": table_breakdown,
 		"recordings_by_uuid": recordings_by_uuid,
 		"mode": mode,
 		"generated_at": generated_at or _now_iso(),
 		"server_tz": _get_server_timezone(),
-		# Severity counts for the summary
+		# Severity counts for the summary — actionable only, so the
+		# session badge reflects fixable items.
 		"severity_counts": {
 			"High": sum(1 for f in findings if f["severity"] == "High"),
 			"Medium": sum(1 for f in findings if f["severity"] == "Medium"),
@@ -549,6 +582,45 @@ def _get_server_timezone() -> str:
 # ---------------------------------------------------------------------------
 
 HARDCODED_ALLOWED_PREFIXES = ("frappe.", "erpnext.", "payments.", "hrms.")
+
+
+# v0.5.2: finding types that carry a concrete, user-actionable fix.
+# These render in the main "Findings — what to fix" section.
+# Everything else (framework-level, system-level, informational)
+# renders in a separate "Observations" section below so the action
+# list stays tight.
+#
+# Rule of thumb: if the customer_description ends with a specific
+# next step the user can ship in a single PR (add THIS index,
+# refactor THIS loop, trim THIS response), it belongs here. If the
+# finding is an observation about the system or framework where the
+# user has no direct code change to make, it's an Observation.
+_ACTIONABLE_FINDING_TYPES = frozenset({
+	# SQL — all have concrete DDL / refactor guidance
+	"N+1 Query",
+	"Missing Index",
+	"Full Table Scan",
+	"Filesort",
+	"Temporary Table",
+	"Low Filter Ratio",
+	"Slow Query",
+	# Python hot paths in user code
+	"Slow Hot Path",       # narrowed by call_tree filter to user frames
+	"Hook Bottleneck",     # user's own doc-event hook is slow
+	"Redundant Call",      # v0.5.2: framework callsites already filtered
+	# Frontend — user can trim responses / optimize JS
+	"Slow Frontend Render",
+	"Heavy Response",
+})
+# Observation-only finding types (informational, no direct fix):
+#   Framework N+1            — loop inside frappe/*
+#   Repeated Hot Frame       — function repeated across actions; needs
+#                               investigation, not a shippable fix
+#   Resource Contention      — system CPU sustained high
+#   Memory Pressure          — worker RSS growth / swap
+#   DB Pool Saturation       — infra-level
+#   Background Queue Backlog — infra-level
+#   Network Overhead         — client/proxy territory, not user code
 
 
 def redact_frame_name(node: dict, mode: str, allowed_prefixes: tuple) -> str:
