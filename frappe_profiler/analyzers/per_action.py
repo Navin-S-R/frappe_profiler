@@ -55,6 +55,16 @@ def _label(recording: dict) -> str:
 	recording's stored cmd is empty (Frappe's recorder captures
 	cmd at hook time, BEFORE the REST routing sets form_dict.cmd
 	— see ``_derive_cmd_from_path`` docstring for the full story).
+
+	v0.5.2: ``frappe.desk.form.save.savedocs`` takes an ``action``
+	field in form_dict ("Save"|"Submit"|"Cancel"|"Update") that
+	routes to semantically different behaviors at the same cmd.
+	Pre-v0.5.2 both appeared as the same label in the per-action
+	table, making Save and Submit rows indistinguishable. Now the
+	action is suffixed to the cmd (``frappe.desk.form.save
+	.savedocs:Submit``) so developers can tell them apart without
+	re-enabling the full humanization pipeline (which the user
+	wanted off in technical breakdowns).
 	"""
 	if recording.get("event_type") == "Background Job":
 		path = recording.get("path") or "Background Job"
@@ -67,11 +77,29 @@ def _label(recording: dict) -> str:
 		cmd = _derive_cmd_from_path(recording.get("path") or "")
 
 	if cmd:
+		# v0.5.2: disambiguate savedocs by its action field. Only
+		# appended when the action is present AND is one of the
+		# known values — a garbage action string wouldn't help the
+		# user read the report and would make grouping-by-label
+		# unstable (different text per arbitrary payload).
+		if cmd == "frappe.desk.form.save.savedocs":
+			form_dict = recording.get("form_dict") or {}
+			action = ""
+			if isinstance(form_dict, dict):
+				action = (form_dict.get("action") or "").strip()
+			if action in _SAVEDOCS_ACTIONS:
+				return f"{cmd}:{action}"
 		return cmd
 
 	method = recording.get("method") or "GET"
 	path = recording.get("path") or "/"
 	return f"{method} {path}"
+
+
+# Known savedocs action values from Frappe's Desk form controller.
+# Used by _label to append ``:<action>`` so Save vs Submit rows
+# in the per-action table aren't indistinguishable.
+_SAVEDOCS_ACTIONS = frozenset({"Save", "Submit", "Cancel", "Update"})
 
 
 def humanized_label(recording: dict) -> str:

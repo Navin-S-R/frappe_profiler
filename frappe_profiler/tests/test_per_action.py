@@ -169,7 +169,9 @@ def test_humanized_savedocs_without_doctype_falls_back():
 		"form_dict": {"action": "Save"},  # no doc
 	}
 	label = per_action.humanized_label(rec)
-	assert label == "frappe.desk.form.save.savedocs"
+	# Falls through humanization (no doctype) → _label → savedocs
+	# disambiguated by :Save (v0.5.2 per-action action-suffix).
+	assert label == "frappe.desk.form.save.savedocs:Save"
 
 
 def test_humanized_desk_getdoc_is_open_doctype():
@@ -214,6 +216,150 @@ def test_humanized_client_insert_is_create():
 	assert per_action.humanized_label(rec) == "Create Lead"
 
 
+# ---------------------------------------------------------------------------
+# v0.5.2: per-action label disambiguation for savedocs actions
+# ---------------------------------------------------------------------------
+# The Desk's savedocs endpoint takes different `action` values (Save,
+# Submit, Cancel, Update) that route to semantically different
+# behaviors under the same cmd. Pre-v0.5.2 the per-action table
+# showed the raw cmd for all of them — indistinguishable. v0.5.2
+# suffixes `:<Action>` so Save vs Submit rows aren't merged visually.
+
+
+def test_savedocs_save_action_appended_to_technical_label(empty_context):
+	"""Save → frappe.desk.form.save.savedocs:Save in per-action table."""
+	import json
+	rec = {
+		"uuid": "save",
+		"cmd": "frappe.desk.form.save.savedocs",
+		"method": "POST",
+		"path": "/api/method/frappe.desk.form.save.savedocs",
+		"event_type": "HTTP Request",
+		"duration": 320,
+		"calls": [],
+		"form_dict": {
+			"doc": json.dumps({"doctype": "Sales Invoice", "__islocal": 1}),
+			"action": "Save",
+		},
+	}
+	result = per_action.analyze([rec], empty_context)
+	assert (
+		result.actions[0]["action_label"]
+		== "frappe.desk.form.save.savedocs:Save"
+	)
+
+
+def test_savedocs_submit_action_appended_to_technical_label(empty_context):
+	"""Submit → frappe.desk.form.save.savedocs:Submit. Crucially
+	DIFFERENT from the Save variant, so the two rows are visually
+	distinguishable in the per-action table."""
+	import json
+	rec = {
+		"uuid": "submit",
+		"cmd": "frappe.desk.form.save.savedocs",
+		"method": "POST",
+		"path": "/api/method/frappe.desk.form.save.savedocs",
+		"event_type": "HTTP Request",
+		"duration": 410,
+		"calls": [],
+		"form_dict": {
+			"doc": json.dumps({"doctype": "Sales Invoice", "name": "SINV-001"}),
+			"action": "Submit",
+		},
+	}
+	result = per_action.analyze([rec], empty_context)
+	assert (
+		result.actions[0]["action_label"]
+		== "frappe.desk.form.save.savedocs:Submit"
+	)
+
+
+def test_savedocs_save_and_submit_are_distinguishable(empty_context):
+	"""End-to-end regression: user's exact scenario — one session
+	with one Save and one Submit on the same Sales Invoice. The
+	two Profiler Action rows must have DIFFERENT action_labels
+	so they render as distinct entries in the per-action table."""
+	import json
+	save_rec = {
+		"uuid": "save",
+		"cmd": "frappe.desk.form.save.savedocs",
+		"method": "POST",
+		"path": "/api/method/frappe.desk.form.save.savedocs",
+		"event_type": "HTTP Request",
+		"duration": 320,
+		"calls": [],
+		"form_dict": {
+			"doc": json.dumps({"doctype": "Sales Invoice", "__islocal": 1}),
+			"action": "Save",
+		},
+	}
+	submit_rec = {
+		"uuid": "submit",
+		"cmd": "frappe.desk.form.save.savedocs",
+		"method": "POST",
+		"path": "/api/method/frappe.desk.form.save.savedocs",
+		"event_type": "HTTP Request",
+		"duration": 410,
+		"calls": [],
+		"form_dict": {
+			"doc": json.dumps({"doctype": "Sales Invoice", "name": "SINV-001"}),
+			"action": "Submit",
+		},
+	}
+	result = per_action.analyze([save_rec, submit_rec], empty_context)
+	labels = [a["action_label"] for a in result.actions]
+	assert labels[0] != labels[1], (
+		f"Save and Submit on the same savedocs cmd must have distinct "
+		f"technical labels; got: {labels}"
+	)
+	assert "Save" in labels[0] and "Submit" in labels[1]
+
+
+def test_savedocs_unknown_action_falls_back_to_bare_cmd(empty_context):
+	"""A weird/unknown action string shouldn't produce a garbage
+	label. Fall back to the bare cmd so grouping by action_label
+	stays stable."""
+	import json
+	rec = {
+		"uuid": "weird",
+		"cmd": "frappe.desk.form.save.savedocs",
+		"method": "POST",
+		"path": "/api/method/frappe.desk.form.save.savedocs",
+		"event_type": "HTTP Request",
+		"duration": 100,
+		"calls": [],
+		"form_dict": {
+			"doc": json.dumps({"doctype": "Sales Invoice"}),
+			"action": "??garbage??",  # not in _SAVEDOCS_ACTIONS
+		},
+	}
+	result = per_action.analyze([rec], empty_context)
+	assert (
+		result.actions[0]["action_label"]
+		== "frappe.desk.form.save.savedocs"
+	)
+
+
+def test_savedocs_missing_action_falls_back_to_bare_cmd(empty_context):
+	"""No action field at all (malformed payload) → bare cmd, no
+	trailing colon."""
+	rec = {
+		"uuid": "no-action",
+		"cmd": "frappe.desk.form.save.savedocs",
+		"method": "POST",
+		"path": "/api/method/frappe.desk.form.save.savedocs",
+		"event_type": "HTTP Request",
+		"duration": 100,
+		"calls": [],
+		"form_dict": {},  # no action
+	}
+	result = per_action.analyze([rec], empty_context)
+	assert (
+		result.actions[0]["action_label"]
+		== "frappe.desk.form.save.savedocs"
+	)
+
+
 def test_humanization_does_not_leak_into_per_action_table(empty_context):
 	"""Guard: the per-action table must stay on the technical label.
 	User feedback was explicit: humanize only in Steps to Reproduce.
@@ -225,8 +371,14 @@ def test_humanization_does_not_leak_into_per_action_table(empty_context):
 	)
 	result = per_action.analyze([rec], empty_context)
 	assert len(result.actions) == 1
-	# Per-action table → raw cmd, NOT "Create Sales Invoice".
-	assert result.actions[0]["action_label"] == "frappe.desk.form.save.savedocs"
+	# Per-action table → technical cmd (with :Save suffix for
+	# Save-vs-Submit disambiguation), NOT "Create Sales Invoice".
+	# Humanization stays strictly in Steps-to-Reproduce.
+	assert (
+		result.actions[0]["action_label"]
+		== "frappe.desk.form.save.savedocs:Save"
+	)
+	assert "Create Sales Invoice" not in result.actions[0]["action_label"]
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +412,12 @@ def test_label_derives_cmd_from_path_when_cmd_is_empty(empty_context):
 		},
 	}
 	result = per_action.analyze([recording], empty_context)
-	# Per-action table gets the RAW cmd (technical), not humanized.
-	assert result.actions[0]["action_label"] == "frappe.desk.form.save.savedocs"
+	# Per-action table gets the technical cmd, disambiguated by
+	# :Save (v0.5.2). Still technical — NOT the humanized form.
+	assert (
+		result.actions[0]["action_label"]
+		== "frappe.desk.form.save.savedocs:Save"
+	)
 	# humanized_label — used only in Steps-to-Reproduce — still
 	# produces the English form for this same recording.
 	assert per_action.humanized_label(recording) == "Create Sales Invoice"
