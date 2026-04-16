@@ -49,7 +49,19 @@ def _label(recording: dict) -> str:
 		short = path.split(".")[-1] if "." in path else path
 		return f"Job: {short}"
 
+	# v0.5.1: frappe.recorder captures `cmd` at __init__ time, which
+	# runs during before_request hooks — BEFORE frappe's REST routing
+	# layer sets form_dict.cmd inside handle_rpc_call. So for every
+	# modern `/api/method/<foo>` URL the recording ends up with
+	# cmd="" and none of the cmd-based humanization below fires —
+	# the label falls through to "POST /api/method/frappe.desk.form
+	# .save.savedocs" (the exact raw URL the user said wasn't
+	# readable). Recover the cmd from the path: /api/method/<foo>
+	# or /api/v2/method/<foo> → <foo>. Same parse shape as
+	# hooks_callbacks._extract_cmd_from_request.
 	cmd = recording.get("cmd") or ""
+	if not cmd:
+		cmd = _derive_cmd_from_path(recording.get("path") or "")
 	form_dict = recording.get("form_dict") or {}
 
 	# v0.5.1: frappe.desk.form.save.savedocs is the Desk's canonical
@@ -124,6 +136,32 @@ def _label(recording: dict) -> str:
 	method = recording.get("method") or "GET"
 	path = recording.get("path") or "/"
 	return f"{method} {path}"
+
+
+def _derive_cmd_from_path(path: str) -> str:
+	"""Parse ``<method>`` out of ``/api/method/<method>`` and
+	``/api/v2/method/<method>`` URLs so the humanization logic in
+	``_label`` can run on recordings whose ``cmd`` field is empty.
+
+	Returns "" for any other URL shape (``/app/...``, ``/api/
+	resource/...``, static files) — the caller's fallback to
+	``METHOD + path`` still applies.
+
+	Why this is needed: frappe.recorder.Recorder.__init__ reads
+	frappe.local.form_dict.cmd, which the REST routing layer only
+	populates AFTER the before_request hooks have run. Every
+	modern /api/method URL therefore ends up with cmd="" in the
+	captured recording dict, so "Save Sales Invoice"-style
+	humanization never fires without this path fallback.
+	"""
+	if not path:
+		return ""
+	marker = "/method/"
+	idx = path.find(marker)
+	if idx < 0:
+		return ""
+	after = path[idx + len(marker):].split("?", 1)[0].rstrip("/")
+	return after
 
 
 def _extract_doc_info(form_dict) -> tuple[str | None, bool]:

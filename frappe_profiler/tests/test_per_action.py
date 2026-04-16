@@ -222,6 +222,99 @@ def test_client_insert_is_create(empty_context):
 	assert result.actions[0]["action_label"] == "Create Lead"
 
 
+# ---------------------------------------------------------------------------
+# v0.5.1: cmd field is empty in real recordings — derive from path
+# ---------------------------------------------------------------------------
+# frappe.recorder.Recorder.__init__ captures cmd at hook time, BEFORE
+# frappe's REST routing sets form_dict.cmd inside handle_rpc_call. So
+# every /api/method/<foo> URL ends up with cmd="" in the stored
+# recording. _label must fall back to the path to preserve the
+# cmd-based humanization.
+
+
+def test_label_derives_cmd_from_path_when_cmd_is_empty(empty_context):
+	"""Exact production recording shape: cmd="", path holds the
+	/api/method/<cmd> URL. Must still produce the humanized
+	'Create Sales Invoice' label by deriving cmd from the path."""
+	import json as _json
+	recording = {
+		"uuid": "prod",
+		"cmd": "",  # EMPTY — matches production
+		"method": "POST",
+		"path": "/api/method/frappe.desk.form.save.savedocs",
+		"event_type": "HTTP Request",
+		"duration": 774.8,
+		"calls": [],
+		"form_dict": {
+			"doc": _json.dumps({"doctype": "Sales Invoice", "__islocal": 1}),
+			"action": "Save",
+		},
+	}
+	result = per_action.analyze([recording], empty_context)
+	# Without the fix this would be "POST /api/method/frappe.desk.form.save.savedocs"
+	assert result.actions[0]["action_label"] == "Create Sales Invoice"
+
+
+def test_label_derives_v2_api_method(empty_context):
+	"""Same rule for /api/v2/method/<foo> — the path parser must
+	see both v1 and v2 shapes."""
+	recording = {
+		"uuid": "v2",
+		"cmd": "",
+		"method": "POST",
+		"path": "/api/v2/method/frappe.client.submit",
+		"event_type": "HTTP Request",
+		"duration": 500,
+		"calls": [],
+		"form_dict": {"doctype": "Delivery Note"},
+	}
+	result = per_action.analyze([recording], empty_context)
+	assert result.actions[0]["action_label"] == "Submit Delivery Note"
+
+
+def test_label_non_method_url_falls_back_to_method_path(empty_context):
+	"""URLs that aren't /method/<cmd> (REST resource, static files,
+	Desk pages) have no cmd to derive. Fall back cleanly."""
+	recording = {
+		"uuid": "rest",
+		"cmd": "",
+		"method": "GET",
+		"path": "/api/resource/Sales Invoice/SI-001",
+		"event_type": "HTTP Request",
+		"duration": 50,
+		"calls": [],
+	}
+	result = per_action.analyze([recording], empty_context)
+	assert result.actions[0]["action_label"] == "GET /api/resource/Sales Invoice/SI-001"
+
+
+def test_derive_cmd_from_path_helper_unit():
+	"""Direct unit test of the cmd-from-path helper."""
+	from frappe_profiler.analyzers.per_action import _derive_cmd_from_path
+
+	assert _derive_cmd_from_path(
+		"/api/method/frappe.client.save"
+	) == "frappe.client.save"
+	assert _derive_cmd_from_path(
+		"/api/v2/method/frappe.client.submit"
+	) == "frappe.client.submit"
+	# Trailing slash tolerated
+	assert _derive_cmd_from_path(
+		"/api/method/foo.bar/"
+	) == "foo.bar"
+	# Query string stripped
+	assert _derive_cmd_from_path(
+		"/api/method/foo.bar?doctype=Item&name=X"
+	) == "foo.bar"
+	# Non-method URLs return empty string
+	assert _derive_cmd_from_path("/api/resource/Item/X") == ""
+	assert _derive_cmd_from_path("/app/home") == ""
+	assert _derive_cmd_from_path("/assets/foo.js") == ""
+	# Empty / None
+	assert _derive_cmd_from_path("") == ""
+	assert _derive_cmd_from_path(None) == ""
+
+
 def test_empty_recordings_list(empty_context):
 	result = per_action.analyze([], empty_context)
 	assert result.actions == []
