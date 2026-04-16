@@ -281,57 +281,51 @@ def test_repeated_hot_frame_skips_pure_helpers_only():
 
 
 def test_repeated_hot_frame_keeps_frappe_application_code():
-	"""v0.5.1 correction (requested in user review): the Repeated Hot
-	Frame aggregator must KEEP most of frappe/* — only pure helpers
-	(utils, handler, app.py) get suppressed. Application-layer Frappe
-	code like Document.run_method, permissions.has_permission, and
-	naming.make_autoname are LEGITIMATE optimization targets even
-	though they're inside frappe/*:
+	"""v0.5.2 round 2: frappe/model/document.py is now entirely
+	plumbing (filtered). Document.run_method's cumulative time is
+	always ≈ the user's validate/on_submit hook times, so showing
+	it as a separate hot frame double-counts information. Users
+	see their actual hooks (erpnext/*.py::validate) as hot frames
+	— that's the actionable signal.
 
-	  - Document.run_method runs user-defined doc-event hooks. A slow
-	    hook bubbles up here and the user CAN optimize it.
-	  - permissions.has_permission evaluates user-defined permission
-	    rules (including custom Permission Query Conditions). Slow
-	    permissions are the user's fault.
-	  - make_autoname runs a naming series; if the user configured a
-	    ledger-heavy naming series it's slow-by-choice and fixable.
+	This test now verifies what remains actionable inside frappe/*:
 
-	A naive 'skip all frappe/*' filter would hide all of these — wrong.
+	  - permissions.has_permission: slow custom Permission Query
+	    Conditions bubble here. KEPT.
+	  - naming.make_autoname: user's naming-series config can be
+	    optimized (simpler prefix, fewer SQL lookups). KEPT.
+
+	Document.run_method is NOT in this keeper list anymore — the
+	user can see their hooks directly instead of the dispatcher.
 	"""
 	per_action_trees = []
 	for _ in range(5):
 		per_action_trees.append(_node("<root>", "", 2000, [
-			# Document.run_method in frappe/model/document.py — keep.
-			_node(
-				"Document.run_method",
-				"apps/frappe/frappe/model/document.py",
-				600,
-				[],
-			),
-			# permissions.has_permission — keep.
+			# permissions.has_permission — keep (user custom rules).
 			_node(
 				"has_permission",
 				"apps/frappe/frappe/permissions.py",
-				200,
+				400,
+				[],
+			),
+			# naming.make_autoname — keep (user naming series).
+			_node(
+				"make_autoname",
+				"apps/frappe/frappe/model/naming.py",
+				300,
 				[],
 			),
 		]))
 
 	findings, leaderboard = call_tree._aggregate_hot_frames(per_action_trees)
 
-	# Document.run_method: 5 actions × 600ms = 3000ms, far above threshold.
-	repeated = [f for f in findings if f["finding_type"] == "Repeated Hot Frame"]
-	run_method_hits = [f for f in repeated if "run_method" in f["title"]]
-	assert len(run_method_hits) == 1, (
-		"Document.run_method in frappe/model/document.py MUST be kept "
-		"in the Repeated Hot Frame aggregator. It runs user hooks and "
-		"is a legitimate optimization target."
-	)
-
-	# And both keepers should be in the leaderboard.
+	# Both keepers should be in the leaderboard.
 	leaderboard_fns = [r["function"] for r in leaderboard]
-	assert any("run_method" in f for f in leaderboard_fns), (
-		f"Document.run_method missing from leaderboard: {leaderboard_fns}"
+	assert any("has_permission" in f for f in leaderboard_fns), (
+		f"has_permission missing from leaderboard: {leaderboard_fns}"
+	)
+	assert any("make_autoname" in f for f in leaderboard_fns), (
+		f"make_autoname missing from leaderboard: {leaderboard_fns}"
 	)
 	assert any("has_permission" in f for f in leaderboard_fns), (
 		f"has_permission missing from leaderboard: {leaderboard_fns}"
@@ -553,12 +547,16 @@ def test_pure_helper_production_payload_all_filtered():
 		("_query", "MySQLdb/cursors.py"),
 	]
 
-	# Check that the CLEAR plumbing cases are filtered. A few we'd
-	# KEEP intentionally (save, run_method, insert — public Document
-	# API methods) — those are commented above and tested separately.
+	# v0.5.2 round 2: ALL of frappe/model/document.py is filtered
+	# (save / insert / submit / _save / run_method / __init__ /
+	# load_from_db / etc.), so this list now includes every row
+	# from production_noise. Users see actionable signal from
+	# their erpnext / myapp validate / on_submit hooks instead.
 	must_filter = [
 		("execute_query", "frappe/query_builder/utils.py"),
+		("save", "frappe/model/document.py"),
 		("_save", "frappe/model/document.py"),
+		("run_method", "frappe/model/document.py"),
 		("composer", "frappe/model/document.py"),
 		("runner", "frappe/model/document.py"),
 		("fn", "frappe/model/document.py"),
@@ -568,18 +566,27 @@ def test_pure_helper_production_payload_all_filtered():
 		("getdoctype", "frappe/desk/form/load.py"),
 		("execute", "frappe/model/qb_query.py"),
 		("get_meta_bundle", "frappe/desk/form/load.py"),
+		("__init__", "frappe/model/document.py"),
+		("load_from_db", "frappe/model/document.py"),
 		("get_meta", "frappe/desk/form/meta.py"),
 		("__init__", "frappe/desk/form/meta.py"),
+		("load_children_from_db", "frappe/model/document.py"),
 		("getouterframes", "inspect.py"),
 		("getframeinfo", "inspect.py"),
 		("load_from_db", "frappe/model/meta.py"),
 		("process", "frappe/model/meta.py"),
+		("insert", "frappe/model/document.py"),
 		("wrapper", "erpnext/__init__.py"),
 		("wrapper", "utils/__init__.py"),
 		("sql", "frappe/database/database.py"),
 		("execute_query", "frappe/database/database.py"),
 		("execute", "MySQLdb/cursors.py"),
+		("get_doc_str", "frappe/model/document.py"),
 		("_query", "MySQLdb/cursors.py"),
+		# Round 2 additions from diagnostic run
+		("is_virtual_doctype", "frappe/model/utils/__init__.py"),
+		("[other: 3 frames]", ""),
+		("[other: 1 frames]", ""),
 	]
 
 	for function_name, filename in must_filter:
@@ -592,25 +599,25 @@ def test_pure_helper_production_payload_all_filtered():
 
 
 def test_pure_helper_still_keeps_application_frappe_code():
-	"""Critical negative case: user-visible Frappe code MUST still
-	pass through. If this test regresses, the user loses visibility
-	into Document lifecycle methods, permissions, hooks, and naming —
-	which ARE legitimate optimization targets inside frappe/*."""
+	"""Critical negative case: user-visible APP code MUST still pass
+	through. v0.5.2 round 2 removed Document.save/insert/submit/
+	run_method from the keepers because their cumulative times
+	always duplicate the user's validate/on_submit hooks —
+	double-counting noise. The user still sees the actual hook
+	code (erpnext/*, myapp/*) as hot frames."""
 	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
 
 	keepers = [
-		# Public Document entry points
-		("save", "frappe/model/document.py"),
-		("insert", "frappe/model/document.py"),
-		("submit", "frappe/model/document.py"),
-		("cancel", "frappe/model/document.py"),
-		# Hook dispatcher (users CAN optimize their hooks that it runs)
-		("run_method", "frappe/model/document.py"),
 		# Permissions (slow custom Permission Query Conditions bubble here)
 		("has_permission", "frappe/permissions.py"),
+		# Naming series (user's series config is optimizable)
+		("make_autoname", "frappe/model/naming.py"),
+		# frappe.client REST API entry points
+		("get_list", "frappe/client.py"),
 		# User app code always kept
 		("compute_tax", "apps/erpnext/erpnext/accounts/tax.py"),
 		("validate", "apps/myapp/doctype/invoice.py"),
+		("on_submit", "erpnext/accounts/doctype/sales_invoice/sales_invoice.py"),
 	]
 	for function_name, filename in keepers:
 		node = {"function": function_name, "filename": filename, "kind": "python"}
@@ -669,42 +676,106 @@ def test_is_pure_helper_frame_matches_absolute_filenames():
 
 
 def test_is_pure_helper_frame_keeps_application_frappe_code():
-	"""Negative cases: application-layer Frappe code must NOT be
-	classified as a pure helper. These are real optimization targets —
-	slow hooks bubble up through Document.run_method, slow permissions
-	through has_permission, slow naming series through make_autoname.
+	"""Negative cases: the SURFACE that matters is user-app code
+	plus the few Frappe entry points users can actually optimize.
 
-	v0.5.2 tightened the filter (database.py::sql, model/meta.py,
-	form/load.py, query_builder are now plumbing per user feedback
-	that they were worthless noise). But the four kept below remain
-	user-actionable and must stay visible in the hot-frames
-	leaderboard.
+	v0.5.2 round 2 tightened further: the entire frappe/model/
+	document.py file is now plumbing. Document.save / insert /
+	submit / run_method all show up as hot frames with cumulative
+	times IDENTICAL to the validate / on_submit / etc. hooks
+	inside them — so the Document-level entries are redundant
+	double-counts. Users see their actual hook code (erpnext/…::
+	validate, myapp/…::on_submit) as separate hot frames; that's
+	where the actionable signal lives.
 	"""
 	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
 
 	for filename, function in (
-		# Document lifecycle entry points — users recognize "save" /
-		# "insert" / "submit" as Document methods they call.
-		("frappe/model/document.py", "save"),
-		("frappe/model/document.py", "insert"),
-		("frappe/model/document.py", "submit"),
-		# run_method — the hook dispatcher, kept because it's the
-		# visible aggregate of all doc-event hooks the user wrote.
-		("frappe/model/document.py", "run_method"),
 		# Permissions — slow custom Permission Query Conditions
-		# bubble here.
+		# bubble here. KEPT.
 		("frappe/permissions.py", "has_permission"),
 		# Naming series — user's series config can be optimized
-		# (simpler prefix, fewer SQL lookups).
+		# (simpler prefix, fewer SQL lookups). KEPT.
 		("frappe/model/naming.py", "make_autoname"),
 		# frappe.client is the REST-ish API layer; get_list is the
-		# entry point users of the REST API actually call.
+		# entry point users of the REST API actually call. KEPT.
 		("frappe/client.py", "get_list"),
+		# User app code — the whole point of the hot-frames
+		# leaderboard.
+		("apps/erpnext/erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "validate"),
+		("apps/myapp/controllers/invoice.py", "on_submit"),
+		("erpnext/controllers/selling_controller.py", "validate"),
 	):
 		node = {"function": function, "filename": filename, "kind": "python"}
 		assert _is_pure_helper_frame(node) is False, (
 			f"{filename}::{function} must NOT be filtered — it's "
 			f"application-layer code users can optimize"
+		)
+
+
+def test_is_pure_helper_frame_filters_entire_document_py():
+	"""v0.5.2 round 2: frappe/model/document.py is entirely
+	plumbing. save / insert / submit / _save / run_method /
+	__init__ / load_from_db / load_children_from_db /
+	get_cached_doc / get_doc_str — all show up with cumulative
+	times identical to the user code inside them. Diagnostic
+	against a real stored call tree confirmed all of these leaked
+	before the round-2 fix."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for function in (
+		"save", "insert", "submit", "cancel", "delete", "amend",
+		"_save", "_insert",
+		"run_method", "run_before_save_methods", "run_after_save_methods",
+		"__init__", "load_from_db", "load_children_from_db",
+		"get_cached_doc", "get_doc_str", "get_cached_value",
+		"reload",
+	):
+		for filename in (
+			"frappe/model/document.py",
+			"apps/frappe/frappe/model/document.py",
+			"/Users/navin/office/frappe_bench/apps/frappe/frappe/model/document.py",
+		):
+			node = {"function": function, "filename": filename, "kind": "python"}
+			assert _is_pure_helper_frame(node) is True, (
+				f"{filename}::{function} must be filtered "
+				"(Document plumbing — v0.5.2 round 2)"
+			)
+
+
+def test_is_pure_helper_frame_filters_model_utils():
+	"""frappe/model/utils/* is framework plumbing — is_virtual_doctype,
+	get_parent_doc, etc. Called by document loader, no user decision
+	behind the time they consume."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for function in ("is_virtual_doctype", "get_parent_doc", "set_new_name"):
+		for filename in (
+			"frappe/model/utils/__init__.py",
+			"apps/frappe/frappe/model/utils/__init__.py",
+			"frappe/model/utils/set_user_and_timestamp.py",
+		):
+			node = {"function": function, "filename": filename, "kind": "python"}
+			assert _is_pure_helper_frame(node) is True, (
+				f"{filename}::{function} must be filtered"
+			)
+
+
+def test_is_pure_helper_frame_filters_square_bracket_synthetic():
+	"""[other: N frames] / [omitted: N frames] are synthetic nodes
+	the pruner inserts to represent rolled-up frames. They're
+	summaries, not real functions. Diagnostic against stored call
+	trees confirmed these leaked into the leaderboard as frames
+	with no file path."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for function in (
+		"[other: 1 frames]", "[other: 3 frames]", "[other: 10 frames]",
+		"[omitted: 5 frames]",
+	):
+		node = {"function": function, "filename": "", "kind": "python"}
+		assert _is_pure_helper_frame(node) is True, (
+			f"synthetic pruning marker '{function}' must be filtered"
 		)
 
 

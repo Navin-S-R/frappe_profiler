@@ -273,6 +273,18 @@ _PURE_HELPER_PATH_SUFFIXES = (
 	# times because they're the same call tree. Users can't optimize
 	# "how Meta loads its fields"; they ARE the framework's cold path.
 	"frappe/model/meta.py",
+	# v0.5.2: entire frappe/model/document.py is framework plumbing.
+	# Document.save / insert / submit etc. look user-recognisable but
+	# their cumulative time is always just the sum of the validate /
+	# on_submit / etc. hooks inside them — which ARE visible as
+	# separate hot frames in the user's own app code (erpnext/myapp/
+	# validate). Keeping document.py entries in the leaderboard
+	# produces double-counting noise: save → _save → run_method →
+	# validate all show up with near-identical cumulative times.
+	# Initial diagnostic run on a production session had 7 separate
+	# document.py entries and only validate/set_missing_values (the
+	# actual user code) told the user anything new.
+	"frappe/model/document.py",
 	# Form-level meta loading: getdoctype, get_meta_bundle — these are
 	# what Desk calls when you open a form. Cumulative time is always
 	# ~= the doctype cache miss cost, which Frappe handles internally.
@@ -306,6 +318,11 @@ _PURE_HELPER_PATH_SUFFIXES = (
 _PURE_HELPER_PATH_SUBSTRINGS = (
 	"frappe_profiler/",
 	"frappe/utils/",          # typing_validations, response, redis_wrapper, etc.
+	# v0.5.2: frappe/model/utils/ is plumbing too — is_virtual_doctype,
+	# get_parent_doc, etc. Called by the document loader and doesn't
+	# reflect any user decision. Distinct from frappe/utils/ which
+	# wouldn't have matched it because there's a `/model/` in between.
+	"frappe/model/utils/",
 	"werkzeug/",
 	"gunicorn/",
 	"/rq/",                   # rq is inside site-packages/; the leading slash
@@ -392,6 +409,12 @@ def _is_pure_helper_frame(node: dict) -> bool:
 	# <module>, <frozen ...>). Pyinstrument emits these for C-level
 	# builtins and compiled-string frames; they're never actionable.
 	if fn.startswith("<") and fn.endswith(">"):
+		return True
+	# v0.5.2: square-bracketed pruning markers ([other: N frames],
+	# [omitted: N frames]). These are synthetic nodes the pruner
+	# inserts to represent frames that got rolled up during
+	# _prune / _soft_cap. They're summaries, not real functions.
+	if fn.startswith("["):
 		return True
 
 	filename = (node.get("filename") or "").replace("\\", "/")
