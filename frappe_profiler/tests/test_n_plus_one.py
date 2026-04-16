@@ -84,8 +84,10 @@ def test_threshold_respected(empty_context):
 
 
 def test_fallback_to_deepest_frame_when_only_frappe_frames(empty_context):
-	"""If the only /apps/ frame is in frappe itself, we still emit the finding
-	rather than silently dropping it.
+	"""If the only /apps/ frame is in frappe itself, we still emit a
+	finding rather than silently dropping it — but as the
+	'Framework N+1' type (Low severity, framework-aware description),
+	not the actionable 'N+1 Query' type.
 	"""
 	recording = {
 		"uuid": "fb",
@@ -107,10 +109,19 @@ def test_fallback_to_deepest_frame_when_only_frappe_frames(empty_context):
 	}
 	result = n_plus_one.analyze([recording], empty_context)
 	assert len(result.findings) == 1
-	detail = json.loads(result.findings[0]["technical_detail_json"])
-	# It fell back to the frappe frame — that's the right behavior for queries
-	# that are genuinely issued from inside frappe internals.
+	finding = result.findings[0]
+	# v0.5.1: framework callsite → Framework N+1, not N+1 Query.
+	assert finding["finding_type"] == "Framework N+1", (
+		f"Pure-frappe/* stack must emit 'Framework N+1'; got: {finding['finding_type']}"
+	)
+	assert finding["severity"] == "Low", (
+		"Framework N+1 is always Low severity — user can rarely fix it"
+	)
+	detail = json.loads(finding["technical_detail_json"])
+	# It fell back to the frappe frame — still include full path.
 	assert "frappe/model/document.py" in detail["callsite"]["filename"]
+	# And the detail must carry the is_framework flag.
+	assert detail.get("is_framework") is True
 
 
 def test_severity_scales_with_count_and_time(empty_context):
@@ -149,6 +160,121 @@ def test_severity_scales_with_count_and_time(empty_context):
 # That's the SHOW GLOBAL STATUS snapshot our before_request hook runs on
 # every recording — real SQL, but profiler overhead, not application work
 # the user can optimize. Same goes for top_queries.
+
+
+def test_framework_n_plus_one_query_builder_utils(empty_context):
+	"""Exact production payload: Frappe's query builder utility
+	issues the same normalized query 138 times while building
+	SELECTs for different inputs. Pre-v0.5.1 this emitted as
+	'N+1 Query' with an actionable fix hint, misleading the user
+	into thinking they should refactor their code — but the
+	blamed file is frappe/query_builder/utils.py which the user
+	doesn't own. v0.5.1 routes it to 'Framework N+1' instead."""
+	recording = {
+		"uuid": "framework-qb",
+		"path": "/",
+		"cmd": None,
+		"method": "GET",
+		"event_type": "HTTP Request",
+		"duration": 500,
+		"calls": [
+			{
+				"query": "SELECT DEFAULT_STORAGE_ENGINE FROM information_schema.GLOBAL_VARIABLES",
+				"normalized_query": "SELECT ? FROM information_schema.GLOBAL_VARIABLES",
+				"duration": 71 / 138,  # ~0.51ms each, matches 71ms cumulative
+				"stack": [
+					{
+						"filename": "frappe/query_builder/utils.py",
+						"lineno": 87,
+						"function": "get_db_type",
+					},
+				],
+			}
+		] * 138,  # matches the production count
+	}
+	result = n_plus_one.analyze([recording], empty_context)
+	# Exactly one finding, and it must be Framework N+1.
+	assert len(result.findings) == 1
+	f = result.findings[0]
+	assert f["finding_type"] == "Framework N+1", (
+		f"Pure-frappe callsite (query_builder/utils.py) must emit "
+		f"'Framework N+1'; got: {f['finding_type']}"
+	)
+	assert f["severity"] == "Low"
+	# Title signals it's framework — no scary "Same query ran Nx"
+	# that implies the user should fix it.
+	assert "Framework query repeated" in f["title"]
+	assert "138" in f["title"]
+	assert "utils.py:87" in f["title"]
+	# Description acknowledges limited user action.
+	desc = f["customer_description"]
+	assert "Frappe's own code" in desc
+	assert "not as an action item" in desc or "rarely something you can change" in desc
+
+
+def test_user_code_n_plus_one_still_emits_as_actionable(empty_context):
+	"""Positive case: a genuine user-code N+1 (apps/myapp/...) must
+	still emit as 'N+1 Query' with its actionable fix hint. The
+	framework routing must NOT over-apply."""
+	recording = {
+		"uuid": "user-loop",
+		"path": "/",
+		"cmd": None,
+		"method": "GET",
+		"event_type": "HTTP Request",
+		"duration": 500,
+		"calls": [
+			{
+				"query": "SELECT name FROM tabItem WHERE id = ?",
+				"normalized_query": "SELECT NAME FROM tabItem WHERE ID = ?",
+				"duration": 3.0,
+				"stack": [
+					{
+						"filename": "apps/myapp/controllers/import.py",
+						"lineno": 42,
+						"function": "import_batch",
+					},
+				],
+			}
+		] * 15,
+	}
+	result = n_plus_one.analyze([recording], empty_context)
+	missing = [f for f in result.findings if f["finding_type"] == "N+1 Query"]
+	framework = [f for f in result.findings if f["finding_type"] == "Framework N+1"]
+	assert len(missing) == 1, (
+		"User-code N+1 must still emit as the actionable 'N+1 Query' "
+		f"type; got findings={[f['finding_type'] for f in result.findings]}"
+	)
+	assert len(framework) == 0
+	# Fix hint still directs to frappe.get_all / JOIN refactor.
+	detail = json.loads(missing[0]["technical_detail_json"])
+	assert "frappe.get_all" in detail["fix_hint"]
+
+
+def test_is_framework_callsite_helper_unit():
+	"""Direct unit test of the classifier — covers edge cases
+	without needing a full recording."""
+	from frappe_profiler.analyzers.n_plus_one import _is_framework_callsite
+
+	# True: framework code
+	assert _is_framework_callsite("frappe/query_builder/utils.py") is True
+	assert _is_framework_callsite("frappe/model/document.py") is True
+	assert _is_framework_callsite("frappe/__init__.py") is True
+	assert _is_framework_callsite("frappe_profiler/capture.py") is True
+	# Absolute path containing frappe/
+	assert _is_framework_callsite(
+		"/Users/navin/office/frappe_bench/apps/frappe/frappe/handler.py"
+	) is True
+
+	# False: user code
+	assert _is_framework_callsite("apps/myapp/controllers/import.py") is False
+	assert _is_framework_callsite("erpnext/accounts/doctype/sales_invoice.py") is False
+	# erpnext is an app, not frappe — NOT framework for this classifier
+	assert _is_framework_callsite("apps/erpnext/erpnext/foo.py") is False
+
+	# Empty
+	assert _is_framework_callsite("") is False
+	assert _is_framework_callsite(None) is False
 
 
 def test_title_fits_in_140_chars_for_deeply_nested_module_paths(empty_context):
