@@ -43,35 +43,69 @@ def _build_action(recording: dict) -> dict:
 
 
 def _label(recording: dict) -> str:
+	"""Technical label for the Per-action table / Frontend XHR panel.
+
+	Intentionally NOT humanized — shows the raw cmd (e.g.
+	``frappe.client.save``) or ``METHOD path`` so developers see
+	exactly what hit the server. The Steps-to-Reproduce section
+	uses ``humanized_label`` instead, which reads like English
+	("Save Sales Invoice", "Open Customer CUST-001").
+
+	v0.5.1: cmd falls back to ``_derive_cmd_from_path`` when the
+	recording's stored cmd is empty (Frappe's recorder captures
+	cmd at hook time, BEFORE the REST routing sets form_dict.cmd
+	— see ``_derive_cmd_from_path`` docstring for the full story).
+	"""
 	if recording.get("event_type") == "Background Job":
 		path = recording.get("path") or "Background Job"
 		# Trim long module paths to the last component for readability
 		short = path.split(".")[-1] if "." in path else path
 		return f"Job: {short}"
 
-	# v0.5.1: frappe.recorder captures `cmd` at __init__ time, which
-	# runs during before_request hooks — BEFORE frappe's REST routing
-	# layer sets form_dict.cmd inside handle_rpc_call. So for every
-	# modern `/api/method/<foo>` URL the recording ends up with
-	# cmd="" and none of the cmd-based humanization below fires —
-	# the label falls through to "POST /api/method/frappe.desk.form
-	# .save.savedocs" (the exact raw URL the user said wasn't
-	# readable). Recover the cmd from the path: /api/method/<foo>
-	# or /api/v2/method/<foo> → <foo>. Same parse shape as
-	# hooks_callbacks._extract_cmd_from_request.
+	cmd = recording.get("cmd") or ""
+	if not cmd:
+		cmd = _derive_cmd_from_path(recording.get("path") or "")
+
+	if cmd:
+		return cmd
+
+	method = recording.get("method") or "GET"
+	path = recording.get("path") or "/"
+	return f"{method} {path}"
+
+
+def humanized_label(recording: dict) -> str:
+	"""Human-readable label for the Steps-to-Reproduce section.
+
+	Reads like English ("Create Sales Invoice", "Submit Delivery Note",
+	"Open Customer CUST-001", "Search Item") rather than the technical
+	cmd string. Used exclusively by ``analyze._build_auto_notes_html`` —
+	the per-action table and frontend XHR panel continue to show the
+	technical label via ``_label``.
+
+	Per user feedback on v0.5.1: "only humanize call name in step to
+	reproduce only not on other breakdowns." The Steps-to-Reproduce
+	section is a high-level flow summary, so English phrasing reads
+	better there. Everywhere else, the raw cmd string is more
+	informative for a developer looking at the technical report.
+
+	Falls back to ``_label`` when the cmd doesn't match any of the
+	humanization rules — so unknown cmds produce the same technical
+	label they would in the per-action table, not an empty string.
+	"""
+	if recording.get("event_type") == "Background Job":
+		# Background jobs use the same label in both views — the
+		# "Job: <method>" form is already readable.
+		return _label(recording)
+
 	cmd = recording.get("cmd") or ""
 	if not cmd:
 		cmd = _derive_cmd_from_path(recording.get("path") or "")
 	form_dict = recording.get("form_dict") or {}
 
-	# v0.5.1: frappe.desk.form.save.savedocs is the Desk's canonical
-	# "save this form" endpoint. Its payload carries:
-	#   - doc:    JSON-encoded doc (has "doctype", "name", "__islocal")
-	#   - action: "Save" | "Submit" | "Cancel" | "Update"
-	# Pre-v0.5.1 this cmd fell through the verb_for_cmd map and the
-	# label came out as the raw cmd string "frappe.desk.form.save.
-	# savedocs" — useless in the Steps to Reproduce panel. Combine
-	# the action + __islocal flag + doctype to build a human phrase.
+	# frappe.desk.form.save.savedocs carries an `action` field
+	# ("Save"|"Submit"|"Cancel"|"Update") and an embedded `doc` JSON
+	# with the __islocal flag for brand-new records.
 	if cmd == "frappe.desk.form.save.savedocs":
 		action = ""
 		if isinstance(form_dict, dict):
@@ -84,10 +118,9 @@ def _label(recording: dict) -> str:
 				return f"Cancel {doctype}"
 			if action == "Update":
 				return f"Update {doctype}"
-			# action == "Save" (or empty): distinguish create vs save
-			# using the __islocal flag pyinstrument captures on the
-			# posted doc payload. "Create" reads better than "Save" for
-			# a brand-new record.
+			# action=Save (or empty). Distinguish Create-vs-Save from
+			# __islocal so the reproducer reads "Create Sales Invoice"
+			# when the user made a new doc.
 			return f"{'Create' if is_new else 'Save'} {doctype}"
 
 	verb_for_cmd = {
@@ -109,9 +142,7 @@ def _label(recording: dict) -> str:
 		if doctype:
 			return f"List {doctype}"
 
-	# v0.5.1: common Desk navigation / form-open operations. Humanize
-	# so the reproducer reads "Open Sales Invoice" instead of
-	# "frappe.desk.form.load.getdoc".
+	# Desk navigation / form-open operations.
 	if cmd == "frappe.desk.form.load.getdoc":
 		doctype = form_dict.get("doctype") if isinstance(form_dict, dict) else None
 		name = form_dict.get("name") if isinstance(form_dict, dict) else None
@@ -130,12 +161,9 @@ def _label(recording: dict) -> str:
 		if doctype:
 			return f"Search {doctype}"
 
-	if cmd:
-		return cmd
-
-	method = recording.get("method") or "GET"
-	path = recording.get("path") or "/"
-	return f"{method} {path}"
+	# No humanization rule matched — defer to the technical label so
+	# the caller always gets a non-empty string.
+	return _label(recording)
 
 
 def _derive_cmd_from_path(path: str) -> str:

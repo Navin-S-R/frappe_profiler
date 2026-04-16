@@ -924,7 +924,14 @@ def _build_auto_notes_html(recordings: list[dict]) -> str:
 
 	items: list[str] = []
 	for rec in signal_recordings[:_AUTO_NOTES_MAX_ENTRIES]:
-		label = per_action._label(rec) or "(unnamed action)"
+		# v0.5.1: humanized_label is Steps-to-Reproduce ONLY — reads
+		# like English ("Create Sales Invoice", "Submit Delivery
+		# Note"). The per-action table and frontend XHR panel
+		# continue to show the technical label via per_action._label
+		# (raw cmd or METHOD+path) per user feedback:
+		#   "only humanize call name in step to reproduce only not
+		#    on other breakdowns."
+		label = per_action.humanized_label(rec) or "(unnamed action)"
 		duration_ms = round(rec.get("duration") or 0, 1)
 		escaped = html.escape(label)
 		items.append(f"<li>{escaped} — {duration_ms:g} ms</li>")

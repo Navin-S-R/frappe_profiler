@@ -7,10 +7,15 @@ from frappe_profiler.analyzers import per_action
 
 
 def test_save_sales_invoice_action_label(n_plus_one_recording, empty_context):
-	"""frappe.client.save + Sales Invoice in form_dict → 'Save Sales Invoice'."""
+	"""v0.5.1: the per-action table shows the TECHNICAL label (raw
+	cmd), not the humanized Steps-to-Reproduce form. A developer
+	reading the technical report wants to see 'frappe.client.save'
+	— the actual whitelisted method — not a prose summary.
+	The Steps-to-Reproduce section uses `humanized_label` instead.
+	"""
 	result = per_action.analyze([n_plus_one_recording], empty_context)
 	assert len(result.actions) == 1
-	assert result.actions[0]["action_label"] == "Save Sales Invoice"
+	assert result.actions[0]["action_label"] == "frappe.client.save"
 
 
 def test_action_aggregates_match_calls(n_plus_one_recording, empty_context):
@@ -75,6 +80,9 @@ def test_background_job_label(empty_context):
 
 
 def test_submit_cmd(empty_context):
+	"""Per-action table shows the raw cmd, not 'Submit Delivery Note'.
+	The humanized form is verified separately in the _humanized_label
+	tests below."""
 	recording = {
 		"uuid": "t3",
 		"cmd": "frappe.client.submit",
@@ -86,17 +94,17 @@ def test_submit_cmd(empty_context):
 		"form_dict": {"doctype": "Delivery Note"},
 	}
 	result = per_action.analyze([recording], empty_context)
-	assert result.actions[0]["action_label"] == "Submit Delivery Note"
+	assert result.actions[0]["action_label"] == "frappe.client.submit"
 
 
 # ---------------------------------------------------------------------------
-# v0.5.1: frappe.desk.form.save.savedocs humanization
+# v0.5.1: per_action.humanized_label — Steps-to-Reproduce ONLY
 # ---------------------------------------------------------------------------
-# The Desk's canonical "save this form" endpoint. Pre-v0.5.1 the cmd
-# fell through the verb_for_cmd map and produced the raw cmd string
-# in the Steps to Reproduce list — useless. v0.5.1 maps the `action`
-# and `__islocal` payload fields to "Create/Save/Submit/Cancel/Update
-# <DocType>" for a human-readable reproducer.
+# These tests target the `humanized_label` helper directly. It's used
+# by analyze._build_auto_notes_html to render the Steps-to-Reproduce
+# section. The per-action table and frontend XHR panel stay on the
+# technical `_label` — per user feedback: "only humanize call name
+# in step to reproduce only not on other breakdowns."
 
 
 def _savedocs(doc, action="Save"):
@@ -117,45 +125,39 @@ def _savedocs(doc, action="Save"):
 	}
 
 
-def test_savedocs_create_new_doc(empty_context):
-	"""__islocal=1 → 'Create <DocType>' reads better than 'Save'."""
+def test_humanized_savedocs_create_new_doc():
 	rec = _savedocs({"doctype": "Sales Invoice", "__islocal": 1}, action="Save")
-	result = per_action.analyze([rec], empty_context)
-	assert result.actions[0]["action_label"] == "Create Sales Invoice"
+	assert per_action.humanized_label(rec) == "Create Sales Invoice"
 
 
-def test_savedocs_save_existing_doc(empty_context):
-	"""No __islocal (or __islocal=0) → 'Save <DocType>'."""
+def test_humanized_savedocs_save_existing_doc():
 	rec = _savedocs(
 		{"doctype": "Sales Invoice", "name": "SINV-00042"},
 		action="Save",
 	)
-	result = per_action.analyze([rec], empty_context)
-	assert result.actions[0]["action_label"] == "Save Sales Invoice"
+	assert per_action.humanized_label(rec) == "Save Sales Invoice"
 
 
-def test_savedocs_submit_action(empty_context):
-	"""action=Submit → 'Submit <DocType>' regardless of __islocal."""
+def test_humanized_savedocs_submit_action():
 	rec = _savedocs(
 		{"doctype": "Sales Invoice", "name": "SINV-00042"},
 		action="Submit",
 	)
-	result = per_action.analyze([rec], empty_context)
-	assert result.actions[0]["action_label"] == "Submit Sales Invoice"
+	assert per_action.humanized_label(rec) == "Submit Sales Invoice"
 
 
-def test_savedocs_cancel_action(empty_context):
+def test_humanized_savedocs_cancel_action():
 	rec = _savedocs(
 		{"doctype": "Sales Invoice", "name": "SINV-00042"},
 		action="Cancel",
 	)
-	result = per_action.analyze([rec], empty_context)
-	assert result.actions[0]["action_label"] == "Cancel Sales Invoice"
+	assert per_action.humanized_label(rec) == "Cancel Sales Invoice"
 
 
-def test_savedocs_without_doctype_falls_back(empty_context):
-	"""If the payload is malformed (no parseable doctype), don't
-	emit an ugly 'Save <empty>' label — fall back to the cmd string."""
+def test_humanized_savedocs_without_doctype_falls_back():
+	"""Malformed payload (no parseable doctype) must fall back to
+	the technical label — never emit 'Save <empty>' with trailing
+	whitespace."""
 	rec = {
 		"uuid": "sd",
 		"cmd": "frappe.desk.form.save.savedocs",
@@ -166,16 +168,11 @@ def test_savedocs_without_doctype_falls_back(empty_context):
 		"calls": [],
 		"form_dict": {"action": "Save"},  # no doc
 	}
-	result = per_action.analyze([rec], empty_context)
-	label = result.actions[0]["action_label"]
-	# Falls through to the raw cmd (or could be the path if cmd wasn't
-	# set) — just verify we DON'T silently emit "Save " with trailing
-	# whitespace or similar.
-	assert label and not label.endswith(" ")
+	label = per_action.humanized_label(rec)
+	assert label == "frappe.desk.form.save.savedocs"
 
 
-def test_desk_getdoc_is_open_doctype(empty_context):
-	"""Opening a doc form in the Desk → 'Open <DocType> <name>'."""
+def test_humanized_desk_getdoc_is_open_doctype():
 	rec = {
 		"uuid": "gd",
 		"cmd": "frappe.desk.form.load.getdoc",
@@ -186,11 +183,10 @@ def test_desk_getdoc_is_open_doctype(empty_context):
 		"calls": [],
 		"form_dict": {"doctype": "Customer", "name": "CUST-001"},
 	}
-	result = per_action.analyze([rec], empty_context)
-	assert result.actions[0]["action_label"] == "Open Customer CUST-001"
+	assert per_action.humanized_label(rec) == "Open Customer CUST-001"
 
 
-def test_desk_search_link_is_search_doctype(empty_context):
+def test_humanized_desk_search_link_is_search_doctype():
 	rec = {
 		"uuid": "sl",
 		"cmd": "frappe.desk.search.search_link",
@@ -201,13 +197,10 @@ def test_desk_search_link_is_search_doctype(empty_context):
 		"calls": [],
 		"form_dict": {"doctype": "Item", "txt": "ITEM-"},
 	}
-	result = per_action.analyze([rec], empty_context)
-	assert result.actions[0]["action_label"] == "Search Item"
+	assert per_action.humanized_label(rec) == "Search Item"
 
 
-def test_client_insert_is_create(empty_context):
-	"""frappe.client.insert is the REST way to create a doc — 'Create'
-	reads better than 'Save' (which v0.4.x used)."""
+def test_humanized_client_insert_is_create():
 	rec = {
 		"uuid": "ci",
 		"cmd": "frappe.client.insert",
@@ -218,8 +211,22 @@ def test_client_insert_is_create(empty_context):
 		"calls": [],
 		"form_dict": {"doctype": "Lead"},
 	}
+	assert per_action.humanized_label(rec) == "Create Lead"
+
+
+def test_humanization_does_not_leak_into_per_action_table(empty_context):
+	"""Guard: the per-action table must stay on the technical label.
+	User feedback was explicit: humanize only in Steps to Reproduce.
+	This test runs a savedocs recording through the full analyzer
+	pipeline and asserts the action row still has the raw cmd."""
+	rec = _savedocs(
+		{"doctype": "Sales Invoice", "__islocal": 1},
+		action="Save",
+	)
 	result = per_action.analyze([rec], empty_context)
-	assert result.actions[0]["action_label"] == "Create Lead"
+	assert len(result.actions) == 1
+	# Per-action table → raw cmd, NOT "Create Sales Invoice".
+	assert result.actions[0]["action_label"] == "frappe.desk.form.save.savedocs"
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +241,10 @@ def test_client_insert_is_create(empty_context):
 
 def test_label_derives_cmd_from_path_when_cmd_is_empty(empty_context):
 	"""Exact production recording shape: cmd="", path holds the
-	/api/method/<cmd> URL. Must still produce the humanized
-	'Create Sales Invoice' label by deriving cmd from the path."""
+	/api/method/<cmd> URL. The per-action table must recover
+	the raw cmd via path-derivation (NOT render the raw URL).
+	The Steps-to-Reproduce humanization is verified separately
+	against ``humanized_label``."""
 	import json as _json
 	recording = {
 		"uuid": "prod",
@@ -251,13 +260,16 @@ def test_label_derives_cmd_from_path_when_cmd_is_empty(empty_context):
 		},
 	}
 	result = per_action.analyze([recording], empty_context)
-	# Without the fix this would be "POST /api/method/frappe.desk.form.save.savedocs"
-	assert result.actions[0]["action_label"] == "Create Sales Invoice"
+	# Per-action table gets the RAW cmd (technical), not humanized.
+	assert result.actions[0]["action_label"] == "frappe.desk.form.save.savedocs"
+	# humanized_label — used only in Steps-to-Reproduce — still
+	# produces the English form for this same recording.
+	assert per_action.humanized_label(recording) == "Create Sales Invoice"
 
 
 def test_label_derives_v2_api_method(empty_context):
-	"""Same rule for /api/v2/method/<foo> — the path parser must
-	see both v1 and v2 shapes."""
+	"""/api/v2/method/<foo> parse works too — per-action table
+	shows the raw cmd, humanized_label produces the English form."""
 	recording = {
 		"uuid": "v2",
 		"cmd": "",
@@ -269,7 +281,8 @@ def test_label_derives_v2_api_method(empty_context):
 		"form_dict": {"doctype": "Delivery Note"},
 	}
 	result = per_action.analyze([recording], empty_context)
-	assert result.actions[0]["action_label"] == "Submit Delivery Note"
+	assert result.actions[0]["action_label"] == "frappe.client.submit"
+	assert per_action.humanized_label(recording) == "Submit Delivery Note"
 
 
 def test_label_non_method_url_falls_back_to_method_path(empty_context):
