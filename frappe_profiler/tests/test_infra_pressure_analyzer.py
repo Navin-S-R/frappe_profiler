@@ -265,3 +265,105 @@ def test_recordings_without_infra_are_ignored():
     assert rc == []
     # Timeline should only include the action with infra.
     assert len(result.aggregate["infra_timeline"]) == 1
+
+
+
+# ---------------------------------------------------------------------------
+# v0.5.2: infra_timeline action labels from context.actions
+# ---------------------------------------------------------------------------
+# Pre-v0.5.2 this analyzer read rec.get("action_label") from the raw
+# recording dict, but per_action._build_action writes action_label on
+# context.actions[idx], NOT on the recording. So every row in the
+# Server Resource table rendered as the synthetic "action_0",
+# "action_1", ... fallback. Same bug shape as frontend_timings.
+
+
+def _production_shape_recording(idx, **overrides):
+    """Real recorder output shape: path/cmd/method, NO action_label
+    on the dict."""
+    base = {
+        "uuid": f"rec-{idx}",
+        "path": "/api/method/frappe.desk.form.save.savedocs",
+        "cmd": "frappe.desk.form.save.savedocs",
+        "method": "POST",
+        "event_type": "HTTP Request",
+        "duration": 100.0,
+        "calls": [],
+        "infra": _synth_infra(),
+    }
+    base.update(overrides)
+    return base
+
+
+def test_infra_timeline_uses_context_actions_for_labels():
+    """Exact production shape: recordings have no action_label, but
+    context.actions (populated by per_action.analyze upstream) does.
+    Timeline rows must pull from there."""
+    from frappe_profiler.analyzers import infra_pressure
+    from frappe_profiler.analyzers.base import AnalyzeContext
+
+    recordings = [
+        _production_shape_recording(0),
+        _production_shape_recording(1),
+    ]
+    ctx = AnalyzeContext(session_uuid="t", docname="t")
+    ctx.actions = [
+        {"action_label": "frappe.desk.form.save.savedocs:Save", "duration_ms": 100},
+        {"action_label": "run_doc_method:make_payment_entry", "duration_ms": 100},
+    ]
+    result = infra_pressure.analyze(recordings, ctx)
+    timeline = result.aggregate["infra_timeline"]
+    labels = [row["action_label"] for row in timeline]
+    assert labels == [
+        "frappe.desk.form.save.savedocs:Save",
+        "run_doc_method:make_payment_entry",
+    ], f"Expected humanized labels; got: {labels}"
+    assert not any(lbl.startswith("action_") for lbl in labels), (
+        f"synthetic action_N labels leaked into the Server Resource "
+        f"table: {labels}"
+    )
+
+
+def test_infra_timeline_falls_back_to_method_path_without_context():
+    """If context.actions is empty (per_action didn't run first, or the
+    actions list is shorter than recordings), derive a readable label
+    from the recording's own method + path rather than emitting the
+    synthetic 'action_N' noise."""
+    from frappe_profiler.analyzers import infra_pressure
+    from frappe_profiler.analyzers.base import AnalyzeContext
+
+    rec = _production_shape_recording(
+        0,
+        path="/api/resource/Sales Invoice/SI-001",
+        cmd="",
+        method="GET",
+    )
+    ctx = AnalyzeContext(session_uuid="t", docname="t")
+    # Deliberately leave ctx.actions empty.
+    result = infra_pressure.analyze([rec], ctx)
+    timeline = result.aggregate["infra_timeline"]
+    assert timeline[0]["action_label"] == (
+        "GET /api/resource/Sales Invoice/SI-001"
+    ), f"Expected METHOD+path fallback; got: {timeline[0]}"
+
+
+def test_infra_timeline_synthetic_only_as_last_resort():
+    """If the recording truly has no method/path/cmd AND no matching
+    context.actions entry, fall back to synthetic 'action_N'. This
+    is the only path that should produce the old noise — and only
+    when the analyzer has zero useful data to work with."""
+    from frappe_profiler.analyzers import infra_pressure
+    from frappe_profiler.analyzers.base import AnalyzeContext
+
+    rec = {
+        "uuid": "bare",
+        "event_type": "HTTP Request",
+        "duration": 50.0,
+        "calls": [],
+        "infra": _synth_infra(),
+        # no method, no path, no cmd, no action_label
+    }
+    ctx = AnalyzeContext(session_uuid="t", docname="t")
+    result = infra_pressure.analyze([rec], ctx)
+    timeline = result.aggregate["infra_timeline"]
+    assert timeline[0]["action_label"] == "action_0"

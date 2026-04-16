@@ -53,6 +53,34 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
     pool_high = _conf("profiler_infra_db_pool_high_ratio", DEFAULT_DB_POOL_HIGH_RATIO)
     rq_warn = _conf("profiler_infra_rq_backlog_warn", DEFAULT_RQ_BACKLOG_WARN)
 
+    # v0.5.2: per_action builds humanized action_labels on
+    # context.actions, NOT on the raw recording dict. Pre-v0.5.2 the
+    # infra timeline read rec.get("action_label") — which is always
+    # None on real recordings — so every row in the "Server Resource"
+    # table rendered as the synthetic "action_0", "action_1", ...
+    # fallback. Same bug pattern the frontend_timings analyzer had
+    # earlier; same fix: read from context.actions[idx].action_label
+    # when available, fall back to the recording's own method/path
+    # for a readable last-resort, only produce synthetic "action_N"
+    # if all else fails.
+    ctx_actions = getattr(context, "actions", None) or []
+
+    def _label_for(idx: int) -> str:
+        if idx < len(ctx_actions):
+            lbl = ctx_actions[idx].get("action_label")
+            if lbl:
+                return lbl
+        if idx < len(recordings):
+            r = recordings[idx]
+            method = r.get("method") or ""
+            path = (r.get("path") or "").split("?", 1)[0]
+            if path:
+                return f"{method} {path}".strip()
+            cmd = r.get("cmd")
+            if cmd:
+                return str(cmd)
+        return f"action_{idx}"
+
     timeline = []
     cpu_values = []
     load_values = []
@@ -90,7 +118,7 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 
         timeline.append({
             "action_idx": idx,
-            "action_label": rec.get("action_label") or f"action_{idx}",
+            "action_label": _label_for(idx),
             "cpu": cpu,
             "rss": rss,
             "load_1min": load,
