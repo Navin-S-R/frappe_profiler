@@ -890,6 +890,207 @@ def test_typeerror_from_optimizer_is_also_a_soft_skip(monkeypatch, empty_context
 	assert len(soft) == 1
 
 
+def test_modified_column_is_never_suggested(monkeypatch, empty_context):
+	"""v0.5.1: 'modified' is a Frappe lifecycle column — updated on
+	every save. Indexing it causes write amplification that outweighs
+	any read-side gain. Must never be suggested, even when the
+	DBOptimizer heuristic points at it. Exact production case:
+	'Add index on tabDocType(modified)' — user feedback: 'Modified
+	fields can't be indexed as it would affect the system performance.'
+
+	Each query is slow enough (50 ms) to clear the per-query-savings
+	floor; the only thing that should suppress this is the lifecycle
+	blacklist.
+	"""
+
+	def fake_optimize(query):
+		return _FakeDBIndex("tabDocType", "modified")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+	_install_fake_frappe_db(
+		monkeypatch,
+		indexed_columns_by_table={"tabDocType": {"name", "module"}},
+		column_types_by_table={
+			"tabDocType": {
+				"name": "varchar",
+				"module": "varchar",
+				"modified": "datetime",
+			},
+		},
+	)
+
+	recording = {
+		"uuid": "ix_modified_lifecycle",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 500,
+		"calls": [
+			{
+				"query": "SELECT * FROM tabDocType ORDER BY modified DESC LIMIT 20",
+				"normalized_query": "SELECT * FROM tabDocType ORDER BY modified DESC LIMIT ?",
+				"duration": 50.0,  # well above per-query floor
+				"stack": [],
+			}
+		] * 10,
+	}
+	result = index_suggestions.analyze([recording], empty_context)
+	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
+	assert missing == [], (
+		"Suggestion on tabDocType.modified must be suppressed — "
+		f"modified is a Frappe lifecycle column. Got: {missing}"
+	)
+
+	# The warning must explicitly name the blacklist reason and
+	# include the table.column for user verification.
+	blacklist_warnings = [
+		w for w in result.warnings
+		if "lifecycle column" in w or "every save" in w
+	]
+	assert len(blacklist_warnings) == 1, (
+		f"Expected blacklist warning; got warnings={result.warnings}"
+	)
+	assert "tabDocType.modified" in blacklist_warnings[0], (
+		f"Warning must name the suppressed column; got: {blacklist_warnings[0]}"
+	)
+
+
+def test_modified_by_column_is_never_suggested(monkeypatch, empty_context):
+	"""Same rule applies to modified_by (also updated on every save)."""
+
+	def fake_optimize(query):
+		return _FakeDBIndex("tabUser", "modified_by")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+	_install_fake_frappe_db(
+		monkeypatch,
+		indexed_columns_by_table={"tabUser": {"name"}},
+		column_types_by_table={
+			"tabUser": {"name": "varchar", "modified_by": "varchar"},
+		},
+	)
+
+	recording = {
+		"uuid": "ix_modified_by",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 100,
+		"calls": [
+			{
+				"query": "SELECT * FROM tabUser WHERE modified_by = 'x'",
+				"normalized_query": "SELECT * FROM tabUser WHERE modified_by = ?",
+				"duration": 20.0,
+				"stack": [],
+			}
+		] * 10,
+	}
+	result = index_suggestions.analyze([recording], empty_context)
+	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
+	assert missing == []
+
+
+def test_never_suggest_skips_schema_lookup(monkeypatch, empty_context):
+	"""Performance guard: the blacklist check must run BEFORE the
+	information_schema lookups, so we don't waste DB roundtrips on
+	a suggestion we already know to drop."""
+
+	def fake_optimize(query):
+		return _FakeDBIndex("tabLead", "modified")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+
+	sql_calls: list[str] = []
+	import frappe
+
+	class FakeDB:
+		def sql(self, query, params=None, as_dict=False):
+			sql_calls.append(query)
+			return []
+
+	monkeypatch.setattr(frappe, "db", FakeDB(), raising=False)
+	monkeypatch.setattr(frappe, "log_error", lambda *a, **k: None, raising=False)
+
+	recording = {
+		"uuid": "ix_no_schema_on_blacklist",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 200,
+		"calls": [
+			{
+				"query": "SELECT ... ORDER BY modified",
+				"normalized_query": "SELECT ... ORDER BY modified",
+				"duration": 20.0,
+				"stack": [],
+			}
+		] * 10,
+	}
+	result = index_suggestions.analyze([recording], empty_context)
+	assert result.findings == []
+	# Classifier's schema lookups must not have run for blacklisted
+	# columns — we can drop without checking anything else.
+	for sql in sql_calls:
+		assert "SHOW INDEX" not in sql, (
+			f"Classifier ran SHOW INDEX for a blacklisted column: {sql}"
+		)
+		assert "information_schema" not in sql, (
+			f"Classifier ran information_schema for a blacklisted column: {sql}"
+		)
+
+
+def test_creation_and_owner_still_analyzed_normally(monkeypatch, empty_context):
+	"""The blacklist is narrow — ``creation`` and ``owner`` are NOT
+	in it. Those columns are set on INSERT and immutable thereafter,
+	so indexing them doesn't cause write amplification. If the
+	optimizer suggests them they go through the normal
+	classify_column → actionable / already_indexed flow."""
+
+	def fake_optimize(query):
+		if "creation" in query:
+			return _FakeDBIndex("tabSomething", "creation")
+		return _FakeDBIndex("tabSomething", "owner")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+	_install_fake_frappe_db(
+		monkeypatch,
+		indexed_columns_by_table={"tabSomething": {"name"}},
+		column_types_by_table={
+			"tabSomething": {
+				"name": "varchar",
+				"creation": "datetime",
+				"owner": "varchar",
+			},
+		},
+	)
+
+	recording = {
+		"uuid": "ix_creation_owner",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 500,
+		"calls": [
+			{
+				"query": "SELECT * FROM tabSomething WHERE creation > '2024-01-01'",
+				"normalized_query": "SELECT * FROM tabSomething WHERE creation > ?",
+				"duration": 50.0,
+				"stack": [],
+			}
+		] * 10 + [
+			{
+				"query": "SELECT * FROM tabSomething WHERE owner = 'x'",
+				"normalized_query": "SELECT * FROM tabSomething WHERE owner = ?",
+				"duration": 50.0,
+				"stack": [],
+			}
+		] * 10,
+	}
+	result = index_suggestions.analyze([recording], empty_context)
+	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
+	# Both creation and owner go through normal path and are emitted
+	# as actionable suggestions — not the blacklist warning.
+	titles = [f["title"] for f in missing]
+	assert any("creation" in t for t in titles), (
+		f"creation should NOT be blacklisted; got findings: {titles}"
+	)
+	assert any("owner" in t for t in titles), (
+		f"owner should NOT be blacklisted; got findings: {titles}"
+	)
+
+
 def test_low_per_query_savings_suggestion_is_suppressed(monkeypatch, empty_context):
 	"""Exact production payload: tabDocType.modified flagged with
 	892ms cumulative across 1526 queries = 0.58ms per query, below

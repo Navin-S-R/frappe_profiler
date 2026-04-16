@@ -152,6 +152,35 @@ _PREFIX_REQUIRED_TYPES = frozenset({
 	"blob", "tinyblob", "mediumblob", "longblob",
 })
 
+# v0.5.1: Frappe lifecycle columns that must NEVER be suggested for
+# indexing, even when the DBOptimizer heuristic thinks they'd help a
+# query. These columns are updated on EVERY save — so every INSERT
+# and UPDATE has to also maintain the index. On any non-trivially-
+# written table the write amplification dwarfs the read-side gain,
+# and the standard advice from Frappe maintainers is: don't index them.
+#
+# The optimizer only sees read patterns (``ORDER BY modified DESC``
+# looks like it wants an index). It can't see the write cost. We
+# encode that knowledge here.
+#
+# A real production report (v0.5.1) surfaced
+# ``Add index on tabDocType(modified)`` as a suggestion, and the user
+# corrected with the rule: "Modified fields can't be indexed as it
+# would affect the system performance."
+#
+# Not included:
+#   - ``creation`` / ``owner``: set on INSERT, immutable thereafter.
+#     Indexing these is fine — no write amplification. If the optimizer
+#     suggests them they're usually still low-leverage and the per-
+#     query savings floor filters them out.
+#   - ``docstatus``: updated on submit/cancel (not every save), but
+#     low cardinality (0/1/2) — indexing standalone is pointless for
+#     different reasons, not write amplification.
+_NEVER_SUGGEST_COLUMNS = frozenset({
+	"modified",
+	"modified_by",
+})
+
 
 def _get_indexed_columns(table: str) -> set[str]:
 	"""Return the set of columns on ``table`` that already have at
@@ -232,12 +261,28 @@ def _classify_column(
 	  - ``"unindexable"``  — column is JSON / geometry or doesn't exist
 	                         on the table; drop the suggestion, second
 	                         element explains
+	  - ``"never_suggest"`` — column is a Frappe lifecycle column
+	                         (``modified``, ``modified_by``) updated on
+	                         every save; indexing causes write
+	                         amplification that outweighs read gains
 	  - ``"unknown"``      — information_schema lookup failed (likely
 	                         no real DB, dev environment); KEEP the
 	                         suggestion with a plain DDL (legacy
 	                         behavior) so we don't silently suppress
 	                         the old pipeline
 	"""
+	# v0.5.1: hard blacklist — lifecycle columns should never be
+	# suggested regardless of read-side heuristics. Checked BEFORE
+	# the information_schema lookups so we don't waste DB roundtrips
+	# on a suggestion we already know to drop.
+	if column in _NEVER_SUGGEST_COLUMNS:
+		return "never_suggest", (
+			f"column `{column}` on `{table}` is a Frappe lifecycle "
+			f"column updated on every save. Indexing it would cost "
+			f"more at write time than it saves at read time — the "
+			f"standard guidance is not to index these columns."
+		)
+
 	# Memoize per-table lookups so a suggestion with N columns on
 	# the same table only pays one round trip.
 	if table not in indexed_cache:
@@ -406,6 +451,8 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 	drop_already_indexed = 0
 	drop_unindexable = 0
 	drop_low_per_query = 0
+	drop_never_suggest = 0
+	never_suggest_columns: list[str] = []
 	unindexable_reasons: list[str] = []
 
 	findings = []
@@ -430,6 +477,10 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 			table, column, indexed_cache, type_cache
 		)
 
+		if status == "never_suggest":
+			drop_never_suggest += 1
+			never_suggest_columns.append(f"{table}.{column}")
+			continue
 		if status == "already_indexed":
 			drop_already_indexed += 1
 			continue
@@ -533,6 +584,19 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 			f"average savings below {MIN_AVG_SAVINGS_PER_QUERY_MS:g}ms "
 			"per query. These queries are already running near MariaDB's "
 			"per-query overhead floor — an index wouldn't measurably help."
+		)
+	if drop_never_suggest:
+		# Include the specific columns in the warning so the user can
+		# confirm it matches their expectations and doesn't look like
+		# the analyzer silently dropped useful suggestions.
+		sample = ", ".join(sorted(set(never_suggest_columns))[:5])
+		overflow = max(0, len(set(never_suggest_columns)) - 5)
+		more = f" (+{overflow} more)" if overflow else ""
+		warnings.append(
+			f"Suppressed {drop_never_suggest} index suggestion(s) on "
+			f"Frappe lifecycle columns ({sample}{more}). These columns "
+			"are updated on every save — indexing them would cost more "
+			"at write time than it saves at read time."
 		)
 	if drop_already_indexed:
 		warnings.append(
