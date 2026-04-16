@@ -47,8 +47,13 @@ def _set_fake_local(cmd=None, path=None):
 
 
 def test_should_skip_frappe_profiler_status_poll():
-	"""The widget polls `frappe_profiler.api.status` every ~2 seconds
-	while a session is Recording — this is the canonical case."""
+	"""``frappe_profiler.api.status`` must always be filtered from
+	capture. v0.5.1 removed the widget's 5-second polling loop in
+	favor of realtime events, but the endpoint is still called once
+	on page load (to rehydrate widget state after navigation/reload)
+	and once on tab-visibility return. Those calls MUST NOT be
+	captured into the profiler session they belong to — they're
+	instrumentation, not user work."""
 	from frappe_profiler.hooks_callbacks import _should_skip_request
 
 	_set_fake_local(cmd="frappe_profiler.api.status")

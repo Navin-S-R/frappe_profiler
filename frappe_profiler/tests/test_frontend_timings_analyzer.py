@@ -200,13 +200,19 @@ def _production_shape_recordings():
 
 def _context_with_per_action_output(recordings):
 	"""Simulate what context.actions looks like AFTER per_action.analyze
-	has run — humanized action_label and real duration_ms."""
+	has run. v0.5.2: action_label on context.actions is the TECHNICAL
+	label (raw cmd with optional :Action suffix, or METHOD+path) —
+	humanization moved to per_action.humanized_label() and is used
+	only by the Steps-to-Reproduce section. The frontend XHR panel
+	mirrors whatever context.actions holds, so these fixtures match
+	the current technical-label format.
+	"""
 	from frappe_profiler.analyzers.base import AnalyzeContext
 	ctx = AnalyzeContext(session_uuid="t", docname="t")
 	ctx.frontend_data = {"xhr": [], "vitals": []}
 	ctx.actions = [
 		{
-			"action_label": "Save Sales Invoice",
+			"action_label": "frappe.desk.form.save.savedocs:Save",
 			"duration_ms": 180.0,
 			"path": "/api/method/frappe.desk.form.save.savedocs",
 		},
@@ -220,10 +226,13 @@ def _context_with_per_action_output(recordings):
 
 
 def test_action_label_comes_from_context_actions(monkeypatch):
-	"""v0.5.1 fix: per-XHR rows must use the humanized label
-	(e.g. 'Save Sales Invoice') from context.actions, not the
-	synthetic action_N fallback that pre-v0.5.1 always hit because
-	raw recordings don't carry action_label.
+	"""v0.5.1 fix, still valid in v0.5.2: per-XHR rows read
+	action_label from context.actions rather than from the raw
+	recording dict (which never carries it in production). The
+	specific label format evolved across versions (v0.5.1
+	humanized, v0.5.2 technical with :Action suffix), but the
+	routing through context.actions is invariant — that's what
+	this test guards.
 	"""
 	from frappe_profiler.analyzers import frontend_timings
 
@@ -257,8 +266,9 @@ def test_action_label_comes_from_context_actions(monkeypatch):
 	matched = result.aggregate["frontend_xhr_matched"]
 	labels = [m["action_label"] for m in matched]
 
-	# Humanized labels from context.actions, NOT action_0 / action_1.
-	assert "Save Sales Invoice" in labels
+	# Labels come from context.actions (v0.5.2 technical format),
+	# NOT the synthetic action_0 / action_1 fallback.
+	assert "frappe.desk.form.save.savedocs:Save" in labels
 	assert "GET /api/resource/Sales Invoice/SI-001" in labels
 	assert not any(lbl.startswith("action_") for lbl in labels), (
 		f"synthetic action_N labels leaked: {labels}"
