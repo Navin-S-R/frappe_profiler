@@ -835,6 +835,62 @@ _AUTO_NOTES_PREAMBLE = (
 	"recording started, expected vs. actual behavior).</em></p>"
 )
 
+# v0.5.1: recordings whose cmd or path matches any of these is
+# considered background/polling noise and excluded from the Steps to
+# Reproduce list. These ARE still shown in the per-action table (the
+# full picture), they just don't belong in a human-readable reproducer.
+#
+# Driven by a real user report whose reproducer read:
+#
+#   GET /api/method/frappe.realtime.has_permission — 25 ms
+#   POST /api/method/frappe.desk.form.save.savedocs — 774.8 ms
+#   GET /api/method/frappe.realtime.has_permission — 6 ms
+#
+# Of those three, only the savedocs is a user action. The two
+# has_permission entries are the Desk polling for realtime
+# subscription permissions and should be filtered.
+_REPRODUCER_NOISE_CMD_PREFIXES = (
+	# Desk polling / realtime subscription permission checks. Fire
+	# 2-3x per second while the Desk has a doctype page open.
+	"frappe.realtime.",
+	# Form-metadata loading issued on every form open. Useful in the
+	# per-action table for timing but clutters the reproducer —
+	# "Load Sales Invoice form" says nothing about user intent.
+	"frappe.desk.form.load.getdoctype",
+	"frappe.desk.form.load.getdocinfo",
+	# Background list counters.
+	"frappe.client.get_count",
+	# Frappe's internal doctype hooks endpoint
+	"frappe.desk.notifications.get_open_count",
+	# Build / reload assets
+	"frappe.core.doctype.system_settings.system_settings.load",
+)
+
+_REPRODUCER_NOISE_PATH_PREFIXES = (
+	# Static asset requests
+	"/assets/",
+	"/favicon",
+	# Frappe's built-in recorder desk page (not a user action)
+	"/app/recorder",
+)
+
+
+def _is_reproducer_noise(rec: dict) -> bool:
+	"""Return True when a recording shouldn't appear in the auto-notes
+	reproducer list. Still appears in the per-action breakdown — just
+	excluded from the high-level human-readable flow."""
+	cmd = (rec.get("cmd") or "").strip()
+	if cmd:
+		for prefix in _REPRODUCER_NOISE_CMD_PREFIXES:
+			if cmd.startswith(prefix):
+				return True
+	path = (rec.get("path") or "").strip()
+	if path:
+		for prefix in _REPRODUCER_NOISE_PATH_PREFIXES:
+			if path.startswith(prefix):
+				return True
+	return False
+
 
 def _build_auto_notes_html(recordings: list[dict]) -> str:
 	"""Render recorded actions as an ordered HTML list for the `notes` field.
@@ -853,20 +909,48 @@ def _build_auto_notes_html(recordings: list[dict]) -> str:
 	if not recordings:
 		return ""
 
+	# v0.5.1: filter Desk polling / static-asset noise before labeling.
+	# See _REPRODUCER_NOISE_* for the full rationale. Preserves the
+	# ORIGINAL total count in the "and N more" overflow so the user
+	# can tell the session had more traffic than the reproducer shows.
+	signal_recordings = [r for r in recordings if not _is_reproducer_noise(r)]
+	total_in_session = len(recordings)
+
+	if not signal_recordings:
+		# Session consisted entirely of noise (polling only, no user
+		# actions). Return empty string so the caller leaves notes
+		# blank rather than filling it with an empty list.
+		return ""
+
 	items: list[str] = []
-	for rec in recordings[:_AUTO_NOTES_MAX_ENTRIES]:
+	for rec in signal_recordings[:_AUTO_NOTES_MAX_ENTRIES]:
 		label = per_action._label(rec) or "(unnamed action)"
 		duration_ms = round(rec.get("duration") or 0, 1)
 		escaped = html.escape(label)
 		items.append(f"<li>{escaped} — {duration_ms:g} ms</li>")
 
-	overflow = len(recordings) - _AUTO_NOTES_MAX_ENTRIES
+	overflow = len(signal_recordings) - _AUTO_NOTES_MAX_ENTRIES
 	if overflow > 0:
 		items.append(
 			f"<li><em>… and {overflow} more action(s) not shown.</em></li>"
 		)
 
-	return _AUTO_NOTES_PREAMBLE + "<ol>" + "".join(items) + "</ol>"
+	# Surface when the session had more traffic overall but noise was
+	# filtered — so the user doesn't wonder why only 3 entries showed
+	# up from a 70-request session.
+	noise_count = total_in_session - len(signal_recordings)
+	footer = ""
+	if noise_count > 0:
+		footer = (
+			f"<p class='muted' style='color:#6b7280;font-size:0.85rem'>"
+			f"{noise_count} background / polling request(s) filtered "
+			"out (permission checks, form-metadata loads, static assets)."
+			"</p>"
+		)
+
+	return (
+		_AUTO_NOTES_PREAMBLE + "<ol>" + "".join(items) + "</ol>" + footer
+	)
 
 
 def _compute_top_severity(findings: list[dict]) -> str:

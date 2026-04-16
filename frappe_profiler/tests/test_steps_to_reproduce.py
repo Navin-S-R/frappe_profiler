@@ -314,6 +314,200 @@ def test_persist_auto_fills_notes_when_field_is_empty():
 	assert "strip()" in src or "not doc.notes" in src
 
 
+def test_auto_notes_filters_realtime_polling_noise():
+	"""v0.5.1: real production reproducer read:
+
+	    GET /api/method/frappe.realtime.has_permission — 25ms
+	    POST /api/method/frappe.desk.form.save.savedocs — 775ms
+	    GET /api/method/frappe.realtime.has_permission — 6ms
+
+	Of those three, only the savedocs is a user action. The two
+	has_permission entries are the Desk polling for realtime
+	subscription permission and should be filtered out of the
+	reproducer (still visible in the per-action table)."""
+	import json as _json
+	from frappe_profiler.analyze import _build_auto_notes_html
+
+	recordings = [
+		{
+			"method": "GET",
+			"path": "/api/method/frappe.realtime.has_permission",
+			"cmd": "frappe.realtime.has_permission",
+			"duration": 25.0,
+			"calls": [],
+		},
+		{
+			"method": "POST",
+			"path": "/api/method/frappe.desk.form.save.savedocs",
+			"cmd": "frappe.desk.form.save.savedocs",
+			"duration": 774.8,
+			"calls": [],
+			"form_dict": {
+				"doc": _json.dumps({
+					"doctype": "Sales Invoice",
+					"__islocal": 1,
+				}),
+				"action": "Save",
+			},
+		},
+		{
+			"method": "GET",
+			"path": "/api/method/frappe.realtime.has_permission",
+			"cmd": "frappe.realtime.has_permission",
+			"duration": 6.0,
+			"calls": [],
+		},
+	]
+
+	html_out = _build_auto_notes_html(recordings)
+	# Only the savedocs survives — humanized as "Create Sales Invoice".
+	assert "Create Sales Invoice" in html_out
+	assert "774.8 ms" in html_out
+	# Polling endpoints filtered out
+	assert "has_permission" not in html_out
+	assert "frappe.realtime" not in html_out
+	# Footer tells the user noise was filtered so they don't wonder
+	# why only 1 entry showed from a 3-request session.
+	assert "2 background / polling request(s) filtered" in html_out
+
+
+def test_auto_notes_filters_static_assets_and_form_load_boilerplate():
+	"""Static /assets/ requests and form-metadata loads are noise too."""
+	from frappe_profiler.analyze import _build_auto_notes_html
+
+	recordings = [
+		{
+			"method": "GET",
+			"path": "/assets/frappe/dist/js/desk.bundle.js",
+			"cmd": None,
+			"duration": 180,
+			"calls": [],
+		},
+		{
+			"method": "GET",
+			"path": "/api/method/frappe.desk.form.load.getdoctype",
+			"cmd": "frappe.desk.form.load.getdoctype",
+			"duration": 120,
+			"calls": [],
+			"form_dict": {"doctype": "Sales Invoice"},
+		},
+		{
+			"method": "POST",
+			"path": "/api/method/frappe.client.submit",
+			"cmd": "frappe.client.submit",
+			"duration": 500,
+			"calls": [],
+			"form_dict": {"doctype": "Sales Invoice"},
+		},
+	]
+	html_out = _build_auto_notes_html(recordings)
+	assert "Submit Sales Invoice" in html_out
+	assert "desk.bundle.js" not in html_out
+	assert "getdoctype" not in html_out
+	assert "2 background / polling" in html_out
+
+
+def test_auto_notes_all_noise_returns_empty_string():
+	"""A session of only polling/noise returns empty — the caller
+	then leaves the notes field blank rather than filling it with
+	the preamble and an empty list."""
+	from frappe_profiler.analyze import _build_auto_notes_html
+
+	recordings = [
+		{
+			"method": "GET",
+			"path": "/api/method/frappe.realtime.has_permission",
+			"cmd": "frappe.realtime.has_permission",
+			"duration": 5.0,
+			"calls": [],
+		}
+	] * 20
+	html_out = _build_auto_notes_html(recordings)
+	assert html_out == ""
+
+
+def test_auto_notes_real_user_sequence_reads_naturally():
+	"""End-to-end: a realistic flow produces a human-readable
+	reproducer that reads like a story, not an HTTP log."""
+	import json as _json
+	from frappe_profiler.analyze import _build_auto_notes_html
+
+	recordings = [
+		# User searches for an item
+		{
+			"method": "GET",
+			"path": "/api/method/frappe.desk.search.search_link",
+			"cmd": "frappe.desk.search.search_link",
+			"duration": 28,
+			"calls": [],
+			"form_dict": {"doctype": "Item"},
+		},
+		# User opens a customer
+		{
+			"method": "GET",
+			"path": "/api/method/frappe.desk.form.load.getdoc",
+			"cmd": "frappe.desk.form.load.getdoc",
+			"duration": 62,
+			"calls": [],
+			"form_dict": {"doctype": "Customer", "name": "CUST-001"},
+		},
+		# (permission polling — filtered)
+		{
+			"method": "GET",
+			"path": "/api/method/frappe.realtime.has_permission",
+			"cmd": "frappe.realtime.has_permission",
+			"duration": 4,
+			"calls": [],
+		},
+		# User creates a new Sales Invoice
+		{
+			"method": "POST",
+			"path": "/api/method/frappe.desk.form.save.savedocs",
+			"cmd": "frappe.desk.form.save.savedocs",
+			"duration": 320,
+			"calls": [],
+			"form_dict": {
+				"doc": _json.dumps({
+					"doctype": "Sales Invoice",
+					"__islocal": 1,
+				}),
+				"action": "Save",
+			},
+		},
+		# User submits it
+		{
+			"method": "POST",
+			"path": "/api/method/frappe.desk.form.save.savedocs",
+			"cmd": "frappe.desk.form.save.savedocs",
+			"duration": 410,
+			"calls": [],
+			"form_dict": {
+				"doc": _json.dumps({
+					"doctype": "Sales Invoice",
+					"name": "SINV-00042",
+				}),
+				"action": "Submit",
+			},
+		},
+	]
+	html_out = _build_auto_notes_html(recordings)
+
+	# The whole story shows up in order, and reads like English.
+	for expected in (
+		"Search Item",
+		"Open Customer CUST-001",
+		"Create Sales Invoice",
+		"Submit Sales Invoice",
+	):
+		assert expected in html_out, (
+			f"Expected '{expected}' in reproducer; got: {html_out!r}"
+		)
+
+	# And the noise is gone.
+	assert "has_permission" not in html_out
+	assert "1 background / polling" in html_out
+
+
 def test_start_dialog_no_longer_asks_for_notes():
 	"""The 'Steps to reproduce' field has been removed from the start
 	dialog. Users can still see / edit the auto-generated notes on the
