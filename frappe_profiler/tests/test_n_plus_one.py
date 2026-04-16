@@ -468,6 +468,145 @@ def test_user_code_routed_through_profiler_wrap_still_attributed(empty_context):
 	assert detail["callsite"]["lineno"] == 42
 
 
+def test_is_profiler_own_query_matches_bench_relative_paths():
+	"""v0.5.1 bug: is_profiler_own_query used startswith() and missed
+	the bench-layout path format ``apps/frappe_profiler/frappe_profiler
+	/capture.py`` that pyinstrument produces on some sites. Fixed by
+	switching to substring match. Regression test uses the exact
+	shapes that were leaking through.
+	"""
+	from frappe_profiler.analyzers.base import is_profiler_own_query
+
+	# Bench-relative paths: apps/<app>/<module>/...
+	bench_stack = [
+		{"filename": "apps/frappe/frappe/app.py", "lineno": 120, "function": "dispatch"},
+		{
+			"filename": "apps/frappe_profiler/frappe_profiler/infra_capture.py",
+			"lineno": 176,
+			"function": "_read_db",
+		},
+		{
+			"filename": "apps/frappe/frappe/database/mariadb/database.py",
+			"lineno": 742,
+			"function": "sql",
+		},
+	]
+	assert is_profiler_own_query(bench_stack) is True, (
+		"Bench-relative apps/frappe_profiler/... path must be detected "
+		"as profiler-own. startswith() would have missed this shape."
+	)
+
+	# Absolute path format
+	abs_stack = [
+		{
+			"filename": "/Users/navin/office/frappe_bench/apps/frappe/frappe/app.py",
+			"lineno": 120, "function": "dispatch",
+		},
+		{
+			"filename": "/Users/navin/office/frappe_bench/apps/frappe_profiler/frappe_profiler/capture.py",
+			"lineno": 88, "function": "wrap",
+		},
+	]
+	assert is_profiler_own_query(abs_stack) is True
+
+	# User frame present in bench-relative stack → NOT profiler own
+	user_bench_stack = [
+		{"filename": "apps/frappe/frappe/app.py", "lineno": 120, "function": "dispatch"},
+		{
+			"filename": "apps/myapp/controllers/import.py",
+			"lineno": 42, "function": "do_import",
+		},
+		{
+			"filename": "apps/frappe_profiler/frappe_profiler/capture.py",
+			"lineno": 88, "function": "wrap",
+		},
+		{
+			"filename": "apps/frappe/frappe/database/mariadb/database.py",
+			"lineno": 742, "function": "sql",
+		},
+	]
+	assert is_profiler_own_query(user_bench_stack) is False
+
+
+def test_walk_callsite_bench_path_profiler_stack_returns_none():
+	"""End-to-end guard: a stack of apps/frappe/... + apps/frappe_profiler/...
+	frames must route through walk_callsite's fallback and return None
+	(not return a profiler frame as the blame callsite). Pre-v0.5.1
+	this was the leak that caused 'Framework N+1 at
+	apps/frappe_profiler/frappe_profiler/infra_capture.py:176' to
+	still appear in production reports even after the previous
+	fixes."""
+	from frappe_profiler.analyzers.base import walk_callsite
+
+	stack = [
+		{
+			"filename": "apps/frappe/frappe/hooks.py",
+			"lineno": 10, "function": "run_request_hooks",
+		},
+		{
+			"filename": "apps/frappe_profiler/frappe_profiler/hooks_callbacks.py",
+			"lineno": 164, "function": "before_request",
+		},
+		{
+			"filename": "apps/frappe_profiler/frappe_profiler/infra_capture.py",
+			"lineno": 176, "function": "_read_db",
+		},
+	]
+	assert walk_callsite(stack) is None, (
+		"walk_callsite must return None for bench-relative profiler "
+		"stacks so n_plus_one drops the query — otherwise a "
+		"Framework N+1 finding gets emitted blaming the profiler's "
+		"own code."
+	)
+
+
+def test_n_plus_one_bench_relative_profiler_stack_produces_no_finding(empty_context):
+	"""Regression guard: the exact call shape from the user's
+	production report — ``apps/frappe_profiler/frappe_profiler/
+	infra_capture.py`` stacks — must produce zero findings (neither
+	normal N+1 Query nor Framework N+1)."""
+	recording = {
+		"uuid": "bench-profiler-leak",
+		"path": "/",
+		"cmd": None,
+		"method": "GET",
+		"event_type": "HTTP Request",
+		"duration": 200,
+		"calls": [
+			{
+				"query": "SHOW GLOBAL STATUS WHERE Variable_name IN (...)",
+				"normalized_query": "SHOW GLOBAL STATUS WHERE Variable_name IN (...)",
+				"duration": 1.5,
+				"stack": [
+					{
+						"filename": "apps/frappe/frappe/app.py",
+						"lineno": 202, "function": "init_request",
+					},
+					{
+						"filename": "apps/frappe_profiler/frappe_profiler/hooks_callbacks.py",
+						"lineno": 164, "function": "before_request",
+					},
+					{
+						"filename": "apps/frappe_profiler/frappe_profiler/infra_capture.py",
+						"lineno": 176, "function": "_read_db",
+					},
+					{
+						"filename": "apps/frappe/frappe/database/mariadb/database.py",
+						"lineno": 742, "function": "sql",
+					},
+				],
+			}
+		] * 22,  # 22 occurrences — matches the reported count
+	}
+	result = n_plus_one.analyze([recording], empty_context)
+	# No findings of EITHER type — the profiler's own queries are
+	# filtered entirely before the framework-vs-user routing.
+	assert result.findings == [], (
+		"Profiler's own bench-relative stack must produce zero findings; "
+		f"got: {[(f['finding_type'], f['title']) for f in result.findings]}"
+	)
+
+
 def test_is_profiler_own_query_unit():
 	"""Direct unit test of the helper — clearer than going through
 	the full n_plus_one pipeline for each branch."""

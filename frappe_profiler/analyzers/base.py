@@ -90,13 +90,20 @@ def is_profiler_own_query(stack: list | None) -> bool:
 	for frame in reversed(stack):
 		if not isinstance(frame, dict):
 			continue
-		filename = frame.get("filename") or ""
+		filename = (frame.get("filename") or "").replace("\\", "/")
 		if not filename:
 			continue
-		if filename.startswith("frappe_profiler/"):
+		# v0.5.1: substring (not startswith) so we match bench-relative
+		# paths like ``apps/frappe_profiler/frappe_profiler/capture.py``
+		# and absolute paths like ``/Users/.../apps/frappe_profiler/...``
+		# in addition to pyinstrument's ``frappe_profiler/capture.py``
+		# short form. startswith missed both the bench and absolute
+		# shapes, letting profiler frames slip through to be blamed
+		# as Framework N+1 findings.
+		if "frappe_profiler/" in filename:
 			has_profiler_frame = True
 			continue
-		if filename.startswith("frappe/"):
+		if "frappe/" in filename:
 			# Keep walking — the profiler or user code may be further out.
 			continue
 		# Non-framework frame — this is user code; the query's origin
@@ -136,11 +143,14 @@ def walk_callsite(stack: list | None) -> dict | None:
 	for frame in reversed(stack):
 		if not isinstance(frame, dict):
 			continue
-		filename = frame.get("filename") or ""
+		filename = (frame.get("filename") or "").replace("\\", "/")
 		lineno = frame.get("lineno")
 		if not filename or lineno is None:
 			continue
-		if any(filename.startswith(prefix) for prefix in FRAMEWORK_PREFIXES):
+		# v0.5.1: substring (not startswith) matches bench and absolute
+		# path shapes in addition to pyinstrument's short form. See the
+		# matching fix in is_profiler_own_query for context.
+		if any(prefix in filename for prefix in FRAMEWORK_PREFIXES):
 			continue
 		return frame
 
