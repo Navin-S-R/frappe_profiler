@@ -389,6 +389,186 @@ def test_filesort_above_floor_still_flagged(empty_context):
 	assert len(filesorts) == 1
 
 
+# ---------------------------------------------------------------------------
+# v0.5.2: callsite + alias filtering
+# ---------------------------------------------------------------------------
+# A production report had 70+ "Full table scan on <tabSomething>"
+# findings and dozens of "Full table scan on a / c / p / addr" findings.
+# The framework-table ones came from Frappe/ERPNext internal queries the
+# user can't patch; the single-letter ones were SQL JOIN aliases the user
+# can't index at all. Both classes now get filtered.
+
+
+def test_full_scan_from_framework_callsite_is_suppressed(empty_context):
+	"""The query lives inside frappe/model/document.py — user can't
+	add an index to fix a Frappe framework query. Skip the findings
+	for this call entirely (Full Scan + whatever else)."""
+	recording = {
+		"uuid": "fw-scan",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 500,
+		"calls": [{
+			"query": "SELECT * FROM `tabAccounting Dimension`",
+			"normalized_query": "SELECT * FROM `tabAccounting Dimension`",
+			"duration": 150.0,
+			"stack": [
+				{"filename": "frappe/app.py", "lineno": 120, "function": "app"},
+				{"filename": "frappe/model/document.py", "lineno": 300, "function": "load_from_db"},
+				{"filename": "frappe/cache_manager.py", "lineno": 50, "function": "get_doc"},
+			],
+			"explain_result": [{
+				"table": "tabAccounting Dimension",
+				"type": "ALL",
+				"rows": 50000,
+				"Extra": "",
+			}],
+		}],
+	}
+	result = explain_flags.analyze([recording], empty_context)
+	scans = [f for f in result.findings if f["finding_type"] == "Full Table Scan"]
+	assert scans == [], (
+		"Full Table Scan finding from a frappe/* callsite must be "
+		"suppressed — user can't add an index to fix a framework "
+		f"query. Got: {[f['title'] for f in scans]}"
+	)
+	# And the suppression surfaces as a warning so the user knows
+	# why they don't see this in the findings list.
+	assert any(
+		"Frappe framework code" in w for w in result.warnings
+	), f"Expected framework-callsite warning; got: {result.warnings}"
+
+
+def test_alias_table_name_is_suppressed(empty_context):
+	"""EXPLAIN rows for JOIN queries often have the table field as
+	a single-letter alias ('a', 'c', 'ap'). 'Full table scan on a'
+	isn't actionable — the user can't index an alias."""
+	recording = {
+		"uuid": "alias-scan",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 200,
+		"calls": [{
+			"query": "SELECT * FROM tabItem a JOIN tabItem_Price c ON a.name = c.item",
+			"normalized_query": (
+				"SELECT * FROM tabItem a JOIN tabItem_Price c "
+				"ON a.name = c.item"
+			),
+			"duration": 80.0,
+			"stack": [
+				{"filename": "apps/myapp/controllers/sync.py", "lineno": 42,
+				 "function": "sync_prices"},
+			],
+			"explain_result": [
+				# Alias "a" and "c" — both should be dropped.
+				{"table": "a", "type": "ALL", "rows": 50000, "Extra": ""},
+				{"table": "c", "type": "ALL", "rows": 50000, "Extra": ""},
+			],
+		}],
+	}
+	result = explain_flags.analyze([recording], empty_context)
+	scans = [f for f in result.findings if f["finding_type"] == "Full Table Scan"]
+	assert scans == [], (
+		"Single-letter aliases 'a' / 'c' must be suppressed as "
+		f"un-indexable. Got: {[f['title'] for f in scans]}"
+	)
+	# Warning should mention the alias suppression.
+	assert any("alias" in w.lower() for w in result.warnings), (
+		f"Expected alias-suppression warning; got: {result.warnings}"
+	)
+
+
+def test_alias_helper_distinguishes_real_tables_from_aliases():
+	"""Direct unit test of the _is_likely_alias helper."""
+	from frappe_profiler.analyzers.explain_flags import _is_likely_alias
+
+	# REAL tables — kept
+	for real in (
+		"tabItem", "tabSales Invoice", "tabCustom Field", "tabDocType",
+		"MyCustomTable",       # capital letters → real
+		"some_log_table",      # has underscore → real
+	):
+		assert _is_likely_alias(real) is False, (
+			f"{real!r} is a real table and must NOT be classified as alias"
+		)
+
+	# ALIASES — filtered
+	for alias in ("a", "c", "p", "ap", "cd", "addr", "d"):
+		assert _is_likely_alias(alias) is True, (
+			f"{alias!r} is a SQL alias and should be filtered"
+		)
+
+	# MariaDB synthetic derived/subquery markers
+	for synthetic in ("<derived2>", "<subquery1>", "<union3,4>"):
+		assert _is_likely_alias(synthetic) is True
+
+	# Edge cases
+	assert _is_likely_alias("") is True
+	assert _is_likely_alias(None) is True
+
+
+def test_user_code_callsite_still_emits_findings(empty_context):
+	"""Positive case: a Full Scan from genuine user-app code
+	(apps/myapp/...) must still produce a finding. The filter is
+	narrow — it only removes framework + alias noise, not real
+	findings."""
+	recording = {
+		"uuid": "user-scan",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 500,
+		"calls": [{
+			"query": "SELECT * FROM tabCustomInvoice WHERE status = ?",
+			"normalized_query": "SELECT * FROM tabCustomInvoice WHERE status = ?",
+			"duration": 200.0,
+			"stack": [
+				{"filename": "apps/myapp/reports/overdue.py", "lineno": 55,
+				 "function": "collect"},
+			],
+			"explain_result": [{
+				"table": "tabCustomInvoice",
+				"type": "ALL",
+				"rows": 50000,
+				"Extra": "",
+			}],
+		}],
+	}
+	result = explain_flags.analyze([recording], empty_context)
+	scans = [f for f in result.findings if f["finding_type"] == "Full Table Scan"]
+	assert len(scans) == 1, (
+		"User-code Full Scan must still produce a finding. "
+		f"Got: {[f['title'] for f in result.findings]}"
+	)
+	assert "tabCustomInvoice" in scans[0]["title"]
+
+
+def test_no_stack_falls_through_to_legacy_behavior(empty_context):
+	"""Pre-v0.5.2 recordings might not have a `stack` on each call.
+	The framework-callsite filter must gracefully pass these
+	through (emit findings as before) rather than dropping them."""
+	recording = {
+		"uuid": "nostack",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 500,
+		"calls": [{
+			"query": "SELECT * FROM tabItem WHERE name = ?",
+			"normalized_query": "SELECT * FROM tabItem WHERE name = ?",
+			"duration": 150.0,
+			# NOTE: no "stack" field — pre-v0.5.2 recording.
+			"explain_result": [{
+				"table": "tabItem",
+				"type": "ALL",
+				"rows": 50000,
+				"Extra": "",
+			}],
+		}],
+	}
+	result = explain_flags.analyze([recording], empty_context)
+	scans = [f for f in result.findings if f["finding_type"] == "Full Table Scan"]
+	assert len(scans) == 1, (
+		"Missing stack must not drop findings — legacy recordings "
+		"should emit findings as before. "
+		f"Got: {[f['title'] for f in result.findings]}"
+	)
+
+
 def test_filtered_as_string_does_not_crash(empty_context):
 	"""`filtered` can also arrive as a string from some drivers.
 	Must coerce cleanly, not crash."""
