@@ -360,6 +360,248 @@ def test_savedocs_missing_action_falls_back_to_bare_cmd(empty_context):
 	)
 
 
+# ---------------------------------------------------------------------------
+# v0.5.2: action-suffix for run_doc_method + apply_workflow
+# ---------------------------------------------------------------------------
+# Both cmds route multiple semantically-different operations into one
+# endpoint (like savedocs). Without disambiguation, 20 distinct custom
+# buttons in an ERPNext session merge into a single "run_doc_method"
+# row in the per-action table. Same for workflow Approve/Reject/etc.
+
+
+def test_run_doc_method_appends_method_name_in_technical_label(empty_context):
+	"""Custom action buttons call run_doc_method with the real
+	method name in form_dict.method. Technical label gets it as
+	a suffix."""
+	rec = {
+		"uuid": "rdm",
+		"cmd": "run_doc_method",
+		"method": "POST",
+		"path": "/api/method/run_doc_method",
+		"event_type": "HTTP Request",
+		"duration": 420,
+		"calls": [],
+		"form_dict": {
+			"method": "make_payment_entry",
+			"dt": "Sales Invoice",
+			"dn": "SINV-001",
+		},
+	}
+	result = per_action.analyze([rec], empty_context)
+	assert (
+		result.actions[0]["action_label"]
+		== "run_doc_method:make_payment_entry"
+	)
+
+
+def test_run_doc_method_variants_all_disambiguate(empty_context):
+	"""Frappe routes run_doc_method via three different cmd paths
+	depending on the caller. All three must get the suffix."""
+	for cmd_variant in (
+		"run_doc_method",
+		"frappe.handler.run_doc_method",
+		"frappe.client.run_doc_method",
+	):
+		rec = {
+			"uuid": cmd_variant.replace(".", "-"),
+			"cmd": cmd_variant,
+			"method": "POST",
+			"path": f"/api/method/{cmd_variant}",
+			"event_type": "HTTP Request",
+			"duration": 100,
+			"calls": [],
+			"form_dict": {"method": "send_email"},
+		}
+		result = per_action.analyze([rec], empty_context)
+		assert (
+			result.actions[0]["action_label"]
+			== f"{cmd_variant}:send_email"
+		), f"variant {cmd_variant} failed to get suffix"
+
+
+def test_apply_workflow_appends_action_name_in_technical_label(empty_context):
+	"""Workflow transitions use apply_workflow with form_dict.action
+	('Approve', 'Reject', 'Submit for Approval'). Technical label
+	gets the action as a suffix."""
+	import json
+	rec = {
+		"uuid": "wf",
+		"cmd": "frappe.model.workflow.apply_workflow",
+		"method": "POST",
+		"path": "/api/method/frappe.model.workflow.apply_workflow",
+		"event_type": "HTTP Request",
+		"duration": 180,
+		"calls": [],
+		"form_dict": {
+			"doc": json.dumps({"doctype": "Leave Application", "name": "LA-001"}),
+			"action": "Approve",
+		},
+	}
+	result = per_action.analyze([rec], empty_context)
+	assert (
+		result.actions[0]["action_label"]
+		== "frappe.model.workflow.apply_workflow:Approve"
+	)
+
+
+def test_apply_workflow_allows_multi_word_action(empty_context):
+	"""Workflow action names can be multi-word like 'Submit for
+	Approval'. The suffix validator permits spaces up to the
+	60-char cap."""
+	import json
+	rec = {
+		"uuid": "wf2",
+		"cmd": "frappe.model.workflow.apply_workflow",
+		"method": "POST",
+		"path": "/api/method/frappe.model.workflow.apply_workflow",
+		"event_type": "HTTP Request",
+		"duration": 180,
+		"calls": [],
+		"form_dict": {
+			"doc": json.dumps({"doctype": "Purchase Order"}),
+			"action": "Submit for Approval",
+		},
+	}
+	result = per_action.analyze([rec], empty_context)
+	assert (
+		result.actions[0]["action_label"]
+		== "frappe.model.workflow.apply_workflow:Submit for Approval"
+	)
+
+
+def test_run_doc_method_garbage_method_falls_back(empty_context):
+	"""Safety rail: a weird method name (non-identifier chars) must
+	NOT produce an unbounded suffix. Fall back to bare cmd."""
+	rec = {
+		"uuid": "weird",
+		"cmd": "run_doc_method",
+		"method": "POST",
+		"path": "/api/method/run_doc_method",
+		"event_type": "HTTP Request",
+		"duration": 100,
+		"calls": [],
+		"form_dict": {"method": "<script>alert(1)</script>"},
+	}
+	result = per_action.analyze([rec], empty_context)
+	assert result.actions[0]["action_label"] == "run_doc_method"
+
+
+def test_apply_workflow_too_long_action_falls_back(empty_context):
+	"""Safety rail: >60 chars fails validation, falls back to
+	bare cmd."""
+	import json
+	rec = {
+		"uuid": "long",
+		"cmd": "frappe.model.workflow.apply_workflow",
+		"method": "POST",
+		"path": "/api/method/frappe.model.workflow.apply_workflow",
+		"event_type": "HTTP Request",
+		"duration": 100,
+		"calls": [],
+		"form_dict": {
+			"doc": json.dumps({"doctype": "X"}),
+			"action": "A" * 61,
+		},
+	}
+	result = per_action.analyze([rec], empty_context)
+	assert (
+		result.actions[0]["action_label"]
+		== "frappe.model.workflow.apply_workflow"
+	)
+
+
+def test_run_doc_method_distinct_buttons_produce_distinct_labels(empty_context):
+	"""End-to-end: three different custom buttons on Sales Invoice
+	in one session must produce THREE different action_labels.
+	This is the readability win over bare 'run_doc_method × 3'."""
+	recs = []
+	for method_name in ("make_payment_entry", "send_email", "update_items"):
+		recs.append({
+			"uuid": method_name,
+			"cmd": "run_doc_method",
+			"method": "POST",
+			"path": "/api/method/run_doc_method",
+			"event_type": "HTTP Request",
+			"duration": 100,
+			"calls": [],
+			"form_dict": {
+				"method": method_name,
+				"dt": "Sales Invoice",
+				"dn": "SINV-001",
+			},
+		})
+	result = per_action.analyze(recs, empty_context)
+	labels = [a["action_label"] for a in result.actions]
+	assert len(set(labels)) == 3, (
+		f"Three distinct custom-button methods must produce three "
+		f"distinct labels; got: {labels}"
+	)
+
+
+# --- humanized_label variants for the Steps-to-Reproduce section ---
+
+
+def test_humanized_run_doc_method_with_doctype_and_name():
+	"""Make Payment Entry button on Sales Invoice SINV-001
+	renders as English prose in the Steps-to-Reproduce section."""
+	rec = {
+		"uuid": "rdm",
+		"cmd": "run_doc_method",
+		"method": "POST",
+		"path": "/api/method/run_doc_method",
+		"event_type": "HTTP Request",
+		"duration": 420,
+		"calls": [],
+		"form_dict": {
+			"method": "make_payment_entry",
+			"dt": "Sales Invoice",
+			"dn": "SINV-001",
+		},
+	}
+	assert (
+		per_action.humanized_label(rec)
+		== "Make Payment Entry on Sales Invoice SINV-001"
+	)
+
+
+def test_humanized_run_doc_method_without_docname():
+	rec = {
+		"uuid": "rdm",
+		"cmd": "run_doc_method",
+		"method": "POST",
+		"path": "/api/method/run_doc_method",
+		"event_type": "HTTP Request",
+		"duration": 100,
+		"calls": [],
+		"form_dict": {
+			"method": "update_items",
+			"dt": "Sales Invoice",
+		},
+	}
+	assert (
+		per_action.humanized_label(rec)
+		== "Update Items on Sales Invoice"
+	)
+
+
+def test_humanized_apply_workflow_with_doctype():
+	import json
+	rec = {
+		"uuid": "wf",
+		"cmd": "frappe.model.workflow.apply_workflow",
+		"method": "POST",
+		"path": "/api/method/frappe.model.workflow.apply_workflow",
+		"event_type": "HTTP Request",
+		"duration": 180,
+		"calls": [],
+		"form_dict": {
+			"doc": json.dumps({"doctype": "Leave Application", "name": "LA-001"}),
+			"action": "Approve",
+		},
+	}
+	assert per_action.humanized_label(rec) == "Approve Leave Application"
+
+
 def test_humanization_does_not_leak_into_per_action_table(empty_context):
 	"""Guard: the per-action table must stay on the technical label.
 	User feedback was explicit: humanize only in Steps to Reproduce.
