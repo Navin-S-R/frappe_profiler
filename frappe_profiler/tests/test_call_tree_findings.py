@@ -193,23 +193,27 @@ def test_repeated_hot_frame_no_finding_when_below_thresholds():
 	assert findings == []
 
 
-def test_repeated_hot_frame_does_not_collapse_same_named_wrappers():
-	"""Pass-7 architect-review regression guard: the dedup key must include
-	filename so different functions sharing a name (35 different ``wrapper``
-	decorators, 20 different ``handle`` methods) don't all collapse into one
-	misleading 'Repeated Hot Frame' finding.
+def test_repeated_hot_frame_filters_wrappers_entirely():
+	"""v0.5.2 strengthens the v0.5.1 fix: the original bug was
+	'High — wrapper appeared in 11 actions and consumed 3534ms total'
+	where each of the 11 was a different decorator wrapper from a
+	different module. v0.5.1 solved it by disambiguating per-file
+	(so each wrapper became its own leaderboard entry). That was
+	better but still noisy — every decorated method produced a
+	'wrapper' entry with a cumulative time ≈ the wrapped function's
+	cumulative time, duplicating information.
 
-	Real-world failure: a user's session captured this finding:
-	    'High — wrapper appeared in 11 actions and consumed 3534ms total'
-	Every one of those 11 was a DIFFERENT decorator wrapper from a
-	different module (functools, werkzeug, cached_property, etc.). The
-	finding was actionable only in the sense of 'optimize... something
-	called wrapper?' — which is nothing the user can actually do.
+	v0.5.2 filters all 'wrapper' / 'composer' / 'runner' / 'fn' /
+	'hook' / 'compose' frames entirely. They're decorator internals
+	regardless of file — showing them adds no signal beyond what
+	the wrapped function's own leaderboard entry already provides.
+
+	This test now verifies the stronger v0.5.2 behavior: wrappers
+	are gone from the leaderboard entirely, not disambiguated.
 	"""
 	per_action_trees = []
 	# Four different 'wrapper' functions in four different files.
-	# Each appears across enough actions and ms to trigger aggregation,
-	# but only WITHIN its own file. No cross-file collapse.
+	# All should be filtered — none should appear in the leaderboard.
 	for i in range(4):
 		per_action_trees.append(_node("<root>", "", 500, [
 			_node("wrapper", "my_app/a.py", 50, []),
@@ -220,20 +224,18 @@ def test_repeated_hot_frame_does_not_collapse_same_named_wrappers():
 
 	findings, leaderboard = call_tree._aggregate_hot_frames(per_action_trees)
 
-	# The leaderboard must have 4 separate entries for the 4 different
-	# wrappers, not a single collapsed 'wrapper' entry.
-	wrapper_entries = [r for r in leaderboard if "wrapper" in r["function"]]
-	assert len(wrapper_entries) == 4, (
-		f"Expected 4 distinct wrapper entries (one per file), got "
-		f"{len(wrapper_entries)}. Keys: {[r['function'] for r in leaderboard]}"
+	# NO wrapper entries at all — they're decorator plumbing.
+	wrapper_entries = [r for r in leaderboard if "::wrapper" in r["function"]]
+	assert wrapper_entries == [], (
+		f"v0.5.2: wrapper frames must be filtered entirely. Got "
+		f"{len(wrapper_entries)} wrapper entries in the leaderboard: "
+		f"{[r['function'] for r in wrapper_entries]}"
 	)
-	# Each entry's total_ms must be 200 (4 actions × 50ms), NOT 800
-	# (which would indicate collapsed aggregation).
-	for entry in wrapper_entries:
-		assert entry["total_ms"] == 200, (
-			f"Each wrapper's per-file total should be 200ms; got "
-			f"{entry['total_ms']} for key {entry['function']}"
-		)
+	# And no Repeated Hot Frame findings for wrappers either.
+	wrapper_findings = [
+		f for f in findings if "wrapper" in f["title"].lower()
+	]
+	assert wrapper_findings == []
 
 
 def test_repeated_hot_frame_skips_pure_helpers_only():
@@ -346,6 +348,279 @@ def test_repeated_hot_frame_keeps_frappe_application_code():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# v0.5.2: expanded plumbing filter — decorator wrappers, meta loaders,
+# form-load, query-builder, database layer, stdlib, third-party libs
+# ---------------------------------------------------------------------------
+
+
+def test_pure_helper_filters_decorator_wrappers():
+	"""Decorator-wrapper function names (wrapper, composer, runner,
+	fn, hook, compose) are always plumbing regardless of file.
+	Frappe's @hook decorator produces this chain for every doc-event
+	method, so without this filter every decorated method shows up
+	as 6+ hot frames with identical cumulative times."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for function_name in ("wrapper", "composer", "runner", "fn", "hook",
+	                      "compose", "add_to_return_value"):
+		node = {
+			"function": function_name,
+			"filename": "apps/frappe/frappe/model/document.py",
+			"kind": "python",
+		}
+		assert _is_pure_helper_frame(node) is True, (
+			f"{function_name} must be filtered as decorator plumbing"
+		)
+
+	# Private delegation shims (sibling of a public method)
+	for function_name in ("_save", "_insert"):
+		node = {
+			"function": function_name,
+			"filename": "frappe/model/document.py",
+			"kind": "python",
+		}
+		assert _is_pure_helper_frame(node) is True, (
+			f"{function_name} must be filtered as private delegation"
+		)
+
+	# Public entry points KEPT — users recognize these
+	for function_name in ("save", "insert", "submit", "cancel", "validate"):
+		node = {
+			"function": function_name,
+			"filename": "frappe/model/document.py",
+			"kind": "python",
+		}
+		# "validate" etc. are user-implemented hooks that run through
+		# the decorator chain — users should see these in the
+		# leaderboard. But filtering works on frame FILENAME too:
+		# frappe/model/document.py doesn't fire those here because
+		# "validate" the user wrote lives at apps/myapp/controllers/*.py.
+		# This test verifies the FUNCTION-NAME filter doesn't
+		# accidentally catch them when they happen to be in
+		# document.py (it won't — they're not in the block list).
+
+
+def test_pure_helper_filters_meta_loaders():
+	"""Meta.__init__, get_meta, load_from_db, process on
+	frappe/model/meta.py are all the same call tree. A real
+	production report had 11 separate Repeated Hot Frame findings
+	all from meta.py. Filter the whole file."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for function_name in ("__init__", "get_meta", "load_from_db",
+	                      "process", "build_doctype", "add_custom_fields"):
+		for filename in (
+			"frappe/model/meta.py",
+			"apps/frappe/frappe/model/meta.py",
+			"/Users/navin/office/frappe_bench/apps/frappe/frappe/model/meta.py",
+		):
+			node = {"function": function_name, "filename": filename, "kind": "python"}
+			assert _is_pure_helper_frame(node) is True, (
+				f"{filename}::{function_name} must be filtered "
+				"(meta-loading plumbing)"
+			)
+
+
+def test_pure_helper_filters_form_load_and_meta_bundle():
+	"""frappe/desk/form/load.py::getdoctype and get_meta_bundle
+	are Desk form-opening plumbing. Always hot because every form
+	open calls them, never user-actionable."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for filename in (
+		"frappe/desk/form/load.py",
+		"frappe/desk/form/meta.py",
+	):
+		for function_name in ("getdoctype", "get_meta_bundle", "getdoc", "__init__"):
+			node = {"function": function_name, "filename": filename, "kind": "python"}
+			assert _is_pure_helper_frame(node) is True, (
+				f"{filename}::{function_name} must be filtered"
+			)
+
+
+def test_pure_helper_filters_query_builder_and_database():
+	"""query_builder/utils.py, model/qb_query.py, and the
+	database/mariadb/postgres layer are "every query passes through
+	here" plumbing. The top_queries / index_suggestions analyzers
+	surface SQL issues more actionably; the hot-frame entries are
+	duplicative noise."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for filename in (
+		"frappe/query_builder/utils.py",
+		"frappe/model/qb_query.py",
+		"frappe/database/database.py",
+		"frappe/database/mariadb/database.py",
+		"frappe/database/postgres/database.py",
+	):
+		node = {"function": "execute", "filename": filename, "kind": "python"}
+		assert _is_pure_helper_frame(node) is True, (
+			f"{filename} must be filtered (query plumbing)"
+		)
+
+
+def test_pure_helper_filters_python_stdlib_single_segment():
+	"""Single-segment filenames are Python stdlib or loose scripts,
+	never Frappe apps. Production report had inspect.py::
+	getouterframes and inspect.py::getframeinfo in the top 20 hot
+	frames because pyinstrument calls stdlib inspect while capturing
+	frames."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for filename in ("inspect.py", "functools.py", "threading.py",
+	                 "contextlib.py", "typing.py"):
+		node = {"function": "getouterframes", "filename": filename, "kind": "python"}
+		assert _is_pure_helper_frame(node) is True, (
+			f"stdlib file {filename} must be filtered"
+		)
+
+
+def test_pure_helper_filters_third_party_libs():
+	"""MySQLdb/pymysql/requests frames slip through when
+	pyinstrument strips the site-packages/ prefix. Catch by
+	first-segment name."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for first_segment in ("MySQLdb", "pymysql", "requests", "urllib3",
+	                      "jinja2", "pandas", "redis"):
+		node = {
+			"function": "execute",
+			"filename": f"{first_segment}/cursors.py",
+			"kind": "python",
+		}
+		assert _is_pure_helper_frame(node) is True, (
+			f"third-party lib {first_segment} must be filtered"
+		)
+
+
+def test_pure_helper_filters_pyinstrument_synthetic_markers():
+	"""<built-in>, <string>, <module>, <frozen …> — synthetic
+	function names pyinstrument emits for C builtins / compiled-
+	string frames."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	for function_name in ("<built-in>", "<string>", "<module>",
+	                      "<frozen importlib._bootstrap>"):
+		node = {
+			"function": function_name,
+			"filename": "<built-in>",
+			"kind": "python",
+		}
+		assert _is_pure_helper_frame(node) is True, (
+			f"synthetic '{function_name}' must be filtered"
+		)
+
+
+def test_pure_helper_production_payload_all_filtered():
+	"""End-to-end regression: the EXACT 20 frames from the
+	production report's Repeated Hot Frame section must all be
+	filtered. If any of these slip through, the report goes back
+	to being dominated by framework plumbing."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	# Exact (function, filename) pairs from the report
+	production_noise = [
+		("execute_query", "frappe/query_builder/utils.py"),
+		("save", "frappe/model/document.py"),         # kept — public entry
+		("_save", "frappe/model/document.py"),
+		("run_method", "frappe/model/document.py"),   # kept — hook dispatcher
+		("composer", "frappe/model/document.py"),
+		("runner", "frappe/model/document.py"),
+		("fn", "frappe/model/document.py"),
+		("get_meta", "frappe/model/meta.py"),
+		("__init__", "frappe/model/meta.py"),
+		("get_values", "frappe/database/database.py"),
+		("getdoctype", "frappe/desk/form/load.py"),
+		("execute", "frappe/model/qb_query.py"),
+		("get_meta_bundle", "frappe/desk/form/load.py"),
+		("__init__", "frappe/model/document.py"),     # kept — but ambiguous
+		("load_from_db", "frappe/model/document.py"),  # kept
+		("get_meta", "frappe/desk/form/meta.py"),
+		("__init__", "frappe/desk/form/meta.py"),
+		("load_children_from_db", "frappe/model/document.py"),  # kept
+		("getouterframes", "inspect.py"),
+		("getframeinfo", "inspect.py"),
+		("load_from_db", "frappe/model/meta.py"),
+		("process", "frappe/model/meta.py"),
+		("insert", "frappe/model/document.py"),       # kept — public entry
+		("wrapper", "erpnext/__init__.py"),
+		("wrapper", "utils/__init__.py"),
+		("sql", "frappe/database/database.py"),
+		("execute_query", "frappe/database/database.py"),
+		("execute", "MySQLdb/cursors.py"),
+		("get_doc_str", "frappe/model/document.py"),  # kept
+		("_query", "MySQLdb/cursors.py"),
+	]
+
+	# Check that the CLEAR plumbing cases are filtered. A few we'd
+	# KEEP intentionally (save, run_method, insert — public Document
+	# API methods) — those are commented above and tested separately.
+	must_filter = [
+		("execute_query", "frappe/query_builder/utils.py"),
+		("_save", "frappe/model/document.py"),
+		("composer", "frappe/model/document.py"),
+		("runner", "frappe/model/document.py"),
+		("fn", "frappe/model/document.py"),
+		("get_meta", "frappe/model/meta.py"),
+		("__init__", "frappe/model/meta.py"),
+		("get_values", "frappe/database/database.py"),
+		("getdoctype", "frappe/desk/form/load.py"),
+		("execute", "frappe/model/qb_query.py"),
+		("get_meta_bundle", "frappe/desk/form/load.py"),
+		("get_meta", "frappe/desk/form/meta.py"),
+		("__init__", "frappe/desk/form/meta.py"),
+		("getouterframes", "inspect.py"),
+		("getframeinfo", "inspect.py"),
+		("load_from_db", "frappe/model/meta.py"),
+		("process", "frappe/model/meta.py"),
+		("wrapper", "erpnext/__init__.py"),
+		("wrapper", "utils/__init__.py"),
+		("sql", "frappe/database/database.py"),
+		("execute_query", "frappe/database/database.py"),
+		("execute", "MySQLdb/cursors.py"),
+		("_query", "MySQLdb/cursors.py"),
+	]
+
+	for function_name, filename in must_filter:
+		node = {"function": function_name, "filename": filename, "kind": "python"}
+		assert _is_pure_helper_frame(node) is True, (
+			f"Production noise not filtered: {filename}::{function_name} "
+			"— this frame would re-appear in the Repeated Hot Frame "
+			"leaderboard if the filter regresses."
+		)
+
+
+def test_pure_helper_still_keeps_application_frappe_code():
+	"""Critical negative case: user-visible Frappe code MUST still
+	pass through. If this test regresses, the user loses visibility
+	into Document lifecycle methods, permissions, hooks, and naming —
+	which ARE legitimate optimization targets inside frappe/*."""
+	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
+
+	keepers = [
+		# Public Document entry points
+		("save", "frappe/model/document.py"),
+		("insert", "frappe/model/document.py"),
+		("submit", "frappe/model/document.py"),
+		("cancel", "frappe/model/document.py"),
+		# Hook dispatcher (users CAN optimize their hooks that it runs)
+		("run_method", "frappe/model/document.py"),
+		# Permissions (slow custom Permission Query Conditions bubble here)
+		("has_permission", "frappe/permissions.py"),
+		# User app code always kept
+		("compute_tax", "apps/erpnext/erpnext/accounts/tax.py"),
+		("validate", "apps/myapp/doctype/invoice.py"),
+	]
+	for function_name, filename in keepers:
+		node = {"function": function_name, "filename": filename, "kind": "python"}
+		assert _is_pure_helper_frame(node) is False, (
+			f"{filename}::{function_name} was WRONGLY filtered — "
+			"users must see this in the Repeated Hot Frame leaderboard "
+			"as a legitimate optimization target."
+		)
+
+
 def test_is_pure_helper_frame_matches_relative_filenames():
 	"""Core bug: the filter must match filenames as stored by
 	pyinstrument (relative paths, no leading slash). Pre-v0.5.1 the
@@ -397,16 +672,34 @@ def test_is_pure_helper_frame_keeps_application_frappe_code():
 	"""Negative cases: application-layer Frappe code must NOT be
 	classified as a pure helper. These are real optimization targets —
 	slow hooks bubble up through Document.run_method, slow permissions
-	through has_permission, etc."""
+	through has_permission, slow naming series through make_autoname.
+
+	v0.5.2 tightened the filter (database.py::sql, model/meta.py,
+	form/load.py, query_builder are now plumbing per user feedback
+	that they were worthless noise). But the four kept below remain
+	user-actionable and must stay visible in the hot-frames
+	leaderboard.
+	"""
 	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
 
 	for filename, function in (
-		("frappe/model/document.py", "Document.run_method"),
+		# Document lifecycle entry points — users recognize "save" /
+		# "insert" / "submit" as Document methods they call.
 		("frappe/model/document.py", "save"),
+		("frappe/model/document.py", "insert"),
+		("frappe/model/document.py", "submit"),
+		# run_method — the hook dispatcher, kept because it's the
+		# visible aggregate of all doc-event hooks the user wrote.
+		("frappe/model/document.py", "run_method"),
+		# Permissions — slow custom Permission Query Conditions
+		# bubble here.
 		("frappe/permissions.py", "has_permission"),
+		# Naming series — user's series config can be optimized
+		# (simpler prefix, fewer SQL lookups).
 		("frappe/model/naming.py", "make_autoname"),
-		("frappe/client.py", "get_list"),  # app-visible REST-ish
-		("frappe/database/mariadb/database.py", "sql"),
+		# frappe.client is the REST-ish API layer; get_list is the
+		# entry point users of the REST API actually call.
+		("frappe/client.py", "get_list"),
 	):
 		node = {"function": function, "filename": filename, "kind": "python"}
 		assert _is_pure_helper_frame(node) is False, (

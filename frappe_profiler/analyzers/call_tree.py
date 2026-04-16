@@ -267,6 +267,34 @@ _PURE_HELPER_PATH_SUFFIXES = (
 	# fattest frame by occurrence count but is 100% instrumentation
 	# overhead, not user code.
 	"frappe/recorder.py",
+	# v0.5.2: meta-loading plumbing. A real production report had 11
+	# Repeated Hot Frame entries all from meta.py (Meta.__init__,
+	# load_from_db, process, get_meta, ...) — identical cumulative
+	# times because they're the same call tree. Users can't optimize
+	# "how Meta loads its fields"; they ARE the framework's cold path.
+	"frappe/model/meta.py",
+	# Form-level meta loading: getdoctype, get_meta_bundle — these are
+	# what Desk calls when you open a form. Cumulative time is always
+	# ~= the doctype cache miss cost, which Frappe handles internally.
+	"frappe/desk/form/load.py",
+	"frappe/desk/form/meta.py",
+	# Query builder internals. Every SQL query the ORM builds passes
+	# through these. Cumulative time on a report session is the sum
+	# across all queries; the hot frame just means "this session had
+	# a lot of SQL" — the top_queries/index_suggestions analyzers
+	# already surface that signal more actionably.
+	"frappe/query_builder/utils.py",
+	"frappe/model/qb_query.py",
+	# Low-level DB cursor layer. frappe.db.sql / get_values / execute
+	# all land here. Same "every query passes through" story as the
+	# query builder — not a user-actionable hot frame.
+	"frappe/database/database.py",
+	"frappe/database/mariadb/database.py",
+	"frappe/database/postgres/database.py",
+	# Intentionally NOT filtered: frappe/model/naming.py — a user's
+	# naming-series configuration IS optimizable (simpler series,
+	# fewer SQL lookups), so make_autoname staying visible in the
+	# hot-frames leaderboard is correct.
 )
 
 # v0.5.1: substring matches (via `in`). Whole directories of framework
@@ -297,6 +325,43 @@ _PURE_HELPER_FUNCTION_PREFIXES = (
 	"frappe.recorder.",        # v0.5.1 addition
 )
 
+# v0.5.2: exact function names that are ALWAYS decorator wrappers or
+# private delegation shims regardless of what file they're in. Classic
+# pattern: functools.wraps / frappe.hook / erpnext.naming_decorator
+# produce frames named "wrapper", "composer", "runner", "fn". They
+# forward to the real function and their cumulative_ms is essentially
+# identical to the wrapped function's — so showing BOTH in the hot-
+# frame leaderboard is noise: the user sees two rows with the same
+# time for every decorated method.
+#
+# Real production report showed 6 separate Repeated Hot Frame findings
+# for Document.save's decorator chain (save → _save → run_method →
+# composer → runner → fn), all with near-identical cumulative times.
+# Filtering the wrappers leaves the visible-to-user entry points
+# (save, run_method) while hiding the functools/hook internals.
+_PURE_HELPER_FUNCTION_NAMES = frozenset({
+	# functools.wraps + frappe.hook decorator internals
+	"wrapper", "composer", "runner", "fn", "hook", "compose",
+	"add_to_return_value",
+	# Private delegation shims — always called by their non-underscored
+	# sibling (save → _save, insert → _insert, etc.). Keep the public
+	# entry point in the leaderboard; hide the private one.
+	"_save", "_insert",
+})
+
+# v0.5.2: bench/site third-party libraries whose frames pyinstrument
+# leaves without the site-packages/ prefix. MySQLdb / pymysql /
+# requests etc. These aren't Frappe apps — the user can't optimize
+# them. Already filtered by the donut's _top_level_app but wasn't
+# filtered here, so they leaked into the Repeated Hot Frame
+# leaderboard.
+_THIRD_PARTY_LIB_SEGMENTS = frozenset({
+	"MySQLdb", "pymysql", "psycopg2", "requests", "urllib3",
+	"httpx", "boto3", "botocore", "redis", "celery",
+	"jinja2", "markupsafe", "bleach", "nh3",
+	"pandas", "numpy", "openpyxl", "PIL",
+})
+
 
 def _is_pure_helper_frame(node: dict) -> bool:
 	"""Narrower than ``_is_framework_frame``. Returns True only for pure
@@ -312,20 +377,61 @@ def _is_pure_helper_frame(node: dict) -> bool:
 	code above the framework boundary.
 	"""
 	fn = node.get("function") or ""
+
+	# v0.5.2: bare function names that are always decorator-wrapper
+	# plumbing regardless of file. See _PURE_HELPER_FUNCTION_NAMES
+	# for rationale.
+	if fn in _PURE_HELPER_FUNCTION_NAMES:
+		return True
+
 	for prefix in _PURE_HELPER_FUNCTION_PREFIXES:
 		if fn.startswith(prefix):
 			return True
+
+	# Angle-bracketed synthetic markers (<built-in>, <string>,
+	# <module>, <frozen ...>). Pyinstrument emits these for C-level
+	# builtins and compiled-string frames; they're never actionable.
+	if fn.startswith("<") and fn.endswith(">"):
+		return True
+
 	filename = (node.get("filename") or "").replace("\\", "/")
 	if not filename:
 		return False
+
 	# Specific files by suffix (works on absolute and relative paths).
 	for suffix in _PURE_HELPER_PATH_SUFFIXES:
 		if filename.endswith(suffix):
 			return True
+
 	# Whole directories by substring.
 	for frag in _PURE_HELPER_PATH_SUBSTRINGS:
 		if frag in filename:
 			return True
+
+	# v0.5.2: synthetic filenames (pyinstrument's <built-in>,
+	# <string>) and Python stdlib (single-segment filenames like
+	# inspect.py, functools.py, threading.py). A real production
+	# report had inspect.py::getouterframes and inspect.py::
+	# getframeinfo showing up in the top hot frames because those
+	# are called by pyinstrument's own frame-capture path and
+	# pyinstrument short-paths stdlib filenames to just the
+	# module name.
+	stripped = filename.lstrip("/")
+	if stripped.startswith("<") and stripped.endswith(">"):
+		return True
+	if "/" not in stripped:
+		# No slash → Python stdlib module or loose script, never
+		# a Frappe app.
+		return True
+
+	# v0.5.2: third-party libraries by first-segment. pyinstrument
+	# sometimes strips the site-packages/ prefix so MySQLdb/cursors.py
+	# arrives without any directory context. Catch by name against
+	# a frozen set of common libs used in Frappe benches.
+	first_segment = stripped.split("/", 1)[0]
+	if first_segment in _THIRD_PARTY_LIB_SEGMENTS:
+		return True
+
 	return False
 
 
