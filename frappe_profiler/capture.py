@@ -24,6 +24,7 @@ single attribute lookup; they never read Redis.
 """
 
 import hashlib
+import sys as _sys
 
 # Optional dependency — capture degrades gracefully if pyinstrument is
 # not installed (e.g. air-gapped environments, broken pip cache).
@@ -33,6 +34,59 @@ try:
 	_PYINSTRUMENT_AVAILABLE = True
 except ImportError:
 	_PYINSTRUMENT_AVAILABLE = False
+
+
+# v0.5.2: how many caller frames to capture for redundant-call attribution.
+# Deep enough to walk past framework dispatchers (Document.save →
+# run_method → composer → runner → fn → user's validate → wrapped call);
+# shallow enough to keep overhead trivial (~1 µs per frame).
+_CALLER_STACK_MAX_DEPTH = 20
+
+
+def _capture_caller_stack() -> list:
+	"""Return a list of ``{"filename","lineno","function"}`` dicts for
+	the Python frames above this function, skipping the wrap and the
+	frames that led into the wrap itself.
+
+	Used ONLY by the sidecar-wrap entries (cache.get_value,
+	frappe.get_doc, has_permission) to enable:
+
+	  1. Filtering redundant-call findings whose callsite is inside
+	     framework code (users can't act on framework loops).
+	  2. Surfacing file:line in the finding detail so users CAN
+	     navigate to the loop when the callsite IS user code.
+
+	Implementation notes:
+
+	- Uses ``sys._getframe`` (CPython-specific but fast, ~1 µs per
+	  frame) instead of ``traceback.extract_stack`` which formats
+	  source-line context that we don't need.
+	- Depth-bounded at ``_CALLER_STACK_MAX_DEPTH`` so a runaway
+	  recursion doesn't build a huge sidecar entry.
+	- Returns [] on any failure (non-CPython interpreter, f_back
+	  unexpectedly None) rather than raising — observability code
+	  never breaks the host call.
+	"""
+	try:
+		# Skip: _capture_caller_stack itself + the wrap function.
+		frame = _sys._getframe(2)
+	except (ValueError, AttributeError):
+		return []
+
+	stack: list = []
+	try:
+		while frame is not None and len(stack) < _CALLER_STACK_MAX_DEPTH:
+			code = frame.f_code
+			stack.append({
+				"filename": code.co_filename,
+				"lineno": frame.f_lineno,
+				"function": code.co_name,
+			})
+			frame = frame.f_back
+	except Exception:
+		# Any unexpected walk failure → return what we collected so far.
+		pass
+	return stack
 
 
 def _hash_identifier(value) -> str:
@@ -164,6 +218,14 @@ def _make_wrap(orig, fn_name: str, local_proxy=None):
 				"fn_name": fn_name,
 				"identifier_raw": identifier_raw,
 				"identifier_safe": identifier_safe,
+				# v0.5.2: caller stack lets redundant_calls.analyze
+				# find the user frame (vs filtering out framework-
+				# only callsites) AND surface file:line in the
+				# finding detail so users can actually navigate to
+				# the loop they need to fix. Pre-v0.5.2 findings
+				# showed only a hashed cache key with no callsite —
+				# users couldn't act on them.
+				"caller_stack": _capture_caller_stack(),
 			}
 		except Exception:
 			entry = None
