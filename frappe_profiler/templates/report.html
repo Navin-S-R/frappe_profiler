@@ -351,6 +351,47 @@
   th.num { text-align: right; }
   tr:hover td { background: #f9fafb; }
 
+  /* v0.5.3: dedicated layout for the Top Queries + Queries-per-action
+     tables. Without fixed layout, a single long callsite path (e.g.
+     "frappe/frappe/model/db_query.py:255") can dominate the Callsite
+     column and squeeze the Query column into a single-character
+     sliver. Fixed column widths guarantee a readable layout even
+     when one row has unusually long text in a single column. */
+  table.query-table { table-layout: fixed; }
+  table.query-table th,
+  table.query-table td {
+    vertical-align: top;
+    overflow: hidden;
+  }
+  /* Width scheme:
+     #/Copies  (very narrow — single-digit or short number)
+     Duration  (narrow — e.g. "1374ms")
+     Callsite  (medium — allow ~25% for path, with word-break)
+     Query     (takes the rest) */
+  table.query-table col.col-index     { width: 44px; }
+  table.query-table col.col-copies    { width: 64px; }
+  table.query-table col.col-duration  { width: 88px; }
+  table.query-table col.col-callsite  { width: 25%; }
+  /* col.col-query uses the remaining width implicitly (auto) */
+
+  /* Long callsite paths must wrap rather than overflow. Using
+     ``break-all`` because file paths are slash-separated with no
+     natural word boundaries; ``break-word`` alone often leaves a
+     long single token un-split. */
+  table.query-table td code {
+    display: inline-block;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    max-width: 100%;
+  }
+  /* SQL cells retain their own scroll container so very long
+     queries don't push the row height absurdly. max-height caps
+     visible vertical space; overflow-x: auto handles wide lines. */
+  table.query-table pre.sql-inline {
+    max-height: 200px;
+    overflow: auto;
+  }
+
   /* ---------- Findings ---------- */
   .finding {
     border-left: 4px solid #d1d5db;
@@ -1179,7 +1220,13 @@
   <details class="section" open>
     <summary><h2>Top {{ top_queries|length }} slowest queries</h2></summary>
     {% if top_queries %}
-      <table>
+      <table class="query-table">
+        <colgroup>
+          <col class="col-index">
+          <col class="col-duration">
+          <col class="col-callsite">
+          <col class="col-query">
+        </colgroup>
         <thead>
           <tr>
             <th>#</th>
@@ -1228,7 +1275,13 @@
         <div style="padding: 10px 4px;">
           {# Sort this action's queries by duration desc, take top 10 #}
           {% set top_in_action = recording.calls | sort(attribute='duration', reverse=True) %}
-          <table>
+          <table class="query-table">
+            <colgroup>
+              <col class="col-duration">
+              <col class="col-copies">
+              <col class="col-callsite">
+              <col class="col-query">
+            </colgroup>
             <thead>
               <tr>
                 <th class="num">Duration</th>
