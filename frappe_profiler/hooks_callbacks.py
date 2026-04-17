@@ -348,7 +348,16 @@ def after_request(*args, **kwargs):
 				frappe.local, "profiler_session_id", None
 			)
 			if recording_uuid_for_dump and profiler_session_id:
-				_inject_correlation_header(recording_uuid_for_dump)
+				# v0.5.3: pass the response object from the hook
+				# kwargs (Frappe passes `response=response,
+				# request=request` via run_after_request_hooks).
+				# Required for v15 compat — v15 doesn't stage
+				# headers on frappe.local.response_headers, so
+				# we set them directly on response.headers.
+				_inject_correlation_header(
+					recording_uuid_for_dump,
+					response=kwargs.get("response"),
+				)
 		except Exception:
 			frappe.log_error(title="frappe_profiler header injection")
 
@@ -627,35 +636,79 @@ def _clear_capture_locals() -> None:
 
 
 _CORRELATION_HEADER_NAME = "X-Profiler-Recording-Id"
+_EXPOSE_HEADER_NAME = "Access-Control-Expose-Headers"
 
 
-def _inject_correlation_header(recording_uuid: str) -> None:
+def _inject_correlation_header(recording_uuid: str, response=None) -> None:
 	"""Attach X-Profiler-Recording-Id to the outgoing response + expose it
 	via Access-Control-Expose-Headers. Called from after_request during
 	an active profiler session. Idempotent and safe to call in non-HTTP
-	contexts (no-op if frappe.local has no response_headers)."""
+	contexts (no-op when neither a response object nor
+	``frappe.local.response_headers`` is available).
+
+	v0.5.3: now supports Frappe v15. v15 does not stage custom headers
+	on ``frappe.local.response_headers`` (only v16 does that), so when
+	a response object is available we write the headers directly to
+	``response.headers``. The v16 staging path is tried first because
+	it predates v15 support and some deployments rely on downstream
+	hooks reading the staged dict; the v15 direct-write path is the
+	fallback.
+
+	Symptom that motivated this fix: on v15, "Per-XHR timings" in the
+	Frontend panel rendered empty because ``profiler_frontend.js``
+	couldn't read the recording-id header — it was never set. Our
+	v16-only staging dict was silently dropped during response build.
+	"""
+	# v16 path: write to the staged dict if Frappe exposes it.
 	headers = getattr(frappe.local, "response_headers", None)
-	if headers is None:
-		return
+	if headers is not None:
+		headers[_CORRELATION_HEADER_NAME] = recording_uuid
+		try:
+			existing = headers.get(_EXPOSE_HEADER_NAME) or ""
+		except Exception:
+			existing = ""
+		# Token-by-token check, NOT a substring ``in`` check. A naive
+		# ``in`` would falsely match when another app has already
+		# added "X-Profiler-Recording-Id-Legacy" or similar — our real
+		# header would then NOT be appended, the browser would refuse
+		# to surface it to JavaScript, and the entire frontend
+		# correlation feature would silently break. Split on commas
+		# and compare case-insensitively.
+		tokens = {t.strip().lower() for t in existing.split(",") if t.strip()}
+		if _CORRELATION_HEADER_NAME.lower() not in tokens:
+			merged = (
+				existing + ", " + _CORRELATION_HEADER_NAME
+				if existing
+				else _CORRELATION_HEADER_NAME
+			)
+			headers[_EXPOSE_HEADER_NAME] = merged
 
-	headers[_CORRELATION_HEADER_NAME] = recording_uuid
-
-	try:
-		existing = headers.get("Access-Control-Expose-Headers") or ""
-	except Exception:
-		existing = ""
-
-	# Token-by-token check, NOT a substring `in` check. A naive `in`
-	# would falsely match when another app has already added
-	# "X-Profiler-Recording-Id-Legacy" or similar — our real header
-	# would then NOT be appended, the browser would refuse to surface
-	# it to JavaScript, and the entire frontend correlation feature
-	# would silently break. Split on commas and compare case-insensitively.
-	tokens = {t.strip().lower() for t in existing.split(",") if t.strip()}
-	if _CORRELATION_HEADER_NAME.lower() not in tokens:
-		merged = (
-			existing + ", " + _CORRELATION_HEADER_NAME
-			if existing
-			else _CORRELATION_HEADER_NAME
-		)
-		headers["Access-Control-Expose-Headers"] = merged
+	# v15 path (AND harmless belt-and-braces on v16): write directly
+	# to response.headers when the Response object is available. This
+	# covers v15 where the staging dict does not exist, and doesn't
+	# hurt v16 where the staged values will be ``update()``'d onto
+	# the same response.headers later anyway (setting twice is a
+	# no-op for the same key).
+	if response is not None:
+		r_headers = getattr(response, "headers", None)
+		if r_headers is None:
+			return
+		try:
+			r_headers[_CORRELATION_HEADER_NAME] = recording_uuid
+		except Exception:
+			return
+		try:
+			existing = r_headers.get(_EXPOSE_HEADER_NAME) or ""
+		except Exception:
+			existing = ""
+		tokens = {t.strip().lower() for t in existing.split(",") if t.strip()}
+		if _CORRELATION_HEADER_NAME.lower() not in tokens:
+			merged = (
+				existing + ", " + _CORRELATION_HEADER_NAME
+				if existing
+				else _CORRELATION_HEADER_NAME
+			)
+			try:
+				r_headers[_EXPOSE_HEADER_NAME] = merged
+			except Exception:
+				pass
