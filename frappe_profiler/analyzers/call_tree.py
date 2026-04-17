@@ -25,6 +25,7 @@ from collections import defaultdict
 from frappe_profiler.analyzers.base import (
 	SEVERITY_ORDER,
 	AnalyzerResult,
+	short_filename,
 )
 
 
@@ -683,6 +684,77 @@ def _largest_sql_child(node: dict):
 	return max(sql_children, key=lambda c: c.get("cumulative_ms", 0))
 
 
+# v0.5.3: Uninformative function names pyinstrument emits for dynamically
+# executed code. A Server Script body, a `exec()`'d snippet, a module's
+# top level, or a list/generator/dict-comp with no function context all
+# show up as one of these synthetic names — and plugging them directly
+# into a finding title gives nonsensical output like
+# "spent in <module>" or "spent in " (empty).
+_UNINFORMATIVE_FUNCTION_NAMES = frozenset({
+	"",
+	"<module>",
+	"<lambda>",
+	"<listcomp>",
+	"<genexpr>",
+	"<dictcomp>",
+	"<setcomp>",
+	"<unknown>",
+	"<string>",
+})
+
+
+def _display_name_for_node(node: dict) -> str:
+	"""Return a human-readable name for a call-tree node's frame.
+
+	Preference order:
+
+	  1. ``node["function"]`` if it's a real name (not in the
+	     uninformative list).
+	  2. ``short_filename(filename):lineno`` when we can derive a
+	     file location — useful for module-scope or ``<module>``
+	     frames so the title reads "spent in myapp/foo.py:42".
+	  3. A type-aware label based on what the synthetic name
+	     suggests — e.g. a Server Script body becomes
+	     "<server-script body>". Better than pass-through because
+	     the report reader immediately understands what's slow.
+	  4. "<unnamed code>" as last resort.
+
+	Production trigger: a user put a 5M-iteration CPU loop inside a
+	Frappe Server Script. pyinstrument recorded the exec()'d body
+	with function="" and filename="<serverscript-N>", so the
+	finding title rendered as "spent in " (trailing blank). Now it
+	renders "spent in <server-script body>".
+	"""
+	raw_fn = (node.get("function") or "").strip()
+	if raw_fn and raw_fn not in _UNINFORMATIVE_FUNCTION_NAMES:
+		return raw_fn
+
+	filename = (node.get("filename") or "").strip()
+	lineno = node.get("lineno")
+
+	# Detect Server Scripts (ERPNext): filename looks like
+	# "<serverscript-XYZ>" or contains "server_script".
+	if filename.startswith("<serverscript") or filename.startswith("<server-script"):
+		return "<server-script body>"
+	if filename == "<string>":
+		return "<exec'd code>"
+
+	# Module-scope / lambda / comprehension with a real filename →
+	# use the short path for navigation.
+	if filename and filename not in ("<unknown>", "<string>", "?"):
+		short = short_filename(filename)
+		if lineno:
+			return f"{short}:{lineno}"
+		return short
+
+	# Last resort: pass through whatever synthetic name pyinstrument
+	# gave us rather than go blank. `<module>` tells the reader the
+	# hot spot is at module top-level; `<lambda>` is a lambda; etc.
+	if raw_fn:
+		return raw_fn
+	return "<unnamed code>"
+
+
 def _emit_per_action_findings(
 	tree: dict,
 	action_idx: int,
@@ -754,7 +826,7 @@ def _walk_for_findings(
 				else "Medium"
 			)
 			pct_str = f"{pct_of_action * 100:.0f}%"
-			fn_name = node.get("function", "<unknown>")
+			fn_name = _display_name_for_node(node)
 
 			if is_hook:
 				findings.append({
