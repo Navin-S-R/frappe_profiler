@@ -168,6 +168,16 @@ def before_request(*args, **kwargs):
 	Redis GET — `get_active_session_for(user)` — and an early return.
 	"""
 	try:
+		# v0.5.3: deferred sidecar-wrap install. The module-level
+		# install in frappe_profiler/__init__.py skips when frappe
+		# isn't fully initialized (to avoid breaking the bench test
+		# runner's bootstrap — see the rationale there). By the time
+		# the first real before_request fires, frappe is guaranteed
+		# to be up, so we lazy-install here. Idempotent via the
+		# wrap's own `_profiler_original` marker.
+		import frappe_profiler
+		frappe_profiler._try_install_capture_wraps()
+
 		# v0.5.2: master kill-switch. When an admin turns off
 		# Profiler Settings ▸ Enabled, we short-circuit before even
 		# the active-session lookup. `is_enabled()` is a cached
@@ -381,6 +391,13 @@ def after_request(*args, **kwargs):
 def before_job(method=None, kwargs=None, **rest):
 	"""Activate the recorder if this job belongs to an active profiler session."""
 	try:
+		# v0.5.3: same deferred-install path as before_request. A job
+		# worker process boots independently of the web request path,
+		# so it needs its own chance to finalize wrap installation
+		# after frappe is fully ready.
+		import frappe_profiler
+		frappe_profiler._try_install_capture_wraps()
+
 		# v0.5.2: honor the master kill-switch here too. If the admin
 		# turned the profiler off, we still need to pop our marker
 		# from kwargs so the user's method doesn't see an unexpected

@@ -78,14 +78,53 @@ _patch_enqueue()
 # present, AND `frappe.log_error` may not exist either. Both failures
 # are silent — the v0.2.0 enqueue patch above uses the same defensive
 # pattern (`pass` on any exception) for the same reason.
-try:
-	from frappe_profiler import capture
+#
+# v0.5.3: we ONLY install at module-import if frappe is already
+# fully loaded (i.e. `frappe._` — the translation function — is
+# available). Otherwise the install is deferred. This guards against
+# the bench test runner importing frappe_profiler during its own
+# bootstrap, while `frappe/__init__.py` is still executing — in that
+# state a later call to `frappe.get_doc(...)` through our wrap hits
+# `frappe.utils.nestedset` which does `from frappe import _` at
+# module-top and blows up with
+# ``ImportError: cannot import name '_' from 'frappe'``. Deferring
+# means the wraps install on first hook invocation (before_request /
+# before_job) via the installer in ``hooks_callbacks``, by which
+# time frappe is fully initialized.
 
-	capture.install_wraps()
-except Exception:
+
+def _try_install_capture_wraps() -> bool:
+	"""Attempt to install the sidecar wraps. Returns True if actually
+	installed, False if deferred or errored. Idempotent — the
+	capture module itself guards against double-wrap.
+	"""
 	try:
 		import frappe
+	except ImportError:
+		# No frappe at all (unit-test Python interpreter). No-op.
+		return False
 
-		frappe.log_error(title="frappe_profiler capture.install_wraps")
+	# Frappe bootstrap in progress? The `_` translator is the last
+	# thing frappe/__init__.py defines that nestedset imports —
+	# if it's missing, wrap-install could cascade into a partial-
+	# init ImportError. Defer until hooks fire.
+	if not hasattr(frappe, "_"):
+		return False
+
+	try:
+		from frappe_profiler import capture
+
+		capture.install_wraps()
+		return True
 	except Exception:
-		pass  # never let a logging failure break app load
+		try:
+			frappe.log_error(title="frappe_profiler capture.install_wraps")
+		except Exception:
+			pass  # never let a logging failure break app load
+		return False
+
+
+# Best-effort: install now if frappe is ready; otherwise the
+# before_request / before_job hooks will trigger the deferred install
+# on first request.
+_try_install_capture_wraps()
