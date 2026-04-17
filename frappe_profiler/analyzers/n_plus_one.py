@@ -262,6 +262,24 @@ def _build_user_finding(
 				"sample_queries": all_variants[:5],
 				"total_time_ms": round(total_time, 2),
 				"average_time_ms": round(total_time / count, 2) if count else 0,
+				# v0.5.3: projected post-fix timing. Batching N loop
+				# queries into ONE collapses the wall-clock cost to
+				# roughly a single query. Empirically, a batched query
+				# with an IN (…) filter or a JOIN costs ~2× a single
+				# tight query (the work still scans the same rows, just
+				# once, and returns a bigger result set). We use that
+				# 2× multiplier as the ceiling so the user sees the
+				# realistic savings, not the idealized floor. A 74-
+				# query 85ms loop projects to ~2.2ms after batching.
+				"projected_total_ms": (
+					round((total_time / count) * 2, 2) if count else 0
+				),
+				"projected_avg_time_ms": (
+					round((total_time / count) * 2, 2) if count else 0
+				),
+				"projected_speedup_label": (
+					f"~{max(1, count // 2)}× fewer queries" if count >= 4 else None
+				),
 				"fix_hint": (
 					"This is a classic N+1 pattern. The Python code at "
 					f"{filename}:{lineno} is running the same query in a loop. "

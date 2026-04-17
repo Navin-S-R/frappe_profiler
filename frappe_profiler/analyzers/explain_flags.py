@@ -24,6 +24,7 @@ from frappe_profiler.analyzers.base import (
 	SEVERITY_ORDER,
 	AnalyzerResult,
 	is_framework_callsite,
+	project_post_fix_ms,
 	walk_callsite,
 )
 
@@ -191,6 +192,49 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 			continue
 
 		findings.append(f)
+
+	# v0.5.3: project "after fix" timing per finding. Gives the
+	# developer a rough ceiling of the fix's value so they can
+	# prioritize by potential speedup, not just current pain.
+	# See analyzers.base.project_post_fix_ms for the heuristics.
+	for f in findings:
+		count = f.get("affected_count") or 0
+		total = f.get("estimated_impact_ms") or 0
+		if count <= 0 or total <= 0:
+			continue
+		avg_ms = total / count
+		try:
+			td = json.loads(f.get("technical_detail_json") or "{}")
+		except Exception:
+			continue
+
+		filtered_pct = None
+		if f["finding_type"] == "Low Filter Ratio":
+			try:
+				explain_row = td.get("explain_row") or {}
+				filtered_pct = float(explain_row.get("filtered") or 0) or None
+			except (TypeError, ValueError):
+				filtered_pct = None
+
+		projected = project_post_fix_ms(
+			f["finding_type"], avg_ms, filtered_pct=filtered_pct,
+		)
+		if projected is None:
+			continue
+
+		td["average_time_ms"] = round(avg_ms, 2)
+		td["projected_avg_time_ms"] = projected
+		td["projected_total_ms"] = round(projected * count, 2)
+		# Display helper: "~20× faster". Always >= 1.0 since projected
+		# <= current (factor is 0-1). Floored at 1.1 to avoid the
+		# nonsensical "~1× faster" display when projection is barely
+		# different from current (e.g., a single-row filesort).
+		if projected > 0 and avg_ms > projected:
+			speedup = avg_ms / projected
+			if speedup >= 1.1:
+				td["projected_speedup_label"] = f"~{speedup:.0f}× faster"
+
+		f["technical_detail_json"] = json.dumps(td, default=str)
 
 	findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 3), -f["estimated_impact_ms"]))
 

@@ -334,6 +334,69 @@ def walk_callsite_str(stack: list | None) -> str | None:
 # technical_detail_json can keep the full path for disambiguation.
 
 
+# ---------------------------------------------------------------------------
+# v0.5.3: "Projected after fix" timing heuristics
+# ---------------------------------------------------------------------------
+# Per-finding-type speedup factors. Applied to the CURRENT average per-query
+# time to estimate what the same query would cost after the recommended
+# fix. These are ceiling estimates — a real fix could do better or worse,
+# but they give the developer a rough sense of "is this worth my afternoon".
+#
+# Derivations:
+#   Full Table Scan: scan O(N) → index lookup O(log N). For N=10k-10M the
+#                    ratio is ~20×. Use 0.05.
+#   Missing Index:   same — the suggestion IS to add an index.
+#   Filesort:        sort cost is O(N log N); with an index-ordered read,
+#                    the sort disappears but the read cost remains. Typical
+#                    observed speedup on Frappe DocTypes is ~3×. Use 0.30.
+#   Temporary Table: materialization cost goes away when a covering index
+#                    supports the GROUP BY / DISTINCT. ~2× speedup. Use 0.50.
+#   Low Filter Ratio: the fix is selectivity, so projected_time ≈ current ×
+#                    (filtered% / 100). Special-cased in explain_flags —
+#                    not a simple factor.
+#   N+1 Query:       N queries × avg → 1 batched query ≈ 2 × avg. Computed
+#                    directly in n_plus_one, not via this table.
+_POST_FIX_SPEEDUP: dict[str, float] = {
+	"Full Table Scan": 0.05,
+	"Missing Index": 0.05,
+	"Filesort": 0.30,
+	"Temporary Table": 0.50,
+}
+
+# Minimum projected time per query. Even a perfect index lookup costs
+# client/server round-trip + plan time, which is typically ~0.3-0.5ms on
+# a warm MariaDB connection. Don't project below this floor — otherwise
+# the report claims "projected 0.0ms" which is nonsense.
+POST_FIX_FLOOR_MS = 0.3
+
+
+def project_post_fix_ms(
+	finding_type: str,
+	current_avg_ms: float,
+	filtered_pct: float | None = None,
+) -> float | None:
+	"""Return the projected per-query time after applying the finding's
+	suggested fix, or None if the finding type isn't one we project.
+
+	``filtered_pct`` is only used for "Low Filter Ratio" findings
+	(MariaDB's EXPLAIN ``filtered`` column, 0-100 representing what %
+	of examined rows survive the WHERE).
+	"""
+	if current_avg_ms <= 0:
+		return None
+
+	if finding_type == "Low Filter Ratio":
+		if filtered_pct is None or filtered_pct <= 0:
+			return None
+		factor = max(0.01, filtered_pct / 100.0)
+		return max(POST_FIX_FLOOR_MS, round(current_avg_ms * factor, 2))
+
+	factor = _POST_FIX_SPEEDUP.get(finding_type)
+	if factor is None:
+		return None
+	return max(POST_FIX_FLOOR_MS, round(current_avg_ms * factor, 2))
+
+
 def short_filename(filename: str, keep_segments: int = 2) -> str:
 	"""Return the last ``keep_segments`` path components of ``filename``.
 
