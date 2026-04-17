@@ -6,3 +6,4 @@ frappe_profiler.patches.v0_3_0.add_call_tree_fields
 frappe_profiler.patches.v0_4_0.add_comparison_and_pdf_fields
 frappe_profiler.patches.v0_5_0.add_metrics_finding_types
 frappe_profiler.patches.v0_5_0.upgrade_notes_to_text_editor
+frappe_profiler.patches.v0_5_2.bump_cache_threshold_default
