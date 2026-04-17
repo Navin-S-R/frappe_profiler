@@ -35,18 +35,24 @@ def test_n_plus_one_detected_from_n_plus_one_fixture(n_plus_one_recording, empty
 
 
 def test_n_plus_one_callsite_attributes_to_business_code(n_plus_one_recording, empty_context):
-	"""The N+1 finding must point at sales_invoice.py, NOT frappe/database/database.py.
+	"""The N+1 finding must point at the custom-app business frame
+	(acme_sales/.../custom_invoice.py:212), NOT frappe/database/database.py.
 
 	This is the fix for review issue #1. The stack has frappe framework
 	frames AFTER the business-logic frame, so without the fix we'd blame
-	database.py:742 for the N+1 instead of sales_invoice.py:212.
+	database.py:742 for the N+1 instead of the business-code frame.
+
+	v0.5.2: fixture renamed from erpnext/… to acme_sales/… because
+	erpnext is now classified as framework — this test is checking
+	the 'blame user code, not framework helpers' behavior, which
+	requires the blame frame to be in a non-framework app.
 	"""
 	result = n_plus_one.analyze([n_plus_one_recording], empty_context)
 	assert len(result.findings) == 1
 
 	detail = json.loads(result.findings[0]["technical_detail_json"])
 	callsite = detail["callsite"]
-	assert "sales_invoice.py" in callsite["filename"]
+	assert "custom_invoice.py" in callsite["filename"]
 	assert callsite["lineno"] == 212
 	# Must NOT be the frappe database frame
 	assert "frappe/database" not in callsite["filename"]
@@ -253,10 +259,19 @@ def test_user_code_n_plus_one_still_emits_as_actionable(empty_context):
 
 def test_is_framework_callsite_helper_unit():
 	"""Direct unit test of the classifier — covers edge cases
-	without needing a full recording."""
+	without needing a full recording.
+
+	v0.5.2: extended to treat every official Frappe-maintained app
+	(erpnext, hrms, payments, lms, helpdesk, insights, crm, builder,
+	wiki, drive) as framework. Triggered by a production Sales
+	Invoice session that surfaced 10 'Redundant cache lookup'
+	findings landing in apps/erpnext/.../sales_invoice.py:300 —
+	loops inside ERPNext that app developers can't practically
+	patch.
+	"""
 	from frappe_profiler.analyzers.n_plus_one import _is_framework_callsite
 
-	# True: framework code
+	# True: frappe core
 	assert _is_framework_callsite("frappe/query_builder/utils.py") is True
 	assert _is_framework_callsite("frappe/model/document.py") is True
 	assert _is_framework_callsite("frappe/__init__.py") is True
@@ -266,11 +281,37 @@ def test_is_framework_callsite_helper_unit():
 		"/Users/navin/office/frappe_bench/apps/frappe/frappe/handler.py"
 	) is True
 
-	# False: user code
+	# True (v0.5.2): official Frappe-maintained apps
+	assert _is_framework_callsite("apps/erpnext/erpnext/foo.py") is True
+	assert _is_framework_callsite(
+		"apps/erpnext/erpnext/accounts/doctype/sales_invoice/sales_invoice.py"
+	) is True
+	assert _is_framework_callsite("apps/hrms/hrms/payroll/utils.py") is True
+	assert _is_framework_callsite("apps/payments/payments/utils.py") is True
+	assert _is_framework_callsite("apps/lms/lms/foo.py") is True
+	assert _is_framework_callsite("apps/helpdesk/helpdesk/api.py") is True
+	assert _is_framework_callsite("apps/insights/insights/api.py") is True
+	assert _is_framework_callsite("apps/crm/crm/fcrm/doctype/foo.py") is True
+	assert _is_framework_callsite("apps/builder/builder/api.py") is True
+	assert _is_framework_callsite("apps/wiki/wiki/api.py") is True
+	assert _is_framework_callsite("apps/drive/drive/api.py") is True
+
+	# True: pip-installed third-party
+	assert _is_framework_callsite(
+		"env/lib/python3.14/site-packages/werkzeug/serving.py"
+	) is True
+
+	# False: user code (custom app, not in the framework allowlist)
 	assert _is_framework_callsite("apps/myapp/controllers/import.py") is False
-	assert _is_framework_callsite("erpnext/accounts/doctype/sales_invoice.py") is False
-	# erpnext is an app, not frappe — NOT framework for this classifier
-	assert _is_framework_callsite("apps/erpnext/erpnext/foo.py") is False
+	# Look-alike names that superficially contain a framework token but
+	# as part of a different word must NOT match (boundary-sensitive).
+	assert _is_framework_callsite("apps/my_crm/custom.py") is False, (
+		"'crm/' must not match inside 'my_crm/' — boundary check failed"
+	)
+	assert _is_framework_callsite("apps/myerpnext_fork/foo.py") is False, (
+		"'erpnext/' must not match inside 'myerpnext_fork/' — "
+		"boundary check failed"
+	)
 
 	# Empty
 	assert _is_framework_callsite("") is False

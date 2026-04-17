@@ -780,15 +780,49 @@ def _walk_for_findings(
 					"action_ref": str(action_idx),
 				})
 			else:
+				# v0.5.2 round 5: when the action label itself ends
+				# with the function name (e.g. action_label =
+				# "erpnext.accounts.doctype.pricing_rule.pricing_rule
+				# .apply_pricing_rule" and fn_name = "apply_pricing_rule"),
+				# the classic phrasing "In X, N% of time was spent in
+				# X" reads as tautology. The real signal is that the
+				# function's own body is the hot spot — not a subcall
+				# — so surface THAT. User-reported on a real Sales
+				# Invoice Submit report.
+				self_referential = (
+					action_label == fn_name
+					or action_label.endswith(f".{fn_name}")
+					or action_label.endswith(f":{fn_name}")
+				)
+				if self_referential:
+					title = (
+						f"{fn_name} is a self-time hot path "
+						f"({pct_str} of the action, {cumulative:.0f}ms)"
+					)
+					desc = (
+						f"The body of **{fn_name}** itself consumed "
+						f"{pct_str} of the action time ({cumulative:.0f}ms). "
+						"This isn't a slow subcall — the function's own logic "
+						"is the bottleneck. Profile the function body to find "
+						"the hot lines (tight loops, expensive computations, "
+						"string/regex work, etc.) and optimize or cache them."
+					)
+				else:
+					title = (
+						f"In {action_label}, {pct_str} of the time "
+						f"was spent in {fn_name}"
+					)
+					desc = (
+						f"During *{action_label}*, **{fn_name}** and its "
+						f"callees consumed {pct_str} of the total time "
+						f"({cumulative:.0f}ms). This is the highest-impact "
+						"code path for this action."
+					)
 				findings.append({
 					"finding_type": "Slow Hot Path",
 					"severity": severity,
-					"title": f"In {action_label}, {pct_str} of the time was spent in {fn_name}",
-					"customer_description": (
-						f"During *{action_label}*, **{fn_name}** and its callees "
-						f"consumed {pct_str} of the total time ({cumulative:.0f}ms). "
-						"This is the highest-impact code path for this action."
-					),
+					"title": title,
+					"customer_description": desc,
 					"technical_detail_json": json.dumps({
 						"function": fn_name,
 						"filename": node.get("filename"),
@@ -796,6 +830,7 @@ def _walk_for_findings(
 						"cumulative_ms": cumulative,
 						"action_wall_time_ms": action_wall_time_ms,
 						"is_hook": False,
+						"is_self_referential": self_referential,
 					}, default=str),
 					"estimated_impact_ms": round(cumulative, 2),
 					"affected_count": 1,

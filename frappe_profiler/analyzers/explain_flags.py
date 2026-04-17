@@ -20,7 +20,13 @@ report it once with the cumulative impact.
 import json
 from collections import defaultdict
 
-from frappe_profiler.analyzers.base import SEVERITY_ORDER, AnalyzerResult, walk_callsite
+from frappe_profiler.analyzers.base import (
+	SEVERITY_ORDER,
+	AnalyzerResult,
+	is_framework_callsite,
+	project_post_fix_ms,
+	walk_callsite,
+)
 
 # A query is "high severity" full-scan if it touched more than this many rows.
 HIGH_ROWS_EXAMINED = 10000
@@ -42,8 +48,70 @@ LOW_FILTERED_MIN_ROWS = 100
 # floor LOW_FILTERED_MIN_ROWS uses for the same reason.
 MIN_ROWS_TO_FLAG_SORT = 100
 
+# v0.5.2 round 3: noise floor. An aggregated bucket (e.g. "Full Table
+# Scan on tabBankClearanceDetail") with tiny total impact AND tiny
+# count isn't actionable — it's a one-off touch during init / metadata
+# resolution, not a hot path. Surfacing it just inflates the
+# "125 findings" stats card with noise. Production report had ~85
+# such entries all at 0-1ms.
+NOISE_FLOOR_IMPACT_MS = 5.0
+NOISE_FLOOR_COUNT = 5
+
+# Framework-owned DocTypes — any scan/filesort/temp finding on one of
+# these routes to Observations because the application developer can't
+# add an index to a stock Frappe/ERPNext DocType. Populated lazily
+# from the DocType + Module Def tables on first use per analyze pass.
+_framework_doctypes_cache: frozenset[str] | None = None
+
+
+def _get_framework_doctypes() -> frozenset[str]:
+	"""Return the set of DocType names owned by framework apps
+	(frappe, erpnext, hrms, etc.).
+
+	Cached per process. Fall back to empty set on any error — the
+	noise-floor filter still runs, so we don't lose correctness.
+	"""
+	global _framework_doctypes_cache
+	if _framework_doctypes_cache is not None:
+		return _framework_doctypes_cache
+	try:
+		import frappe
+		from frappe_profiler.analyzers.base import FRAMEWORK_APPS
+
+		rows = frappe.db.sql(
+			"""
+			SELECT dt.name
+			FROM `tabDocType` dt
+			JOIN `tabModule Def` md ON dt.module = md.name
+			WHERE md.app_name IN %(apps)s
+			""",
+			{"apps": tuple(FRAMEWORK_APPS)},
+			as_dict=True,
+		)
+		_framework_doctypes_cache = frozenset(r["name"] for r in rows)
+	except Exception:
+		_framework_doctypes_cache = frozenset()
+	return _framework_doctypes_cache
+
+
+def _is_framework_doctype_table(table: str, framework_doctypes: frozenset[str]) -> bool:
+	"""True if `table` is a stock Frappe/ERPNext DocType the user
+	cannot add indexes to (would require an upstream patch).
+
+	Accepts both ``tab<Name>`` (Frappe convention) and bare names.
+	"""
+	if not table:
+		return False
+	name = table[3:] if table.startswith("tab") else table
+	return name in framework_doctypes
+
 
 def analyze(recordings: list[dict], context) -> AnalyzerResult:
+	# One settings read per analyze pass.
+	from frappe_profiler.settings import get_config
+	tracked_apps = get_config().tracked_apps
+	framework_doctypes = _get_framework_doctypes()
+
 	# (finding_type, table) → aggregated finding dict
 	buckets: dict[tuple, dict] = {}
 	row_errors = 0
@@ -52,6 +120,9 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 	# the raw EXPLAIN data would suggest.
 	drop_alias = 0
 	drop_framework_callsite = 0
+	# v0.5.2 round 3:
+	drop_noise_floor = 0           # tiny-impact + tiny-count findings
+	drop_framework_doctype = 0     # scans on stock Frappe/ERPNext DocTypes
 
 	for action_idx, recording in enumerate(recordings):
 		for call in recording.get("calls") or []:
@@ -73,7 +144,7 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 			# code and isn't user-actionable. Skip the whole call's
 			# EXPLAIN rows rather than emit N findings the user
 			# can't act on.
-			if _is_framework_origin(call_stack):
+			if _is_framework_origin(call_stack, tracked_apps=tracked_apps):
 				drop_framework_callsite += 1
 				continue
 
@@ -95,7 +166,76 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 							f"(row keys: {sorted(list(row.keys()))[:10]})"
 						)
 
-	findings = list(buckets.values())
+	raw_findings = list(buckets.values())
+	findings: list[dict] = []
+	for f in raw_findings:
+		table = ""
+		try:
+			td = json.loads(f.get("technical_detail_json") or "{}")
+			table = td.get("table") or ""
+		except Exception:
+			pass
+
+		# Framework DocType filter: a Full Scan on tabDocField /
+		# tabWorkspace / tabCustom Field / etc. isn't fixable by the
+		# application developer — requires an upstream index patch.
+		# Route to Observations by tagging the finding type.
+		if _is_framework_doctype_table(table, framework_doctypes):
+			drop_framework_doctype += 1
+			continue
+
+		# Noise floor: tiny impact AND tiny count → drop.
+		impact = f.get("estimated_impact_ms") or 0
+		count = f.get("affected_count") or 0
+		if impact < NOISE_FLOOR_IMPACT_MS and count < NOISE_FLOOR_COUNT:
+			drop_noise_floor += 1
+			continue
+
+		findings.append(f)
+
+	# v0.5.3: project "after fix" timing per finding. Gives the
+	# developer a rough ceiling of the fix's value so they can
+	# prioritize by potential speedup, not just current pain.
+	# See analyzers.base.project_post_fix_ms for the heuristics.
+	for f in findings:
+		count = f.get("affected_count") or 0
+		total = f.get("estimated_impact_ms") or 0
+		if count <= 0 or total <= 0:
+			continue
+		avg_ms = total / count
+		try:
+			td = json.loads(f.get("technical_detail_json") or "{}")
+		except Exception:
+			continue
+
+		filtered_pct = None
+		if f["finding_type"] == "Low Filter Ratio":
+			try:
+				explain_row = td.get("explain_row") or {}
+				filtered_pct = float(explain_row.get("filtered") or 0) or None
+			except (TypeError, ValueError):
+				filtered_pct = None
+
+		projected = project_post_fix_ms(
+			f["finding_type"], avg_ms, filtered_pct=filtered_pct,
+		)
+		if projected is None:
+			continue
+
+		td["average_time_ms"] = round(avg_ms, 2)
+		td["projected_avg_time_ms"] = projected
+		td["projected_total_ms"] = round(projected * count, 2)
+		# Display helper: "~20× faster". Always >= 1.0 since projected
+		# <= current (factor is 0-1). Floored at 1.1 to avoid the
+		# nonsensical "~1× faster" display when projection is barely
+		# different from current (e.g., a single-row filesort).
+		if projected > 0 and avg_ms > projected:
+			speedup = avg_ms / projected
+			if speedup >= 1.1:
+				td["projected_speedup_label"] = f"~{speedup:.0f}× faster"
+
+		f["technical_detail_json"] = json.dumps(td, default=str)
+
 	findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 3), -f["estimated_impact_ms"]))
 
 	warnings: list[str] = []
@@ -116,6 +256,24 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 			"without knowing which table 'a' aliases — the per-query "
 			"detail in the Top Queries section shows the actual SQL "
 			"if you want to investigate."
+		)
+	if drop_framework_doctype:
+		warnings.append(
+			f"Suppressed {drop_framework_doctype} SQL finding(s) on "
+			"stock Frappe / ERPNext DocTypes (tabDocField, tabWorkspace, "
+			"tabCustom Field, etc.). You can't add an index to a "
+			"framework-owned DocType from your application code — it "
+			"requires an upstream patch. If one of these is a real "
+			"hot spot, check whether a Frappe upgrade has already "
+			"indexed it, or file an upstream issue."
+		)
+	if drop_noise_floor:
+		warnings.append(
+			f"Suppressed {drop_noise_floor} SQL finding(s) below the "
+			f"noise floor ({NOISE_FLOOR_IMPACT_MS}ms total impact AND "
+			f"{NOISE_FLOOR_COUNT} occurrences). These are one-off "
+			"metadata lookups that wouldn't measurably benefit from "
+			"an index."
 		)
 	if row_errors:
 		warnings.append(
@@ -186,21 +344,29 @@ def _to_float(val):
 		return None
 
 
-def _is_framework_origin(stack: list) -> bool:
-	"""Return True when every user-visible frame in a SQL call's stack
-	is inside frappe/* or frappe_profiler/*.
+def _is_framework_origin(
+	stack: list,
+	tracked_apps: tuple[str, ...] | None = None,
+) -> bool:
+	"""Return True when the SQL call's blame frame is inside framework
+	code (frappe, erpnext, hrms, lms, …) or a pip-installed library.
+
+	Accepts ``tracked_apps`` for the inclusion-mode classification
+	(when the site admin has set Profiler Settings ▸ Tracked Apps).
+	Defaults to exclusion mode (built-in FRAMEWORK_APPS) when None.
 
 	Used by explain_flags to skip Full Scan / Filesort / Temporary
 	Table / Low Filter findings whose issuing code lives in the
 	framework. Same rationale as the Framework N+1 split: the
 	application developer can't add an index for a query that
-	Frappe issues — they'd have to patch Frappe itself.
+	Frappe/ERPNext issues — they'd have to patch upstream.
 
-	walk_callsite walks innermost-to-outermost for a non-framework
+	walk_callsite walks innermost-to-outermost for a non-frappe-core
 	frame; its fallback returns the deepest frame if ALL frames are
-	framework. So a None return means "profiler-own stack" (already
-	filtered elsewhere). A returned frame inside frappe/* means
-	"pure frappe stack." We filter both cases.
+	framework-core. So a None return means "profiler-own stack"
+	(already filtered elsewhere). We additionally filter any blame
+	frame resolving to a framework app via is_framework_callsite()
+	so findings rooted in erpnext loops don't surface as actionable.
 	"""
 	if not stack:
 		# No stack captured. Don't filter — fall through to the
@@ -213,13 +379,32 @@ def _is_framework_origin(stack: list) -> bool:
 		# Pure-profiler stack → filtered (though those should
 		# already be gone at this stage — defensive).
 		return True
-	filename = (callsite.get("filename") or "").replace("\\", "/")
-	return "frappe/" in filename or "frappe_profiler/" in filename
+	return is_framework_callsite(
+		callsite.get("filename") or "", tracked_apps=tracked_apps
+	)
+
+
+# v0.5.2 round 4: INFORMATION_SCHEMA / MariaDB metadata views that
+# show up as ``table`` values in EXPLAIN rows. These ARE real tables
+# (in the ``information_schema`` database), but the user can't add
+# indexes to them — they're engine-managed. Production reports have
+# shown "Full table scan on columns" and "Full table scan on tables"
+# cluttering actionable findings; both are INFORMATION_SCHEMA views.
+# Treat them as aliases (suppressed with the SQL-alias warning).
+_SYSTEM_METADATA_TABLES: frozenset[str] = frozenset({
+	"columns", "tables", "schemata", "statistics", "routines",
+	"triggers", "views", "processlist", "key_column_usage",
+	"referential_constraints", "table_constraints",
+	"session_variables", "global_variables",
+	"session_status", "global_status",
+	"character_sets", "collations",
+	"engines", "plugins", "partitions",
+})
 
 
 def _is_likely_alias(table: str) -> bool:
 	"""Return True when `table` looks like a SQL alias rather than a
-	real table name.
+	real user-addressable table name.
 
 	Frappe DocType tables always start with ``tab`` (``tabItem``,
 	``tabSales Invoice``, ``tabCustom Field``, etc.), so anything
@@ -239,6 +424,11 @@ def _is_likely_alias(table: str) -> bool:
 	A finding of "Full table scan on a" has no actionable signal
 	— the user can't index "a", they'd need the real table name.
 
+	Also filters INFORMATION_SCHEMA pseudo-tables (``columns``,
+	``tables``, ``schemata``, etc.) — these are real but not
+	user-indexable, same "no action available" property as a raw
+	alias.
+
 	False negatives are acceptable: a legitimate short table name
 	like a custom "log" table would be mis-classified as alias
 	and filtered. That's rare enough that the noise reduction
@@ -248,6 +438,15 @@ def _is_likely_alias(table: str) -> bool:
 	if not table:
 		return True
 	s = str(table).strip()
+	# v0.5.2 round 4: INFORMATION_SCHEMA / MariaDB metadata views.
+	# Checked BEFORE the tab-prefix check because "tables" (metadata
+	# view) would otherwise be misclassified as a real Frappe
+	# DocType via the startswith("tab") short-circuit. SQL is case-
+	# insensitive on table names and the engine typically lowercases
+	# them in EXPLAIN output — so "columns" matches, "COLUMNS" also
+	# matches after lowering.
+	if s.lower() in _SYSTEM_METADATA_TABLES:
+		return True
 	# Real Frappe tables — always kept.
 	if s.startswith("tab"):
 		return False

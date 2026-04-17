@@ -28,10 +28,12 @@ def test_top_callsite_from_business_code(full_scan_recording, empty_context):
 	"""Top queries should report the business-logic callsite, not frappe internals."""
 	result = top_queries.analyze([full_scan_recording], empty_context)
 	top = result.aggregate["top_queries"]
-	# All fixture frames are in erpnext — should see erpnext paths, not frappe
+	# All fixture frames are in acme_reports (custom app) — should see
+	# those paths, not frappe. v0.5.2: renamed from erpnext because
+	# erpnext is now classified as framework.
 	for q in top:
 		if q["callsite"]:
-			assert "erpnext/" in q["callsite"]
+			assert "acme_reports/" in q["callsite"]
 
 
 def test_clean_recording_emits_no_slow_query_findings(clean_recording, empty_context):

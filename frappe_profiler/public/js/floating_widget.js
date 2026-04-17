@@ -24,7 +24,7 @@
 	// earlier page load. If the build ID in the console / in the
 	// widget's title attribute doesn't match what we think is current,
 	// the user is on cached JS and needs a hard refresh + bench restart.
-	const WIDGET_BUILD_ID = "2026-04-16-realtime-no-poll";
+	const WIDGET_BUILD_ID = "2026-04-16-hide-when-disabled";
 
 	// LOUD diagnostic so we can SEE this script execute in the browser console.
 	console.log(
@@ -83,6 +83,24 @@
 	}
 
 	function init() {
+		// v0.5.2 round 4: hide widget entirely when Profiler Settings ▸
+		// Profiler Enabled is off. A disabled widget is a dead button
+		// (before_request / before_job short-circuit), so showing it
+		// misleads the user into thinking they can still record.
+		// `frappe.boot.profiler_enabled` is populated by boot_session
+		// and defaults to True on error — matching the settings
+		// module's fail-open posture.
+		const bootEnabled = (
+			frappe.boot && frappe.boot.profiler_enabled
+		);
+		if (bootEnabled === false) {
+			console.log(
+				"[frappe_profiler] profiler is disabled in settings — "
+				+ "widget will not mount"
+			);
+			return;
+		}
+
 		// Mount the widget UNCONDITIONALLY for any logged-in user. The
 		// server-side `_require_profiler_user()` check in api.py is the
 		// real permission gate; this client-side check is just a hint

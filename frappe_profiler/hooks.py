@@ -73,6 +73,16 @@ app_include_css = f"/assets/frappe_profiler/css/floating_widget.css?v={_widget_c
 after_install = "frappe_profiler.install.after_install"
 before_uninstall = "frappe_profiler.install.before_uninstall"
 
+# Boot session
+# ------------
+# Attaches `profiler_enabled` to `frappe.boot` so the floating widget
+# can hide itself when the master kill-switch is off. Without this,
+# an admin who disables Profiler Settings still sees the widget —
+# which is a dead button (clicking Start does nothing because
+# before_request short-circuits). See floating_widget.js for the
+# corresponding client-side guard.
+boot_session = "frappe_profiler.boot.boot_session"
+
 # Request lifecycle (Phase 1)
 # ---------------------------
 # These hooks run AFTER frappe's own recorder hooks, so by the time

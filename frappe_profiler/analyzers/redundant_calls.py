@@ -17,16 +17,19 @@ identifier_raw so the renderer can show the appropriate form per mode.
 import json
 from collections import Counter, defaultdict
 
-from frappe_profiler.analyzers.base import AnalyzerResult, walk_callsite
+from frappe_profiler.analyzers.base import (
+	AnalyzerResult,
+	is_framework_callsite,
+	walk_callsite,
+)
 
 
-DEFAULT_REDUNDANT_DOC_THRESHOLD = 5
-DEFAULT_REDUNDANT_CACHE_THRESHOLD = 10
-DEFAULT_REDUNDANT_PERM_THRESHOLD = 10
 DEFAULT_REDUNDANT_HIGH_MULTIPLIER = 5
 
 
 def _conf_int(key: str, default: int) -> int:
+	"""site_config.json fallback for the non-threshold knob (high
+	multiplier) that isn't surfaced on the Settings DocType yet."""
 	try:
 		import frappe
 
@@ -38,13 +41,19 @@ def _conf_int(key: str, default: int) -> int:
 	return default
 
 
-def _threshold_for(fn_name: str) -> int:
+def _threshold_for(fn_name: str, cfg) -> int:
+	"""Return the count threshold for a given sidecar fn_name.
+
+	Resolved from Profiler Settings (cached) with site_config.json
+	and hardcoded defaults as fallbacks — see settings.get_config()
+	for the precedence chain.
+	"""
 	if fn_name == "get_doc":
-		return _conf_int("profiler_redundant_doc_threshold", DEFAULT_REDUNDANT_DOC_THRESHOLD)
+		return cfg.redundant_doc_threshold
 	if fn_name == "cache_get":
-		return _conf_int("profiler_redundant_cache_threshold", DEFAULT_REDUNDANT_CACHE_THRESHOLD)
+		return cfg.redundant_cache_threshold
 	if fn_name == "has_permission":
-		return _conf_int("profiler_redundant_perm_threshold", DEFAULT_REDUNDANT_PERM_THRESHOLD)
+		return cfg.redundant_perm_threshold
 	return 999_999
 
 
@@ -107,39 +116,13 @@ def _to_hashable(value):
 	return value
 
 
-def _is_framework_filename(filename: str) -> bool:
-	"""True if the given filename is inside code the user can't
-	modify from their application: frappe/*, frappe_profiler/*, OR
-	any third-party pip-installed library.
-
-	Used to filter Redundant Call findings whose loop lives in
-	framework / infra code. Production report had 3 of 4 redundant
-	findings pointing at ``env/lib/python3.14/site-packages/
-	werkzeug/serving.py`` — werkzeug's WSGI loop. 'Cache looked up
-	25 times in serving.py:370' isn't a real loop — it's once per
-	request across 25 requests — and even if it were, the user
-	can't patch werkzeug.
-	"""
-	if not filename:
-		return False
-	norm = filename.replace("\\", "/")
-	# Frappe-ecosystem framework
-	if "frappe/" in norm or "frappe_profiler/" in norm:
-		return True
-	# v0.5.2: third-party libs. Any pip-installed package lives
-	# under site-packages/ or dist-packages/ (Debian). Also catch
-	# common ones by name in case sys.path was manipulated to
-	# bypass the site-packages indirection.
-	if "site-packages/" in norm or "dist-packages/" in norm:
-		return True
-	for lib in ("werkzeug/", "gunicorn/", "/rq/", "pyinstrument/",
-	            "pytz/", "dateutil/", "MySQLdb/", "pymysql/"):
-		if lib in norm:
-			return True
-	return False
-
-
 def analyze(recordings: list, context) -> AnalyzerResult:
+	# Read settings once for this analyze pass — avoids N cache
+	# lookups for an N-bucket analysis.
+	from frappe_profiler.settings import get_config
+	cfg = get_config()
+	tracked_apps = cfg.tracked_apps  # may be empty (→ exclusion mode)
+
 	# Bucket: (fn_name, identifier_safe_tuple) → list of
 	# (action_idx, raw, caller_stack)
 	buckets: dict = defaultdict(list)
@@ -194,7 +177,7 @@ def analyze(recordings: list, context) -> AnalyzerResult:
 	drop_cross_request_spread = 0
 
 	for (fn_name, safe_key), occurrences in buckets.items():
-		threshold = _threshold_for(fn_name)
+		threshold = _threshold_for(fn_name, cfg)
 		count = len(occurrences)
 		if count < threshold:
 			continue
@@ -227,18 +210,18 @@ def analyze(recordings: list, context) -> AnalyzerResult:
 			continue
 
 		callsite = walk_callsite(first_stack)
-		if callsite is None or _is_framework_filename(
-			callsite.get("filename") or ""
+		if callsite is None or is_framework_callsite(
+			callsite.get("filename") or "", tracked_apps=tracked_apps
 		):
 			# Pure framework stack. walk_callsite returns None for
 			# profiler-own stacks; for pure frappe/* stacks it falls
 			# back to the deepest frame (so legitimate migration /
 			# background-task findings don't disappear). Here we
-			# ADDITIONALLY filter any callsite that resolves to
-			# frappe/* code, because for Redundant Calls the loop
-			# inside Frappe's own codebase isn't actionable for
-			# application developers. Same rationale as the
-			# Framework N+1 filter.
+			# ADDITIONALLY filter any callsite that resolves to an
+			# official Frappe-maintained app (frappe, erpnext, hrms,
+			# …) or a pip-installed third-party lib — the loop inside
+			# those isn't actionable for application developers.
+			# Same rationale as the Framework N+1 filter.
 			drop_framework_callsite += 1
 			continue
 

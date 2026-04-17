@@ -123,6 +123,66 @@ def test_no_finding_below_absolute_threshold():
 	assert findings == []
 
 
+def test_self_referential_hot_path_uses_clear_phrasing():
+	"""Production bug: the title read as
+	'In erpnext.accounts.doctype.pricing_rule.pricing_rule.apply_pricing_rule,
+	 96% of the time was spent in apply_pricing_rule'
+	— tautological because the action label ends with the same
+	function name. The hot spot is self-time in the function body,
+	not a subcall. We rephrase to surface that fact."""
+	tree = _node("<root>", "", 1000, [
+		_node("apply_pricing_rule", "apps/erpnext/foo.py", 960, []),
+	])
+	findings = call_tree._emit_per_action_findings(
+		tree,
+		action_idx=5,
+		action_label=(
+			"erpnext.accounts.doctype.pricing_rule.pricing_rule."
+			"apply_pricing_rule"
+		),
+		action_wall_time_ms=1000,
+	)
+	slow = [f for f in findings if f["finding_type"] == "Slow Hot Path"]
+	assert len(slow) == 1
+	title = slow[0]["title"]
+	# The old self-referential phrasing must be gone.
+	assert "of the time was spent in apply_pricing_rule" not in title, (
+		f"Self-referential hot-path phrasing must be rewritten; "
+		f"got: {title!r}"
+	)
+	# New phrasing should mention self-time / own body.
+	assert (
+		"self-time" in title.lower()
+		or "body" in title.lower()
+		or "own" in title.lower()
+	), (
+		f"Title must signal that the hot spot is self-time in the "
+		f"function's own body; got: {title!r}"
+	)
+	# Still carries the function name + percentage.
+	assert "apply_pricing_rule" in title
+	assert "96%" in title
+
+
+def test_non_self_referential_hot_path_keeps_classic_phrasing():
+	"""Sanity: the self-time fix must NOT change the classic shape
+	when action_label and fn_name are different (the common case)."""
+	tree = _node("<root>", "", 1000, [
+		_node("validate", "apps/erpnext/foo.py", 800, []),
+	])
+	findings = call_tree._emit_per_action_findings(
+		tree, action_idx=0,
+		action_label="frappe.desk.form.save.savedocs:Save",
+		action_wall_time_ms=1000,
+	)
+	slow = [f for f in findings if f["finding_type"] == "Slow Hot Path"]
+	assert len(slow) == 1
+	assert "80% of the time was spent in validate" in slow[0]["title"], (
+		f"Non-self-referential titles must keep the classic phrasing; "
+		f"got: {slow[0]['title']!r}"
+	)
+
+
 def test_hook_bottleneck_emitted_instead_of_slow_hot_path():
 	"""F3 takes precedence when ancestor is Document.run_method."""
 	tree = _node("<root>", "", 1000, [

@@ -24,6 +24,7 @@ from frappe_profiler.analyzers.base import (
 	FRAMEWORK_PREFIXES,  # noqa: F401  (kept for any external importers)
 	SEVERITY_ORDER,
 	AnalyzerResult,
+	is_framework_callsite,
 	short_filename,
 	walk_callsite,
 )
@@ -46,15 +47,13 @@ HIGH_TOTAL_TIME_MS = 200
 MEDIUM_OCCURRENCES = 20
 
 def _get_threshold() -> int:
+	"""Kept for backwards-compat with external importers. New callers
+	should go through ``frappe_profiler.settings.get_config()``."""
+	from frappe_profiler.settings import get_config
 	try:
-		import frappe
-
-		v = frappe.conf.get("profiler_n_plus_one_threshold")
-		if v is not None:
-			return int(v)
+		return get_config().n_plus_one_min_occurrences
 	except Exception:
-		pass
-	return DEFAULT_MIN_OCCURRENCES
+		return DEFAULT_MIN_OCCURRENCES
 
 
 def _get_min_total_time() -> float:
@@ -70,8 +69,27 @@ def _get_min_total_time() -> float:
 
 
 def analyze(recordings: list[dict], context) -> AnalyzerResult:
-	groups: dict[tuple, list[dict]] = defaultdict(list)
-	min_occurrences = _get_threshold()
+	# Single settings read per analyze pass (see redundant_calls for
+	# the same pattern).
+	from frappe_profiler.settings import get_config
+	cfg = get_config()
+	tracked_apps = cfg.tracked_apps
+
+	# v0.5.2 round 3: group by (filename, lineno) instead of
+	# (normalized_query, filename, lineno). A single callsite that
+	# generates 10 different query shapes in the same loop (e.g.
+	# frappe/query_builder/utils.py:131 resolving DocField / DocPerm
+	# / Custom Field metadata within one iteration) was emitting 10
+	# separate findings — same fix, 10 rows — which spammed the
+	# report. Collapsing at callsite level gives ONE finding per
+	# loop with the query variants listed in the detail.
+	#
+	# Structure: {(filename, lineno): {"variants": {normalized_q:
+	# [occurrence]}, "function_name": str}}
+	callsite_groups: dict[tuple, dict] = defaultdict(
+		lambda: {"variants": defaultdict(list), "function_name": ""}
+	)
+	min_occurrences = cfg.n_plus_one_min_occurrences
 	min_total_time = _get_min_total_time()
 
 	for action_idx, recording in enumerate(recordings):
@@ -80,74 +98,67 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 			callsite = walk_callsite(call.get("stack"))
 			if not normalized or not callsite:
 				continue
-			key = (normalized, callsite["filename"], callsite["lineno"])
-			groups[key].append(
-				{
-					"duration": call.get("duration", 0),
-					"action_idx": action_idx,
-					"function": callsite.get("function") or "",
-				}
-			)
+			key = (callsite["filename"], callsite["lineno"])
+			bucket = callsite_groups[key]
+			bucket["variants"][normalized].append({
+				"duration": call.get("duration", 0),
+				"action_idx": action_idx,
+			})
+			if not bucket["function_name"]:
+				bucket["function_name"] = callsite.get("function") or ""
 
 	findings = []
-	for (normalized, filename, lineno), occurrences in groups.items():
-		count = len(occurrences)
-		if count < min_occurrences:
+	for (filename, lineno), bucket in callsite_groups.items():
+		variants: dict = bucket["variants"]
+		# Total count across ALL variants at this callsite.
+		total_count = sum(len(occ) for occ in variants.values())
+		# N+1 signal: the MOST-repeated query variant must clear the
+		# threshold. If 10 different queries each ran once from this
+		# callsite, it's not an N+1 — it's a fan-out call site.
+		max_variant_count = max(
+			(len(occ) for occ in variants.values()), default=0
+		)
+		if max_variant_count < min_occurrences:
 			continue
 
-		total_time = sum(o["duration"] for o in occurrences)
-		# Also require a minimum total time so we don't flag 10 × 0.1 ms
-		# queries as an N+1 — those are not worth reporting.
+		total_time = sum(
+			o["duration"]
+			for occ in variants.values()
+			for o in occ
+		)
+		# Minimum total time so we don't flag 10 × 0.1 ms queries as
+		# an N+1 — those are not worth reporting.
 		if total_time < min_total_time:
 			continue
 
-		function_name = occurrences[0]["function"]
-		action_idx = occurrences[0]["action_idx"]
+		# For the finding's "canonical" representative, use the query
+		# variant with the most occurrences (highest-impact loop).
+		top_variant = max(variants.items(), key=lambda kv: len(kv[1]))
+		canonical_query, canonical_occurrences = top_variant
+		function_name = bucket["function_name"]
+		action_idx = canonical_occurrences[0]["action_idx"]
+		variant_count = len(variants)
 
-		# v0.5.1: shorten filename in the TITLE only. Deeply-nested module
-		# paths (e.g. jewellery_erpnext/jewellery_erpnext/jewellery_erpnext/
-		# doctype/parent_manufacturing_order/parent_manufacturing_order.py)
-		# push the 140-char Profiler Finding.title limit and crash analyze
-		# with CharacterLengthExceededError. customer_description and
-		# technical_detail_json keep the full filename for navigation.
 		short_fn = short_filename(filename)
-
-		# v0.5.1: framework-level repetition gets a separate finding
-		# type. When the N+1 is blamed on frappe/* code (e.g. the query
-		# builder resolving table metadata 138× in one session),
-		# there's usually nothing the user can do — the framework is
-		# iterating over inputs as designed. Flagging it as a normal
-		# "N+1 Query" would tell the user to "refactor to fetch data
-		# in one query" for code they don't own.
-		#
-		# Emit as "Framework N+1" with Low severity and a customer
-		# description that's transparent about the limited action
-		# available. Contributors who DO want to act on framework N+1s
-		# can still see them in the findings list — they're just
-		# distinct from application-level N+1s.
-		is_framework = _is_framework_callsite(filename)
-		if is_framework:
-			findings.append(_build_framework_finding(
-				short_fn=short_fn,
-				filename=filename,
-				lineno=lineno,
-				function_name=function_name,
-				normalized=normalized,
-				count=count,
-				total_time=total_time,
-				action_idx=action_idx,
-			))
-		else:
-			findings.append(_build_user_finding(
-				short_fn=short_fn,
-				filename=filename,
-				lineno=lineno,
-				function_name=function_name,
-				normalized=normalized,
-				count=count,
-				total_time=total_time,
-				action_idx=action_idx,
-			))
+		is_framework = is_framework_callsite(filename, tracked_apps=tracked_apps)
+		builder = _build_framework_finding if is_framework else _build_user_finding
+		findings.append(builder(
+			short_fn=short_fn,
+			filename=filename,
+			lineno=lineno,
+			function_name=function_name,
+			normalized=canonical_query,
+			count=total_count,
+			total_time=total_time,
+			action_idx=action_idx,
+			# v0.5.2 round 3: expose variant list so the detail can
+			# show "10 query variants observed" with sample queries.
+			all_variants=sorted(
+				variants.keys(),
+				key=lambda q: -len(variants[q]),
+			),
+			variant_count=variant_count,
+		))
 
 	# Sort: highest severity first, then highest impact within severity
 	findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 3), -f["estimated_impact_ms"]))
@@ -164,21 +175,37 @@ def _severity(count: int, total_time_ms: float) -> str:
 
 
 def _is_framework_callsite(filename: str) -> bool:
-	"""True when the blamed file is inside Frappe / frappe_profiler.
+	"""True when the blamed file is inside a framework or official
+	Frappe-maintained app (see base.FRAMEWORK_APPS).
 
 	Used to route N+1 findings into the separate "Framework N+1"
 	bucket (Low severity, transparent description) rather than the
 	normal "N+1 Query" one. The callsite walker already prefers
-	user-code frames over framework frames, so this only fires when
-	EVERY frame in the stack was in the framework — which happens
-	for framework background tasks, migrations, and
-	framework-internal query loops like frappe.query_builder.utils
-	building a SELECT for each input.
+	user-code frames over framework core frames, so this only fires
+	when EVERY frame in the stack was in a framework app — which
+	happens for framework background tasks, migrations, and
+	framework-internal query loops (e.g. frappe.query_builder.utils
+	building a SELECT for each input, or erpnext's sales_invoice
+	validation looping over cached lookups).
+
+	Thin wrapper around base.is_framework_callsite — kept as its own
+	module-level name for backwards compatibility with existing tests
+	that import ``n_plus_one._is_framework_callsite``.
 	"""
-	if not filename:
-		return False
-	norm = filename.replace("\\", "/")
-	return "frappe/" in norm or "frappe_profiler/" in norm
+	return is_framework_callsite(filename)
+
+
+def _title_for_callsite(short_fn, lineno, count, variant_count) -> str:
+	"""Format the N+1 title. Single variant: 'Same query ran N× at …'.
+	Multi variant: 'Callsite ran N queries in M variants at …' so
+	the user knows the loop generates different SQL shapes, not
+	literally the same string."""
+	if variant_count <= 1:
+		return f"Same query ran {count}× at {short_fn}:{lineno}"
+	return (
+		f"Callsite ran {count} queries ({variant_count} variants) "
+		f"at {short_fn}:{lineno}"
+	)
 
 
 def _build_user_finding(
@@ -191,20 +218,34 @@ def _build_user_finding(
 	count: int,
 	total_time: float,
 	action_idx: int,
+	all_variants: list[str] | None = None,
+	variant_count: int = 1,
 ) -> dict:
 	"""Build the classic user-code N+1 finding — High/Medium/Low
 	severity by count & impact, actionable fix hint."""
+	all_variants = all_variants or [normalized]
+	multi = variant_count > 1
+
+	desc = (
+		f"We noticed the same query was repeated {count} times in a row "
+		f"from the same line of code ({filename}:{lineno}), costing about "
+		f"{total_time:.0f}ms in total. This is usually a Python loop that "
+		"should fetch its data in one query instead of one-at-a-time. "
+		"Typical fix: a few hours of dev work."
+	) if not multi else (
+		f"The loop at **{filename}:{lineno}** issued **{count} queries** "
+		f"in {variant_count} different shapes, costing {total_time:.0f}ms. "
+		"Even though the queries differ, they all come from the same "
+		"line — a loop iterating over inputs and running one query per "
+		"iteration. The fix is the same as a classic N+1: batch the "
+		"data into a single query."
+	)
+
 	return {
 		"finding_type": "N+1 Query",
 		"severity": _severity(count, total_time),
-		"title": f"Same query ran {count}× at {short_fn}:{lineno}",
-		"customer_description": (
-			f"We noticed the same query was repeated {count} times in a row "
-			f"from the same line of code ({filename}:{lineno}), costing about "
-			f"{total_time:.0f}ms in total. This is usually a Python loop that "
-			"should fetch its data in one query instead of one-at-a-time. "
-			"Typical fix: a few hours of dev work."
-		),
+		"title": _title_for_callsite(short_fn, lineno, count, variant_count),
+		"customer_description": desc,
 		"technical_detail_json": json.dumps(
 			{
 				"callsite": {
@@ -214,8 +255,31 @@ def _build_user_finding(
 				},
 				"normalized_query": normalized,
 				"occurrences": count,
+				"variant_count": variant_count,
+				# Up to 5 sample variants for the detail block —
+				# enough to identify the loop, capped so we don't
+				# blow out the 140-char title limit / DocType blob.
+				"sample_queries": all_variants[:5],
 				"total_time_ms": round(total_time, 2),
 				"average_time_ms": round(total_time / count, 2) if count else 0,
+				# v0.5.3: projected post-fix timing. Batching N loop
+				# queries into ONE collapses the wall-clock cost to
+				# roughly a single query. Empirically, a batched query
+				# with an IN (…) filter or a JOIN costs ~2× a single
+				# tight query (the work still scans the same rows, just
+				# once, and returns a bigger result set). We use that
+				# 2× multiplier as the ceiling so the user sees the
+				# realistic savings, not the idealized floor. A 74-
+				# query 85ms loop projects to ~2.2ms after batching.
+				"projected_total_ms": (
+					round((total_time / count) * 2, 2) if count else 0
+				),
+				"projected_avg_time_ms": (
+					round((total_time / count) * 2, 2) if count else 0
+				),
+				"projected_speedup_label": (
+					f"~{max(1, count // 2)}× fewer queries" if count >= 4 else None
+				),
 				"fix_hint": (
 					"This is a classic N+1 pattern. The Python code at "
 					f"{filename}:{lineno} is running the same query in a loop. "
@@ -243,6 +307,8 @@ def _build_framework_finding(
 	count: int,
 	total_time: float,
 	action_idx: int,
+	all_variants: list[str] | None = None,
+	variant_count: int = 1,
 ) -> dict:
 	"""Build the framework-level N+1 finding — always Low severity,
 	description acknowledges the user can rarely fix framework code.
@@ -250,15 +316,20 @@ def _build_framework_finding(
 	Still includes the technical detail (callsite, query, impact) so
 	contributors who WANT to optimize the framework can find it.
 	"""
+	all_variants = all_variants or [normalized]
+	title = (
+		f"Framework query repeated {count}× at {short_fn}:{lineno}"
+		if variant_count <= 1
+		else f"Framework callsite ran {count} queries ({variant_count} variants) at {short_fn}:{lineno}"
+	)
+
 	return {
 		"finding_type": "Framework N+1",
 		"severity": "Low",
-		"title": (
-			f"Framework query repeated {count}× at {short_fn}:{lineno}"
-		),
+		"title": title,
 		"customer_description": (
-			f"Frappe's own code at **{filename}:{lineno}** issued the "
-			f"same query {count} times in this session, totalling "
+			f"Frappe's own code at **{filename}:{lineno}** issued "
+			f"{count} queries in this session, totalling "
 			f"{total_time:.0f}ms. This is typically the framework "
 			"resolving metadata, permissions, or building queries for "
 			"different inputs — it's rarely something you can change "
@@ -275,6 +346,8 @@ def _build_framework_finding(
 				},
 				"normalized_query": normalized,
 				"occurrences": count,
+				"variant_count": variant_count,
+				"sample_queries": all_variants[:5],
 				"total_time_ms": round(total_time, 2),
 				"average_time_ms": round(total_time / count, 2) if count else 0,
 				"is_framework": True,

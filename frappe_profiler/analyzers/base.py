@@ -41,10 +41,140 @@ SEVERITY_ORDER: dict[str, int] = {"High": 0, "Medium": 1, "Low": 2}
 # not the frappe helper the query was routed through (get_value,
 # get_all, db.count etc.). See the detailed explanation in
 # analyzers/n_plus_one.py — this is just a shared constant now.
+#
+# Intentionally narrower than FRAMEWORK_APPS below: walk_callsite uses
+# this to pick a BLAME frame (skip frappe helpers, surface the caller).
+# We don't skip erpnext/hrms/etc. here because when a user's app calls
+# into erpnext, the deepest erpnext frame is still a legitimate blame
+# target (user can at least refactor their calling pattern). The
+# is_framework_callsite() FILTER (below) routes those into Observations
+# separately, which is the right layer for the noise filter.
 FRAMEWORK_PREFIXES: tuple[str, ...] = (
 	"frappe/",
 	"frappe_profiler/",
 )
+
+# v0.5.2: official Frappe-maintained apps. When a finding's BLAME
+# frame resolves inside one of these apps, the user can't practically
+# act on it — fixes live upstream, not in their bench. The renderer
+# routes these into the collapsed Observations subsection (see the
+# split in renderer.py + redundant_calls / explain_flags / n_plus_one
+# filters).
+#
+# Production trigger: a raw session on a Sales Invoice Save+Submit
+# surfaced 10 "Redundant cache lookup: <hash> (106 times)" findings
+# all landing in apps/erpnext/.../sales_invoice.py:300-321 — a loop
+# inside ERPNext that the application developer can't patch.
+FRAMEWORK_APPS: frozenset[str] = frozenset({
+	"frappe",
+	"frappe_profiler",
+	"erpnext",
+	"payments",
+	"hrms",
+	"lms",
+	"helpdesk",
+	"insights",
+	"crm",
+	"builder",
+	"wiki",
+	"drive",
+})
+
+# Well-known third-party libs to catch even when sys.path manipulation
+# bypasses site-packages/. Checked by is_framework_callsite().
+_THIRD_PARTY_LIB_FRAGMENTS: tuple[str, ...] = (
+	"werkzeug/",
+	"gunicorn/",
+	"/rq/",
+	"pyinstrument/",
+	"pytz/",
+	"dateutil/",
+	"MySQLdb/",
+	"pymysql/",
+)
+
+
+def _extract_app_segment(norm: str) -> str | None:
+	"""Return the app name from a normalized filename, or None.
+
+	Handles both path shapes we see in recorder stacks:
+	- ``apps/<app>/<app>/foo.py`` (bench-relative)
+	- ``<app>/foo.py`` (pyinstrument short form after path strip)
+	- ``/abs/path/to/apps/<app>/<app>/foo.py`` (absolute)
+
+	For the short form we treat the first path segment as the app.
+	For the bench-relative / absolute forms we return the segment
+	that follows ``apps/``.
+	"""
+	if not norm:
+		return None
+	# Split on 'apps/' if present.
+	marker = "apps/"
+	idx = norm.find(marker)
+	if idx != -1:
+		tail = norm[idx + len(marker):]
+		first = tail.split("/", 1)[0]
+		if first:
+			return first
+	# Short form — first segment.
+	first = norm.split("/", 1)[0]
+	return first or None
+
+
+def is_framework_callsite(
+	filename: str | None,
+	tracked_apps: tuple[str, ...] | None = None,
+) -> bool:
+	"""True if ``filename`` lives inside framework or third-party code
+	that the application developer can't practically patch.
+
+	Two modes, chosen by whether ``tracked_apps`` is provided:
+
+	**Inclusion mode** — when ``tracked_apps`` is a non-empty tuple, the
+	classifier flips: a callsite is framework *unless* its app matches
+	one of the tracked apps. This is what ``Profiler Settings ▸ Tracked
+	Apps`` configures — it lets the site admin say "I only care about
+	findings in myapp" and get everything else routed to Observations
+	without having to enumerate every framework app.
+
+	**Exclusion mode** — when ``tracked_apps`` is None or empty, the
+	classifier uses the built-in ``FRAMEWORK_APPS`` set + third-party
+	heuristics. This is the default for sites that haven't configured
+	the Single.
+
+	Matching is boundary-sensitive (``/app/`` or ``startswith(app/)``)
+	so ``crm/`` does NOT false-positive on ``my_crm/``.
+
+	Used by redundant_calls, explain_flags, and n_plus_one to route
+	findings with framework-only callsites into the Observations bucket.
+	Tests and internal callers pass ``tracked_apps`` explicitly;
+	production runtime passes ``None`` and lets the caller plumb in
+	the value from ``frappe_profiler.settings.get_tracked_apps()`` to
+	avoid circular imports here.
+	"""
+	if not filename:
+		return False
+	norm = filename.replace("\\", "/")
+
+	if tracked_apps:
+		# Inclusion mode: framework UNLESS the app is in the allowlist.
+		app = _extract_app_segment(norm)
+		if app and app in tracked_apps:
+			return False
+		return True
+
+	# Exclusion mode (default): framework if the app is in the built-in
+	# FRAMEWORK_APPS set or the path contains a known third-party marker.
+	for app in FRAMEWORK_APPS:
+		token = f"{app}/"
+		if norm.startswith(token) or f"/{token}" in norm:
+			return True
+	if "site-packages/" in norm or "dist-packages/" in norm:
+		return True
+	for lib in _THIRD_PARTY_LIB_FRAGMENTS:
+		if lib in norm:
+			return True
+	return False
 
 
 def is_profiler_own_query(stack: list | None) -> bool:
@@ -202,6 +332,69 @@ def walk_callsite_str(stack: list | None) -> str | None:
 #
 # Analyzers should use this for TITLES only; customer_description and
 # technical_detail_json can keep the full path for disambiguation.
+
+
+# ---------------------------------------------------------------------------
+# v0.5.3: "Projected after fix" timing heuristics
+# ---------------------------------------------------------------------------
+# Per-finding-type speedup factors. Applied to the CURRENT average per-query
+# time to estimate what the same query would cost after the recommended
+# fix. These are ceiling estimates — a real fix could do better or worse,
+# but they give the developer a rough sense of "is this worth my afternoon".
+#
+# Derivations:
+#   Full Table Scan: scan O(N) → index lookup O(log N). For N=10k-10M the
+#                    ratio is ~20×. Use 0.05.
+#   Missing Index:   same — the suggestion IS to add an index.
+#   Filesort:        sort cost is O(N log N); with an index-ordered read,
+#                    the sort disappears but the read cost remains. Typical
+#                    observed speedup on Frappe DocTypes is ~3×. Use 0.30.
+#   Temporary Table: materialization cost goes away when a covering index
+#                    supports the GROUP BY / DISTINCT. ~2× speedup. Use 0.50.
+#   Low Filter Ratio: the fix is selectivity, so projected_time ≈ current ×
+#                    (filtered% / 100). Special-cased in explain_flags —
+#                    not a simple factor.
+#   N+1 Query:       N queries × avg → 1 batched query ≈ 2 × avg. Computed
+#                    directly in n_plus_one, not via this table.
+_POST_FIX_SPEEDUP: dict[str, float] = {
+	"Full Table Scan": 0.05,
+	"Missing Index": 0.05,
+	"Filesort": 0.30,
+	"Temporary Table": 0.50,
+}
+
+# Minimum projected time per query. Even a perfect index lookup costs
+# client/server round-trip + plan time, which is typically ~0.3-0.5ms on
+# a warm MariaDB connection. Don't project below this floor — otherwise
+# the report claims "projected 0.0ms" which is nonsense.
+POST_FIX_FLOOR_MS = 0.3
+
+
+def project_post_fix_ms(
+	finding_type: str,
+	current_avg_ms: float,
+	filtered_pct: float | None = None,
+) -> float | None:
+	"""Return the projected per-query time after applying the finding's
+	suggested fix, or None if the finding type isn't one we project.
+
+	``filtered_pct`` is only used for "Low Filter Ratio" findings
+	(MariaDB's EXPLAIN ``filtered`` column, 0-100 representing what %
+	of examined rows survive the WHERE).
+	"""
+	if current_avg_ms <= 0:
+		return None
+
+	if finding_type == "Low Filter Ratio":
+		if filtered_pct is None or filtered_pct <= 0:
+			return None
+		factor = max(0.01, filtered_pct / 100.0)
+		return max(POST_FIX_FLOOR_MS, round(current_avg_ms * factor, 2))
+
+	factor = _POST_FIX_SPEEDUP.get(finding_type)
+	if factor is None:
+		return None
+	return max(POST_FIX_FLOOR_MS, round(current_avg_ms * factor, 2))
 
 
 def short_filename(filename: str, keep_segments: int = 2) -> str:

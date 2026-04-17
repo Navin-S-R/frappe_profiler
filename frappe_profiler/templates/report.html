@@ -100,6 +100,205 @@
   }
   .section > h2:first-child { margin-top: 0; }
 
+  /* v0.5.2: collapsible <details> sections. Native HTML5 — no JS
+     required, fully keyboard + screen-reader accessible. Default
+     expanded for primary sections (via `open` attribute in the
+     template); nested sub-sections (e.g., framework-level
+     observations under Findings) default collapsed so the main
+     list isn't buried in noise by default. */
+  details.section > summary,
+  details.subsection > summary {
+    list-style: none;
+    cursor: pointer;
+    user-select: none;
+  }
+  details.section > summary::-webkit-details-marker,
+  details.subsection > summary::-webkit-details-marker {
+    display: none;
+  }
+  details.section > summary h2 {
+    display: inline-block;
+    margin: 0;
+  }
+  /* Chevron that rotates when the details is open. */
+  details.section > summary::before,
+  details.subsection > summary::before {
+    content: "";
+    display: inline-block;
+    width: 0;
+    height: 0;
+    margin-right: 8px;
+    vertical-align: middle;
+    border-left: 6px solid currentColor;
+    border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+    transition: transform 0.15s ease;
+    transform-origin: center;
+  }
+  details.section[open] > summary::before,
+  details.subsection[open] > summary::before {
+    transform: rotate(90deg);
+  }
+  details.section > summary:hover h2 {
+    color: #2563eb;
+  }
+  details.subsection {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px dashed #e5e7eb;
+  }
+  details.subsection > summary h3 {
+    display: inline-block;
+    margin: 0;
+    font-size: 0.95rem;
+    color: #6b7280;
+  }
+  details.subsection > summary:hover h3 {
+    color: #2563eb;
+  }
+
+  /* v0.5.2: per-app bucket header — the <h3> inside a subsection
+     <summary> renders as "myapp · 3 findings · ~420ms". The app name
+     is the primary emphasis; count + impact are muted so they read
+     as secondary metadata without competing for attention. */
+  .app-bucket-name {
+    color: #111827;
+    font-weight: 600;
+  }
+  .app-bucket-meta {
+    font-weight: 400;
+    color: #6b7280;
+    margin-left: 4px;
+  }
+
+  /* v0.5.3: projected post-fix timing line. Renders as a subtle green
+     pill directly under the "occurrences / avg / total" line so the
+     reader sees current vs projected at a glance and can prioritize
+     by ceiling-of-value (worth a few hours for a 20× speedup vs a
+     1.5× speedup). Green = "this is the win"; uses the severity-low
+     palette so it doesn't compete with severity badges. */
+  .projected-after-fix {
+    color: #065f46;
+    background: #f0fdf4;
+    border-left: 3px solid #10b981;
+    padding: 4px 10px;
+    margin-top: 6px;
+    border-radius: 3px;
+    display: inline-block;
+  }
+  .projected-after-fix .projected-label {
+    font-weight: 600;
+    margin-right: 4px;
+  }
+  .projected-after-fix .projected-speedup {
+    color: #047857;
+    font-weight: 600;
+    margin-left: 4px;
+  }
+
+  /* v0.5.2 round 4: clickable callsite → editor. Subtle style — looks
+     like the plain <code> block but with a dotted underline that
+     signals interactivity, and a hover color lift. We don't use the
+     default-link blue because the callsite is already inline code
+     and shouldn't compete for attention with surrounding text. */
+  a.callsite-link {
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px dotted #9ca3af;
+    cursor: pointer;
+  }
+  a.callsite-link:hover {
+    border-bottom-color: #2563eb;
+  }
+  a.callsite-link:hover code {
+    color: #1d4ed8;
+  }
+  /* Print mode: drop the editor-link decoration — a PDF reader can't
+     click vscode:// handlers. */
+  @media print {
+    a.callsite-link { border-bottom: none; }
+  }
+
+  /* v0.5.2 round 3: Executive summary card. The visual weight signals
+     "read this first" — colored left border flags session pace
+     (green / amber / red), generous padding, bullets styled like an
+     agenda. A non-developer should get the punch without scrolling. */
+  .exec-summary {
+    background: white;
+    border-radius: 8px;
+    border-left: 6px solid #10b981;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    padding: 18px 22px;
+    margin-bottom: 20px;
+  }
+  .exec-summary.pace-moderate { border-left-color: #f59e0b; }
+  .exec-summary.pace-slow { border-left-color: #dc2626; }
+  .exec-summary h2 { margin: 0 0 8px 0; border: 0; padding: 0; }
+  .exec-headline {
+    font-size: 1.05rem;
+    color: #111827;
+    margin: 0 0 12px 0;
+  }
+  .exec-bullets { margin-top: 8px; }
+  .exec-bullets ol {
+    margin: 8px 0 0 0;
+    padding-left: 24px;
+  }
+  .exec-bullets li {
+    padding: 6px 0;
+    color: #374151;
+    line-height: 1.5;
+  }
+  .exec-bullet-severity {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 3px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  .exec-bullet-severity.severity-high {
+    background: #fee2e2; color: #991b1b;
+  }
+  .exec-bullet-severity.severity-medium {
+    background: #fef3c7; color: #92400e;
+  }
+  .exec-bullet-severity.severity-low {
+    background: #dbeafe; color: #1e40af;
+  }
+  .exec-bullet-text { font-weight: 500; }
+  .exec-bullet-impact {
+    color: #6b7280;
+    margin-left: 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  .exec-infra {
+    margin: 10px 0 0 0;
+    padding-top: 10px;
+    border-top: 1px dashed #e5e7eb;
+    color: #374151;
+    font-size: 0.9rem;
+  }
+
+  /* v0.5.2: analyzer-notes bullet list — readable line spacing so the
+     suppression explanations don't jam together like the old
+     newline-concatenated paragraph did. */
+  .analyzer-notes-list {
+    margin: 12px 0 4px 20px;
+    padding: 0;
+  }
+  .analyzer-notes-list li {
+    margin-bottom: 10px;
+    color: #374151;
+    line-height: 1.5;
+  }
+  .analyzer-notes-list li:last-child {
+    margin-bottom: 0;
+  }
+
   /* ---------- Tables ---------- */
   table {
     width: 100%;
@@ -198,6 +397,26 @@
     body { background: white; }
     .section, .stat, .report-header { box-shadow: none; border: 1px solid #e5e7eb; }
     .finding { page-break-inside: avoid; }
+
+    /* v0.5.2 round 4: force-expand every collapsible section for PDF
+       / print output. Without this, wkhtmltopdf (and Chrome's print
+       engine) only render disclosure-element content when the
+       element has the open attribute — so the Observations subsection,
+       the Analyzer notes section, and any collapsed app buckets
+       disappear entirely from the exported PDF. The print-media
+       override keeps parity between what the reader sees in the
+       browser and what ends up in the PDF. */
+    details > summary { list-style: none; }
+    details > summary::-webkit-details-marker { display: none; }
+    details > summary::before { display: none !important; }
+    details > *:not(summary) {
+      display: revert !important;
+    }
+    /* Collapse the interactive cursor since PDF readers can't click. */
+    details > summary { cursor: default; }
+    /* Ensure subsection borders still visually separate app buckets
+       when everything is expanded at once. */
+    details.subsection { border-top: 1px dashed #e5e7eb; margin-top: 12px; padding-top: 10px; }
   }
 
   @media (max-width: 700px) {
@@ -238,6 +457,109 @@
 </head>
 <body>
 
+{# v0.5.2: shared finding-card macro used by both Findings and
+   Observations sections. DRYs out the ~40-line card markup so the
+   per-app bucket loop stays readable. `show_fix_hint_label` toggles
+   "How to fix" (actionable Findings) vs "Context" (Observations). #}
+{% macro finding_card(f, show_fix_hint_label="How to fix") %}
+  <div class="finding severity-{{ f.severity | lower }}">
+    <div class="finding-header">
+      <span class="severity-badge {{ f.severity | lower }}">{{ f.severity }}</span>
+      <span class="finding-title">{{ f.title }}</span>
+      <span class="finding-impact">~{{ "%.0f" | format(f.estimated_impact_ms) }}ms{% if f.affected_count > 1 %} &middot; {{ f.affected_count }}×{% endif %}</span>
+    </div>
+    <div class="finding-description">{{ f.customer_description }}</div>
+
+    {% if f.technical_detail %}
+    <div class="finding-detail">
+      {% set detail = f.technical_detail %}
+
+      {% if detail.callsite %}
+        <span class="label">Callsite</span>
+        {# v0.5.2 round 4: in raw mode, absolute-path callsites become
+           clickable vscode://file links so developers can jump from
+           the report into their editor in one click. Cursor + VS Code
+           Insiders both register this handler, so the link works
+           across the common Frappe dev setups. Safe mode stays plain
+           text — we don't leak absolute paths outside the org. #}
+        {% if mode == "raw" and detail.callsite.filename and detail.callsite.filename.startswith("/") %}
+          <a class="callsite-link"
+             href="vscode://file{{ detail.callsite.filename }}:{{ detail.callsite.lineno }}"
+             title="Open in VS Code / Cursor">
+            <code>{{ detail.callsite.filename }}:{{ detail.callsite.lineno }}{% if detail.callsite.function %} <span class="muted">({{ detail.callsite.function }})</span>{% endif %}</code>
+          </a>
+        {% else %}
+          <code>{{ detail.callsite.filename }}:{{ detail.callsite.lineno }}{% if detail.callsite.function %} <span class="muted">({{ detail.callsite.function }})</span>{% endif %}</code>
+        {% endif %}
+      {% endif %}
+
+      {% if detail.normalized_query %}
+        <span class="label">Query (normalized)</span>
+        <pre>{{ detail.normalized_query }}</pre>
+      {% endif %}
+
+      {% if detail.suggested_ddl %}
+        <span class="label">Suggested DDL</span>
+        <pre>{{ detail.suggested_ddl }}</pre>
+      {% endif %}
+
+      {% if detail.example_queries %}
+        <span class="label">Affected queries (first {{ detail.example_queries|length }})</span>
+        {% for q in detail.example_queries %}
+          <pre>{{ q }}</pre>
+        {% endfor %}
+      {% endif %}
+
+      {% if detail.explain_row %}
+        <span class="label">EXPLAIN row</span>
+        <pre>{{ detail.explain_row }}</pre>
+      {% endif %}
+
+      {% if detail.fix_hint %}
+        <span class="label">{{ show_fix_hint_label }}</span>
+        <p>{{ detail.fix_hint }}</p>
+      {% endif %}
+
+      {% if detail.validation_note %}
+        <p class="small muted"><em>{{ detail.validation_note }}</em></p>
+      {% endif %}
+
+      {% if detail.occurrences %}
+        <p class="small muted">
+          {{ detail.occurrences }} occurrences
+          {% if detail.average_time_ms %} &middot; ~{{ "%.1f" | format(detail.average_time_ms) }}ms each{% endif %}
+          {% if detail.total_time_ms %} &middot; {{ "%.0f" | format(detail.total_time_ms) }}ms total{% endif %}
+        </p>
+      {% endif %}
+
+      {# v0.5.3: projected post-fix timing. Analyzers (explain_flags
+         + n_plus_one) set projected_avg_time_ms / projected_total_ms
+         when there's a credible estimate — see base.project_post_fix_ms
+         for the per-finding-type heuristics. #}
+      {% if detail.projected_avg_time_ms is defined and detail.projected_avg_time_ms %}
+        <p class="small projected-after-fix">
+          <span class="projected-label">Projected after fix:</span>
+          ~{{ "%.1f" | format(detail.projected_avg_time_ms) }}ms each
+          {% if detail.projected_total_ms %} &middot; ~{{ "%.0f" | format(detail.projected_total_ms) }}ms total{% endif %}
+          {% if detail.projected_speedup_label %} <span class="projected-speedup">({{ detail.projected_speedup_label }})</span>{% endif %}
+        </p>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+{% endmacro %}
+
+{# v0.5.2: per-app bucket header — "myapp (3 findings, ~420ms)". #}
+{% macro app_bucket_header(bucket) %}
+  <span class="app-bucket-name">{{ bucket.app }}</span>
+  <span class="app-bucket-meta small muted">
+    &middot; {{ bucket.count }} finding{{ "s" if bucket.count != 1 else "" }}
+    {% if bucket.total_impact_ms %}
+      &middot; ~{{ "%.0f" | format(bucket.total_impact_ms) }}ms
+    {% endif %}
+  </span>
+{% endmacro %}
+
 <div class="container">
 
   {# --------------- HEADER --------------- #}
@@ -253,10 +575,43 @@
       &middot; Report generated {{ generated_at }}
       <br><span class="small muted">All times in server timezone ({{ server_tz or "UTC" }})</span>
     </div>
-    {% if session.analyzer_warnings %}
-      <p class="small muted"><strong>Warnings:</strong> {{ session.analyzer_warnings }}</p>
+    {% if analyzer_warnings %}
+      <p class="small muted">
+        <strong>Analyzer notes:</strong>
+        {{ analyzer_warnings | length }} suppression{{ "s" if analyzer_warnings | length != 1 else "" }}
+        recorded &mdash; see the <a href="#analyzer-notes">Analyzer notes</a> section at the bottom.
+      </p>
     {% endif %}
   </div>
+
+  {# v0.5.2 round 3: EXECUTIVE SUMMARY — TL;DR readable in 30 seconds.
+     Placed above the stat-cards so a non-developer sees the "what's
+     wrong + what to fix" narrative before the raw numbers. #}
+  {% if executive_summary.show %}
+  <div class="exec-summary pace-{{ executive_summary.pace }}">
+    <h2>At a glance</h2>
+    <p class="exec-headline">{{ executive_summary.headline }}</p>
+
+    {% if executive_summary.bullets %}
+    <div class="exec-bullets">
+      <p class="small muted">Top {{ executive_summary.bullets | length }} highest-impact finding{{ "s" if executive_summary.bullets | length != 1 else "" }}{% if executive_summary.total_impact_ms %} ({{ executive_summary.total_impact_ms | int }}ms combined){% endif %}:</p>
+      <ol>
+        {% for b in executive_summary.bullets %}
+        <li>
+          <span class="exec-bullet-severity severity-{{ b.severity | lower }}">{{ b.severity }}</span>
+          <span class="exec-bullet-text">{{ b.text }}</span>
+          {% if b.impact_ms %}<span class="exec-bullet-impact">~{{ b.impact_ms | int }}ms</span>{% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+    </div>
+    {% endif %}
+
+    {% if executive_summary.infra_note %}
+    <p class="exec-infra"><strong>Infra:</strong> {{ executive_summary.infra_note }}</p>
+    {% endif %}
+  </div>
+  {% endif %}
 
   {# v0.5.0: Steps to Reproduce / Notes. Content is pre-sanitized by
      renderer.py via frappe.utils.html_utils.sanitize_html (bleach) so
@@ -265,18 +620,18 @@
      bleach-cleaned — do NOT change to `session.notes | safe` without
      re-adding sanitization, that's a stored-XSS sink. #}
   {% if notes_html %}
-  <section class="section" style="background: #f0f9ff; border-left: 4px solid #2563eb;">
-    <h2 style="margin-top: 0;">Steps to Reproduce</h2>
+  <details class="section" open style="background: #f0f9ff; border-left: 4px solid #2563eb;">
+    <summary><h2 style="margin-top: 0;">Steps to Reproduce</h2></summary>
     <div class="notes-content">
       {{ notes_html | safe }}
     </div>
-  </section>
+  </details>
   {% endif %}
 
   {# v0.4.0: SECTION C1 — Session-level delta card #}
   {% if comparison %}
-  <section class="section comparison-card">
-    <h2>Compared to baseline: {{ comparison.baseline_info.title }}</h2>
+  <details class="section comparison-card" open>
+    <summary><h2>Compared to baseline: {{ comparison.baseline_info.title }}</h2></summary>
     <p class="muted">Baseline recorded {{ comparison.baseline_info.started_at }}</p>
     <table class="session-delta">
       <thead>
@@ -296,7 +651,7 @@
         {% endfor %}
       </tbody>
     </table>
-  </section>
+  </details>
   {% endif %}
 
   {# --------------- STAT CARDS --------------- #}
@@ -331,18 +686,18 @@
   </div>
 
   {# --------------- SUMMARY --------------- #}
-  <div class="section">
-    <h2>Summary</h2>
+  <details class="section" open>
+    <summary><h2>Summary</h2></summary>
     {% if session.summary_html %}
       {{ session.summary_html | safe }}
     {% else %}
       <p class="empty">No summary available.</p>
     {% endif %}
-  </div>
+  </details>
 
   {# --------------- PER-ACTION BREAKDOWN --------------- #}
-  <div class="section">
-    <h2>Per-action breakdown</h2>
+  <details class="section" open>
+    <summary><h2>Per-action breakdown</h2></summary>
     {% if actions %}
       <p class="small muted">Sorted by duration. Click on the action to drill into its queries.</p>
       <table>
@@ -379,12 +734,12 @@
     {% else %}
       <p class="empty">No actions were recorded in this session.</p>
     {% endif %}
-  </div>
+  </details>
 
   {# v0.4.0: SECTION C2 — Per-action comparison diff #}
   {% if comparison and comparison.action_pairs %}
-  <section class="section comparison-action-diff">
-    <h2>Per-action comparison</h2>
+  <details class="section comparison-action-diff" open>
+    <summary><h2>Per-action comparison</h2></summary>
 
     {% set matched = comparison.action_pairs | selectattr("status", "equalto", "matched") | list %}
     {% if matched %}
@@ -431,13 +786,13 @@
       {% endfor %}
     </ul>
     {% endif %}
-  </section>
+  </details>
   {% endif %}
 
   {# v0.4.0: SECTION C3 — Finding diff #}
   {% if comparison and (comparison.finding_diff.fixed or comparison.finding_diff.new or comparison.finding_diff.unchanged) %}
-  <section class="section comparison-findings">
-    <h2>Findings compared to baseline</h2>
+  <details class="section comparison-findings" open>
+    <summary><h2>Findings compared to baseline</h2></summary>
 
     {% if comparison.finding_diff.fixed %}
     <h3 class="fixed-findings-header">Fixed ({{ comparison.finding_diff.fixed | length }})</h3>
@@ -473,128 +828,72 @@
       {% endfor %}
     </ul>
     {% endif %}
-  </section>
+  </details>
   {% endif %}
 
-  {# --------------- FINDINGS --------------- #}
-  <div class="section">
-    <h2>Findings &mdash; what to fix</h2>
-    {% if findings %}
-      <p class="small muted">Sorted by severity, then by impact. Each finding includes a plain-language description for you and a technical detail block for your developer.</p>
-      {% for f in findings %}
-      <div class="finding severity-{{ f.severity | lower }}">
-        <div class="finding-header">
-          <span class="severity-badge {{ f.severity | lower }}">{{ f.severity }}</span>
-          <span class="finding-title">{{ f.title }}</span>
-          <span class="finding-impact">~{{ "%.0f" | format(f.estimated_impact_ms) }}ms{% if f.affected_count > 1 %} &middot; {{ f.affected_count }}×{% endif %}</span>
-        </div>
-        <div class="finding-description">{{ f.customer_description }}</div>
+  {# --------------- FINDINGS (v0.5.2: per-app sub-grouping) --------------- #}
+  <details class="section" open>
+    <summary><h2>Findings &mdash; what to fix</h2></summary>
+    {% if findings_by_app %}
+      <p class="small muted">Sorted by severity, then by impact. Grouped by app so you can focus on your custom code without scanning through framework noise.</p>
 
-        {% if f.technical_detail %}
-        <div class="finding-detail">
-          {% set detail = f.technical_detail %}
-
-          {% if detail.callsite %}
-            <span class="label">Callsite</span>
-            <code>{{ detail.callsite.filename }}:{{ detail.callsite.lineno }}{% if detail.callsite.function %} <span class="muted">({{ detail.callsite.function }})</span>{% endif %}</code>
-          {% endif %}
-
-          {% if detail.normalized_query %}
-            <span class="label">Query (normalized)</span>
-            <pre>{{ detail.normalized_query }}</pre>
-          {% endif %}
-
-          {% if detail.suggested_ddl %}
-            <span class="label">Suggested DDL</span>
-            <pre>{{ detail.suggested_ddl }}</pre>
-          {% endif %}
-
-          {% if detail.example_queries %}
-            <span class="label">Affected queries (first {{ detail.example_queries|length }})</span>
-            {% for q in detail.example_queries %}
-              <pre>{{ q }}</pre>
-            {% endfor %}
-          {% endif %}
-
-          {% if detail.explain_row %}
-            <span class="label">EXPLAIN row</span>
-            <pre>{{ detail.explain_row }}</pre>
-          {% endif %}
-
-          {% if detail.fix_hint %}
-            <span class="label">How to fix</span>
-            <p>{{ detail.fix_hint }}</p>
-          {% endif %}
-
-          {% if detail.validation_note %}
-            <p class="small muted"><em>{{ detail.validation_note }}</em></p>
-          {% endif %}
-
-          {% if detail.occurrences %}
-            <p class="small muted">
-              {{ detail.occurrences }} occurrences
-              {% if detail.average_time_ms %} &middot; ~{{ "%.1f" | format(detail.average_time_ms) }}ms each{% endif %}
-              {% if detail.total_time_ms %} &middot; {{ "%.0f" | format(detail.total_time_ms) }}ms total{% endif %}
-            </p>
-          {% endif %}
-        </div>
-        {% endif %}
-      </div>
-      {% endfor %}
+      {% if findings_by_app | length == 1 %}
+        {# Single app → skip the wrapper, render flat to avoid a
+           pointless "myapp (N findings)" that wraps the whole list. #}
+        {% for f in findings_by_app[0].findings %}
+          {{ finding_card(f, "How to fix") }}
+        {% endfor %}
+      {% else %}
+        {% for bucket in findings_by_app %}
+        <details class="subsection" open>
+          <summary><h3>{{ app_bucket_header(bucket) }}</h3></summary>
+          {% for f in bucket.findings %}
+            {{ finding_card(f, "How to fix") }}
+          {% endfor %}
+        </details>
+        {% endfor %}
+      {% endif %}
     {% else %}
       <p class="empty">No significant performance issues detected.</p>
     {% endif %}
-  </div>
 
-  {# --------------- OBSERVATIONS (v0.5.2) --------------- #}
-  {# Informational findings: framework-level issues, system-level
-     infrastructure pressure, hot-frame observations. Still shown
-     for transparency — just separated from the main "what to fix"
-     action list because the user doesn't have a direct code change
-     to make for these. #}
-  {% if observational_findings %}
-  <div class="section">
-    <h2>Observations</h2>
-    <p class="small muted">
-      Informational signals that don't have a concrete fix in your application code —
-      framework-level activity, system-level infrastructure pressure, and hot-frame
-      observations. Listed for transparency; investigate if something here surprises you.
-    </p>
-    {% for f in observational_findings %}
-    <div class="finding severity-{{ f.severity | lower }}">
-      <div class="finding-header">
-        <span class="severity-badge {{ f.severity | lower }}">{{ f.severity }}</span>
-        <span class="finding-title">{{ f.title }}</span>
-        <span class="finding-impact">~{{ "%.0f" | format(f.estimated_impact_ms) }}ms{% if f.affected_count > 1 %} &middot; {{ f.affected_count }}×{% endif %}</span>
-      </div>
-      <div class="finding-description">{{ f.customer_description }}</div>
+    {# Framework-level / observational findings live INSIDE Findings
+       as a collapsed subsection, and within THAT, bucket by app so a
+       site with 50 framework observations spread across frappe +
+       erpnext + werkzeug doesn't read as one giant blob. User's
+       rationale: "the framework and other 1 party app's scripts can
+       be easily avoided and focus on their custom app". #}
+    {% if observational_findings_by_app %}
+    <details class="subsection">
+      <summary><h3>Framework-level observations (not user-actionable)</h3></summary>
+      <p class="small muted">
+        Informational signals without a concrete fix in your application code —
+        framework-level activity, infrastructure pressure, and hot-frame
+        observations. Listed for transparency; investigate if something here surprises you.
+      </p>
 
-      {% if f.technical_detail %}
-      <div class="finding-detail">
-        {% set detail = f.technical_detail %}
-        {% if detail.callsite %}
-          <span class="label">Callsite</span>
-          <code>{{ detail.callsite.filename }}:{{ detail.callsite.lineno }}{% if detail.callsite.function %} <span class="muted">({{ detail.callsite.function }})</span>{% endif %}</code>
-        {% endif %}
-        {% if detail.normalized_query %}
-          <span class="label">Query (normalized)</span>
-          <pre>{{ detail.normalized_query }}</pre>
-        {% endif %}
-        {% if detail.fix_hint %}
-          <span class="label">Context</span>
-          <p>{{ detail.fix_hint }}</p>
-        {% endif %}
-      </div>
+      {% if observational_findings_by_app | length == 1 %}
+        {% for f in observational_findings_by_app[0].findings %}
+          {{ finding_card(f, "Context") }}
+        {% endfor %}
+      {% else %}
+        {% for bucket in observational_findings_by_app %}
+        <details class="subsection">
+          <summary><h3>{{ app_bucket_header(bucket) }}</h3></summary>
+          {% for f in bucket.findings %}
+            {{ finding_card(f, "Context") }}
+          {% endfor %}
+        </details>
+        {% endfor %}
       {% endif %}
-    </div>
-    {% endfor %}
-  </div>
-  {% endif %}
+    </details>
+    {% endif %}
+  </details>
 
   {# --------------- v0.5.0: SERVER RESOURCE PANEL --------------- #}
   {% if infra_timeline %}
-  <div class="section">
-    <h2>Server Resource</h2>
+  <details class="section" open>
+    <summary><h2>Server Resource</h2></summary>
     <p class="small muted">
       CPU, memory, load average, DB and Redis pressure, and background
       queue depth sampled at each action boundary. Use this to tell code-slow
@@ -651,13 +950,13 @@
         {% endfor %}
       </tbody>
     </table>
-  </div>
+  </details>
   {% endif %}
 
   {# --------------- v0.5.0: FRONTEND PANEL --------------- #}
   {% if frontend_xhr_matched or frontend_vitals_by_page %}
-  <div class="section">
-    <h2>Frontend</h2>
+  <details class="section" open>
+    <summary><h2>Frontend</h2></summary>
     <p class="small muted">
       Per-XHR timings from the browser joined to the matching server recording,
       plus Web Vitals (FCP, LCP, CLS) per page. Shows what the user actually
@@ -775,13 +1074,13 @@
       </table>
     </details>
     {% endif %}
-  </div>
+  </details>
   {% endif %}
 
   {# --------------- v0.3.0: TIME BREAKDOWN DONUT --------------- #}
   {% if donut_slices %}
-  <div class="section">
-    <h2>Time breakdown</h2>
+  <details class="section" open>
+    <summary><h2>Time breakdown</h2></summary>
     {% set total_ms = donut_slices | map(attribute=1) | sum %}
     {% if total_ms > 0 %}
       {% set ns = namespace(offset=0) %}
@@ -806,13 +1105,13 @@
         </ul>
       </div>
     {% endif %}
-  </div>
+  </details>
   {% endif %}
 
   {# --------------- v0.3.0: HOT FRAMES LEADERBOARD --------------- #}
   {% if hot_frames_rows %}
-  <div class="section">
-    <h2>Hot frames (top {{ hot_frames_rows | length }})</h2>
+  <details class="section" open>
+    <summary><h2>Hot frames (top {{ hot_frames_rows | length }})</h2></summary>
     <table>
       <thead>
         <tr>
@@ -833,12 +1132,12 @@
         {% endfor %}
       </tbody>
     </table>
-  </div>
+  </details>
   {% endif %}
 
   {# --------------- TOP-N SLOW QUERIES --------------- #}
-  <div class="section">
-    <h2>Top {{ top_queries|length }} slowest queries</h2>
+  <details class="section" open>
+    <summary><h2>Top {{ top_queries|length }} slowest queries</h2></summary>
     {% if top_queries %}
       <table>
         <thead>
@@ -863,12 +1162,12 @@
     {% else %}
       <p class="empty">No queries were recorded.</p>
     {% endif %}
-  </div>
+  </details>
 
   {# --------------- QUERY BREAKDOWN PER ACTION --------------- #}
   {% if recordings_by_uuid %}
-  <div class="section">
-    <h2>Queries per action</h2>
+  <details class="section" open>
+    <summary><h2>Queries per action</h2></summary>
     <p class="small muted">
       The top queries for each action in this session, with callsites so your
       developer knows where to look. Actions are ordered by total duration.
@@ -928,12 +1227,12 @@
       </details>
       {% endif %}
     {% endfor %}
-  </div>
+  </details>
   {% endif %}
 
   {# --------------- PER-TABLE BREAKDOWN --------------- #}
-  <div class="section">
-    <h2>Time spent per database table</h2>
+  <details class="section" open>
+    <summary><h2>Time spent per database table</h2></summary>
     {% if table_breakdown %}
       <p class="small muted">Where the time goes. Queries that touch multiple tables are counted against each. Sorted by time desc.</p>
       <table>
@@ -957,12 +1256,12 @@
     {% else %}
       <p class="empty">No table breakdown available.</p>
     {% endif %}
-  </div>
+  </details>
 
   {# --------------- RAW MODE: full recordings drill-down --------------- #}
   {% if mode == "raw" and recordings_by_uuid %}
-  <div class="section">
-    <h2>Full recordings (raw mode)</h2>
+  <details class="section" open>
+    <summary><h2>Full recordings (raw mode)</h2></summary>
     <p class="small muted">Every action's complete data &mdash; raw SQL with literal values, request headers (sensitive fields redacted), form data (sensitive fields redacted), and full Python stack traces. <strong>This contains potentially sensitive customer data &mdash; do not share externally.</strong></p>
     <p class="small muted">Each action is collapsed by default. Click to expand.</p>
 
@@ -1014,7 +1313,29 @@
       </details>
       {% endif %}
     {% endfor %}
-  </div>
+  </details>
+  {% endif %}
+
+  {# --------------- v0.5.2: ANALYZER NOTES --------------- #}
+  {# Collapsed-by-default section holding every "Suppressed N …" /
+     "Skipped M …" explanation the analyzers emitted. Pre-v0.5.2 these
+     were concatenated into a single <p> at the top of the report,
+     which read as a wall of text. Moving them here keeps the header
+     tight while preserving full transparency for users who want to
+     understand what the analyzers filtered and why. #}
+  {% if analyzer_warnings %}
+  <details class="section" id="analyzer-notes">
+    <summary><h2>Analyzer notes</h2></summary>
+    <p class="small muted">
+      Things the analyzers chose not to flag as findings, with the reason.
+      Transparency for debugging — you don't need to act on any of these.
+    </p>
+    <ul class="analyzer-notes-list">
+      {% for note in analyzer_warnings %}
+      <li>{{ note }}</li>
+      {% endfor %}
+    </ul>
+  </details>
   {% endif %}
 
   {# --------------- FOOTER --------------- #}

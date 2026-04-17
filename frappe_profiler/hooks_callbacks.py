@@ -168,6 +168,16 @@ def before_request(*args, **kwargs):
 	Redis GET — `get_active_session_for(user)` — and an early return.
 	"""
 	try:
+		# v0.5.2: master kill-switch. When an admin turns off
+		# Profiler Settings ▸ Enabled, we short-circuit before even
+		# the active-session lookup. `is_enabled()` is a cached
+		# read (same Redis value reused across all requests until a
+		# setting change invalidates it), so the hot-path cost is a
+		# single Redis GET regardless of state.
+		from frappe_profiler.settings import is_enabled
+		if not is_enabled():
+			return
+
 		# Round 2 fix #6: if the analyze pipeline itself is running (it
 		# does DB writes to the Profiler Session doctype, which may
 		# trigger nested queries), don't recursively activate recording
@@ -371,6 +381,19 @@ def after_request(*args, **kwargs):
 def before_job(method=None, kwargs=None, **rest):
 	"""Activate the recorder if this job belongs to an active profiler session."""
 	try:
+		# v0.5.2: honor the master kill-switch here too. If the admin
+		# turned the profiler off, we still need to pop our marker
+		# from kwargs so the user's method doesn't see an unexpected
+		# keyword argument — that happens below after the kill-switch
+		# check short-circuits the recorder activation path.
+		from frappe_profiler.settings import is_enabled
+		if not is_enabled():
+			# Still pop the marker so the downstream method signature
+			# stays clean (see the pop comment below for why).
+			if isinstance(kwargs, dict):
+				kwargs.pop("_profiler_session_id", None)
+			return
+
 		# Round 2 fix #6: don't recurse into our own analyze job. The
 		# analyze.run job sets frappe.local.profiler_analyzing = True
 		# at its top, so we exit here if this job IS our analyze.

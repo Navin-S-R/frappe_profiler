@@ -9,7 +9,25 @@ requests serve from cache. Analyze pipeline is never touched — keeping
 PDF generation outside the analyze budget.
 """
 
+import re
+
 import frappe
+
+# v0.5.2 round 4: wkhtmltopdf uses old QtWebKit which doesn't reliably
+# render collapsed <details> content even under @media print — the
+# Observations subsection and Analyzer notes section end up invisible
+# in the PDF. We pre-process the HTML to force `open` on every
+# <details> before handing it to wkhtmltopdf, so PDF reports contain
+# everything the reader sees when they expand sections in the browser.
+#
+# Pattern matches:  <details class="section">     → <details class="section" open>
+#                   <details class="subsection">  → <details class="subsection" open>
+#                   <details id="foo">            → <details id="foo" open>
+# Already-open details are left alone (idempotent).
+_DETAILS_OPEN_RE = re.compile(
+	r"<details\b([^>]*?)>",
+	re.IGNORECASE,
+)
 
 
 def get_or_generate_pdf(session_uuid: str) -> str:
@@ -69,14 +87,40 @@ def _load_safe_html(doc) -> str:
 	return file_row.get_content().decode("utf-8")
 
 
+def _expand_collapsible_sections(html: str) -> str:
+	"""Add the ``open`` attribute to every <details> element so the
+	PDF renderer shows their content.
+
+	Idempotent — <details open> and <details ... open> are left alone.
+	Exposed as module-level for unit-testing.
+	"""
+	def _inject_open(match: re.Match) -> str:
+		attrs = match.group(1).strip()
+		# Already open? Preserve as-is.
+		if re.search(r"\bopen\b", attrs, re.IGNORECASE):
+			return match.group(0)
+		if attrs:
+			return f"<details {attrs} open>"
+		return "<details open>"
+
+	return _DETAILS_OPEN_RE.sub(_inject_open, html)
+
+
 def _html_to_pdf(html: str) -> bytes:
 	"""Run HTML through wkhtmltopdf via frappe.utils.pdf.get_pdf.
 
 	Options tuned for the safe report's CSS — A4, conservative margins,
 	UTF-8, print-media-type so any @media print rules in the report are
 	honored (e.g. the SVG donut fallback).
+
+	Pre-processes the HTML to force-open all <details> blocks so the
+	Observations subsection and Analyzer notes render in the PDF —
+	wkhtmltopdf's QtWebKit doesn't reliably expand collapsed <details>
+	via @media print alone.
 	"""
 	import frappe.utils.pdf
+
+	html = _expand_collapsible_sections(html)
 
 	options = {
 		"page-size": "A4",

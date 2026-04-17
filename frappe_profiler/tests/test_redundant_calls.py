@@ -110,7 +110,7 @@ def test_high_severity_at_5x_threshold():
 
 
 def test_cache_get_threshold_separate_from_doc_threshold():
-	# 8 cache_get calls — under cache threshold of 10
+	# 8 cache_get calls — well under cache threshold of 50
 	recording = {
 		"uuid": "rec-1",
 		"calls": [],
@@ -123,6 +123,53 @@ def test_cache_get_threshold_separate_from_doc_threshold():
 	ctx = AnalyzeContext(session_uuid="t", docname="t")
 	result = redundant_calls.analyze([recording], ctx)
 	assert result.findings == []  # below cache threshold
+
+
+def test_cache_threshold_suppresses_low_count_noise():
+	"""v0.5.2 round 4: cache threshold bumped from 10 → 50. A loop
+	running a cache lookup 30× from the same callsite was previously
+	a Medium finding at 0ms impact — indistinguishable from framework
+	background noise. Now suppressed entirely.
+
+	Production report trigger: 6 'Redundant cache lookup: <hash> (19/21/25/26/31×)'
+	Medium findings cluttering the actionable list on a Sales Invoice
+	Submit session where the real fix was a 1078-query loop elsewhere.
+	"""
+	recording = {
+		"uuid": "rec-1",
+		"calls": [],
+		"sidecar": [
+			_sidecar_entry("cache_get", "role_permissions", "hash1")
+			for _ in range(30)
+		],
+		"pyi_session": None,
+	}
+	ctx = AnalyzeContext(session_uuid="t", docname="t")
+	result = redundant_calls.analyze([recording], ctx)
+	assert result.findings == [], (
+		"30× cache loop must be suppressed post-threshold-bump. "
+		"Loops this small at 0ms impact are noise. "
+		f"Got: {[f['title'] for f in result.findings]}"
+	)
+
+
+def test_cache_high_count_still_fires():
+	"""Negative case for the above: a 60× loop (clearly above the
+	new 50-threshold) still emits a finding."""
+	recording = {
+		"uuid": "rec-1",
+		"calls": [],
+		"sidecar": [
+			_sidecar_entry("cache_get", "role_permissions", "hash1")
+			for _ in range(60)
+		],
+		"pyi_session": None,
+	}
+	ctx = AnalyzeContext(session_uuid="t", docname="t")
+	result = redundant_calls.analyze([recording], ctx)
+	rc = [f for f in result.findings if f["finding_type"] == "Redundant Call"]
+	assert len(rc) == 1
+	assert rc[0]["affected_count"] == 60
 
 
 def test_truncation_marker_emits_warning():
@@ -179,7 +226,7 @@ def test_framework_callsite_filters_finding():
 				"hash-fw",
 				caller_stack=_FRAMEWORK_CALLER_STACK,
 			)
-			for _ in range(20)  # above cache threshold (10)
+			for _ in range(60)  # above cache threshold (50, bumped from 10 in v0.5.2 round 4)
 		],
 		"pyi_session": None,
 	}
@@ -227,6 +274,56 @@ def test_user_callsite_finding_is_kept():
 	assert td["callsite"]["filename"] == "apps/myapp/controllers/bulk.py"
 
 
+def test_erpnext_callsite_filters_finding():
+	"""v0.5.2: official Frappe-maintained apps (erpnext, hrms,
+	payments, lms, helpdesk, insights, crm, builder, wiki, drive) are
+	framework for the purposes of the Redundant Call filter — the
+	application developer can't practically patch upstream. A raw
+	production session on Sales Invoice Save+Submit surfaced 10
+	'Redundant cache lookup' findings all landing in
+	apps/erpnext/.../sales_invoice.py:300 (ERPNext's own validation
+	loop). Users can't fix that without a patch to ERPNext."""
+	erpnext_stack = [
+		{"filename": "frappe/app.py", "lineno": 120, "function": "application"},
+		{"filename": "frappe/desk/form/save.py", "lineno": 40, "function": "savedocs"},
+		{
+			"filename": (
+				"apps/erpnext/erpnext/accounts/doctype/"
+				"sales_invoice/sales_invoice.py"
+			),
+			"lineno": 300,
+			"function": "validate",
+		},
+	]
+	recording = {
+		"uuid": "rec-1",
+		"calls": [],
+		"sidecar": [
+			_sidecar_entry(
+				"cache_get",
+				"role_permissions:SalesManager",
+				"hash-erpnext",
+				caller_stack=erpnext_stack,
+			)
+			for _ in range(106)  # matches production report count
+		],
+		"pyi_session": None,
+	}
+	ctx = AnalyzeContext(session_uuid="t", docname="t")
+	result = redundant_calls.analyze([recording], ctx)
+	rc = [f for f in result.findings if f["finding_type"] == "Redundant Call"]
+	assert rc == [], (
+		"ERPNext-internal cache loop must be suppressed from the "
+		"actionable Redundant Call list — users can't patch ERPNext. "
+		f"Got: {[f['title'] for f in rc]}"
+	)
+	# Suppression warning surfaces the reason.
+	assert any(
+		"Frappe framework code" in w or "third-party library" in w
+		for w in ctx.warnings
+	), f"Expected framework-filter warning; got: {ctx.warnings}"
+
+
 def test_third_party_lib_callsite_filters_finding():
 	"""v0.5.2 round 2: werkzeug / site-packages / gunicorn / rq are
 	infrastructure users can't modify. Production report had 3
@@ -271,10 +368,11 @@ def test_cross_request_spread_does_not_count_as_redundant():
 	findings like 'Redundant cache lookup (25 times)' where each
 	of the 25 was a separate request, 1 call each. Filter these
 	with a per-action threshold check."""
-	# 20 recordings, each with exactly ONE cache_get for the same key.
-	# Total = 20 (above threshold of 10), but per-action max = 1.
+	# 60 recordings, each with exactly ONE cache_get for the same key.
+	# Total = 60 (above threshold of 50, bumped in v0.5.2 round 4),
+	# but per-action max = 1 — not a loop.
 	recordings = []
-	for i in range(20):
+	for i in range(60):
 		recordings.append({
 			"uuid": f"rec-{i}",
 			"calls": [],
@@ -299,15 +397,16 @@ def test_cross_request_spread_does_not_count_as_redundant():
 
 
 def test_single_request_loop_still_fires():
-	"""Positive case: 15 calls from a SINGLE request still fires
+	"""Positive case: 60 calls from a SINGLE request still fires
 	(real loop in user code). The per-action threshold must not
-	over-filter."""
+	over-filter. Count bumped from 15 to 60 in v0.5.2 round 4 to
+	clear the new 50× cache threshold."""
 	recording = {
 		"uuid": "rec-1",
 		"calls": [],
 		"sidecar": [
 			_sidecar_entry("cache_get", "user_lang:x", "hash-loop")
-			for _ in range(15)  # 15 in ONE action
+			for _ in range(60)  # 60 in ONE action, above 50 threshold
 		],
 		"pyi_session": None,
 	}
@@ -315,7 +414,7 @@ def test_single_request_loop_still_fires():
 	result = redundant_calls.analyze([recording], ctx)
 	rc = [f for f in result.findings if f["finding_type"] == "Redundant Call"]
 	assert len(rc) == 1, (
-		"A 15-call loop in a single request must still fire. "
+		"A 60-call loop in a single request must still fire. "
 		f"Got: {[f['title'] for f in rc]}"
 	)
 

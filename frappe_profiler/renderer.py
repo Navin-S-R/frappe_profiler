@@ -449,9 +449,50 @@ def render(
 			import html as html_mod
 			notes_html = html_mod.escape(notes_html)
 
+	# v0.5.2: Analyzer warnings are stored as a newline-joined string
+	# (see analyze.py). Split into a list of non-empty bullets for the
+	# collapsible "Analyzer notes" section at the bottom of the report
+	# so they render as a clean <ul> instead of a wall of text.
+	warnings_raw = getattr(session_doc, "analyzer_warnings", None) or ""
+	analyzer_warnings = [
+		line.strip()
+		for line in warnings_raw.split("\n")
+		if line.strip()
+	]
+
+	# v0.5.2: sub-group findings by top-level app so the report reads
+	# "myapp (3 findings, ~420ms)" → 3 cards, instead of a flat list
+	# mixing myapp + erpnext + frappe callsites. Tracked-apps order
+	# wins (user's mental model: my apps first), then remaining apps
+	# by total impact, with "Other (no callsite)" always tail.
+	try:
+		from frappe_profiler.settings import get_tracked_apps
+		tracked_apps = get_tracked_apps()
+	except Exception:
+		tracked_apps = ()
+	findings_by_app = _bucket_findings_by_app(findings, tracked_apps)
+	observational_findings_by_app = _bucket_findings_by_app(
+		observational_findings, tracked_apps
+	)
+
+	# v0.5.2 round 3: executive summary — top 3 most-impactful findings
+	# stated in plain English, rendered in a card at the top of the
+	# report. A non-developer (e.g. a project manager) reading this
+	# should be able to decide "do we have a problem" in 30 seconds
+	# without scrolling past the first screen.
+	executive_summary = _build_executive_summary(
+		findings=findings,
+		session_doc=session_doc,
+		v5=v5,
+	)
+
 	context = {
 		"session": session_doc,
 		"actions": actions,
+		"analyzer_warnings": analyzer_warnings,
+		"findings_by_app": findings_by_app,
+		"observational_findings_by_app": observational_findings_by_app,
+		"executive_summary": executive_summary,
 		# v0.5.2: "findings" holds actionable items only (shown in
 		# "Findings — what to fix"). The severity counts and the
 		# summary reflect ACTIONABLE findings — not the observations
@@ -544,6 +585,226 @@ def _finding_to_dict(child: Any) -> dict:
 		"action_ref": child.action_ref or "",
 		"technical_detail": detail,
 	}
+
+
+# ---------------------------------------------------------------------------
+# v0.5.2 round 3: Executive summary
+# ---------------------------------------------------------------------------
+# A one-paragraph TL;DR at the top of the report that a non-developer
+# (product manager, ops lead, customer) can read in 30 seconds and walk
+# away knowing (1) is the session slow, (2) what's the biggest problem,
+# (3) how much of the time it accounts for. Surfaces the top 3 most-
+# impactful actionable findings as plain-English bullets.
+
+
+def _build_executive_summary(
+	*,
+	findings: list[dict],
+	session_doc: Any,
+	v5: dict,
+) -> dict:
+	"""Return a dict shaped for the template's exec-summary card.
+
+	Shape: ``{"headline": str, "bullets": list[str], "show": bool}``
+
+	``show`` is False when there's nothing meaningful to summarize —
+	e.g. a clean session with no findings. The template renders the
+	card only when ``show`` is True.
+	"""
+	total_ms = getattr(session_doc, "total_duration_ms", 0) or 0
+	total_queries = getattr(session_doc, "total_queries", 0) or 0
+	total_actions = getattr(session_doc, "total_requests", 0) or 0
+
+	# Headline — describes the session at a glance.
+	if total_ms >= 5000:
+		pace = "slow"
+	elif total_ms >= 2000:
+		pace = "moderate"
+	else:
+		pace = "fast"
+
+	queries_per_action = (
+		round(total_queries / total_actions, 1) if total_actions else 0
+	)
+	headline = (
+		f"This session took {int(total_ms)}ms across {total_actions} "
+		f"action{'s' if total_actions != 1 else ''} "
+		f"({int(total_queries)} queries, ~{queries_per_action} per action)."
+	)
+
+	# Pull the top 3 findings by estimated_impact_ms (already sorted
+	# globally by severity+impact, but we want PURE impact order for
+	# the exec view). No finding = no bullet = no card.
+	top_findings = sorted(
+		findings,
+		key=lambda f: -(f.get("estimated_impact_ms") or 0),
+	)[:3]
+
+	bullets = []
+	total_impact = sum(f.get("estimated_impact_ms") or 0 for f in top_findings)
+	for f in top_findings:
+		impact = f.get("estimated_impact_ms") or 0
+		title = f.get("title") or "Finding"
+		# Strip the count suffix since the title often repeats it.
+		bullets.append({
+			"text": title,
+			"impact_ms": round(impact, 0),
+			"severity": f.get("severity") or "Low",
+		})
+
+	# Infra signal — if swap was active or memory grew >50MB, call it out.
+	infra_summary = v5.get("infra_summary") or {}
+	rss_delta_mb = round((infra_summary.get("rss_delta") or 0) / 1_000_000, 0)
+	swap_mb = infra_summary.get("swap_peak_mb") or 0
+	infra_note = None
+	if rss_delta_mb and abs(rss_delta_mb) >= 50:
+		direction = "grew" if rss_delta_mb > 0 else "shrank"
+		infra_note = f"Worker memory {direction} by {abs(int(rss_delta_mb))}MB during the session."
+	if swap_mb and swap_mb >= 100:
+		s = f"Swap was active ({int(swap_mb)}MB)"
+		infra_note = f"{infra_note} {s}." if infra_note else s + "."
+
+	show = bool(bullets or infra_note)
+	return {
+		"headline": headline,
+		"bullets": bullets,
+		"infra_note": infra_note,
+		"total_impact_ms": round(total_impact, 0),
+		"pace": pace,
+		"show": show,
+	}
+
+
+# ---------------------------------------------------------------------------
+# v0.5.2: Per-app sub-grouping inside Findings and Observations
+# ---------------------------------------------------------------------------
+# Each finding carries a ``technical_detail.callsite.filename`` set by the
+# analyzers (when they can resolve a blame frame). We bucket findings by
+# their top-level app segment so the report reads as:
+#
+#   Findings — what to fix
+#     ▸ myapp (3 findings, ~420ms)
+#         N+1 in ...
+#         Missing index on ...
+#     ▸ custom_invoicing (1 finding, ~60ms)
+#         Full table scan on ...
+#
+# This is what the user asked for so "the framework and other 1 party
+# app's scripts can be easily avoided and focus on their custom app".
+
+
+_OTHER_APP_LABEL = "Other (no callsite)"
+
+# v0.5.2 round 4: finding types that legitimately have no code-location
+# callsite because they describe scope-level timing ("56% of savedocs
+# Submit was in on_submit") rather than a specific line. When the no-
+# callsite bucket is made up ENTIRELY of these, we rename it from the
+# undersell "Other (no callsite)" → "Request hotspots" so the user
+# understands it's where request time actually went.
+_HOTPATH_FINDING_TYPES: frozenset[str] = frozenset({
+	"Slow Hot Path",
+	"Hook Bottleneck",
+	"Slow Frontend Render",
+})
+
+_HOTPATH_BUCKET_LABEL = "Request hotspots"
+
+
+def _app_from_finding(finding: dict) -> str:
+	"""Return the top-level app name for a finding, or ``_OTHER_APP_LABEL``.
+
+	Inspects ``technical_detail.callsite.filename`` using the same
+	boundary-sensitive split as the framework classifier — the goal is
+	that the app name shown in the sub-section header matches what
+	``is_framework_callsite`` would see.
+	"""
+	from frappe_profiler.analyzers.base import _extract_app_segment
+
+	detail = finding.get("technical_detail") or {}
+	callsite = detail.get("callsite") or {}
+	filename = (callsite.get("filename") or "").replace("\\", "/")
+	app = _extract_app_segment(filename)
+	return app or _OTHER_APP_LABEL
+
+
+def _bucket_findings_by_app(
+	findings: list[dict],
+	tracked_apps: tuple[str, ...] = (),
+) -> list[dict]:
+	"""Group findings by app and return an ordered list of buckets.
+
+	Each bucket is a dict:
+	``{"app": str, "findings": list, "count": int, "total_impact_ms": float}``
+
+	Ordering rules:
+	1. Tracked apps first, in the order the admin listed them in
+	   Profiler Settings (user's mental model: "my apps first").
+	2. Any other apps next, sorted by total estimated impact desc.
+	3. ``_OTHER_APP_LABEL`` (no resolvable callsite) last — always the
+	   tail bucket because its contents are less actionable.
+	"""
+	if not findings:
+		return []
+
+	buckets: dict[str, list[dict]] = {}
+	for f in findings:
+		app = _app_from_finding(f)
+		buckets.setdefault(app, []).append(f)
+
+	# v0.5.2 round 4: if the no-callsite bucket is entirely hot-path
+	# findings (Slow Hot Path / Hook Bottleneck / Slow Frontend Render),
+	# re-bucket it under the "Request hotspots" label. Mixed buckets
+	# keep the "Other (no callsite)" label so we're never misleading
+	# about what's inside.
+	no_callsite = buckets.get(_OTHER_APP_LABEL)
+	if no_callsite and all(
+		f.get("finding_type") in _HOTPATH_FINDING_TYPES
+		for f in no_callsite
+	):
+		buckets[_HOTPATH_BUCKET_LABEL] = buckets.pop(_OTHER_APP_LABEL)
+
+	# Preserve tracked-apps ordering at the top.
+	seen = set()
+	ordered: list[str] = []
+	for app in tracked_apps:
+		if app in buckets and app not in seen:
+			ordered.append(app)
+			seen.add(app)
+
+	# Remaining apps sorted by total impact (most painful first),
+	# then alphabetically for stable ordering when impacts tie.
+	def _impact(app: str) -> float:
+		return sum(f.get("estimated_impact_ms") or 0 for f in buckets[app])
+
+	_TAIL_BUCKETS = (_OTHER_APP_LABEL, _HOTPATH_BUCKET_LABEL)
+	remainder = [
+		a for a in buckets
+		if a not in seen and a not in _TAIL_BUCKETS
+	]
+	remainder.sort(key=lambda a: (-_impact(a), a))
+	ordered.extend(remainder)
+
+	# Tail buckets always last — user-app findings come first.
+	# Hotspots before Other because they're at least typed.
+	if _HOTPATH_BUCKET_LABEL in buckets:
+		ordered.append(_HOTPATH_BUCKET_LABEL)
+	if _OTHER_APP_LABEL in buckets:
+		ordered.append(_OTHER_APP_LABEL)
+
+	out = []
+	for app in ordered:
+		bucket_findings = buckets[app]
+		# Findings inside each bucket keep severity/impact ordering
+		# from the caller (they've already been sorted globally).
+		out.append({
+			"app": app,
+			"findings": bucket_findings,
+			"count": len(bucket_findings),
+			"total_impact_ms": sum(
+				f.get("estimated_impact_ms") or 0 for f in bucket_findings
+			),
+		})
+	return out
 
 
 def _now_iso() -> str:
