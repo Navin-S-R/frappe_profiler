@@ -28,7 +28,7 @@
                 }
             ],
             "stack": [
-                {"filename": "erpnext/accounts/report/general_ledger/general_ledger.py", "lineno": 120, "function": "execute"}
+                {"filename": "acme_reports/acme_reports/report/general_ledger/general_ledger.py", "lineno": 120, "function": "execute"}
             ]
         },
         {
@@ -48,7 +48,7 @@
                 }
             ],
             "stack": [
-                {"filename": "erpnext/accounts/report/general_ledger/general_ledger.py", "lineno": 180, "function": "aggregate"}
+                {"filename": "acme_reports/acme_reports/report/general_ledger/general_ledger.py", "lineno": 180, "function": "aggregate"}
             ]
         },
         {
@@ -62,7 +62,7 @@
                 {"table": "tabAccount", "type": "ref", "key": "account_type", "rows": 25, "Extra": ""}
             ],
             "stack": [
-                {"filename": "erpnext/accounts/report/general_ledger/general_ledger.py", "lineno": 90, "function": "get_accounts"}
+                {"filename": "acme_reports/acme_reports/report/general_ledger/general_ledger.py", "lineno": 90, "function": "get_accounts"}
             ]
         }
     ]

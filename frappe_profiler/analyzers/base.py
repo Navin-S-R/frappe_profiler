@@ -41,10 +41,140 @@ SEVERITY_ORDER: dict[str, int] = {"High": 0, "Medium": 1, "Low": 2}
 # not the frappe helper the query was routed through (get_value,
 # get_all, db.count etc.). See the detailed explanation in
 # analyzers/n_plus_one.py — this is just a shared constant now.
+#
+# Intentionally narrower than FRAMEWORK_APPS below: walk_callsite uses
+# this to pick a BLAME frame (skip frappe helpers, surface the caller).
+# We don't skip erpnext/hrms/etc. here because when a user's app calls
+# into erpnext, the deepest erpnext frame is still a legitimate blame
+# target (user can at least refactor their calling pattern). The
+# is_framework_callsite() FILTER (below) routes those into Observations
+# separately, which is the right layer for the noise filter.
 FRAMEWORK_PREFIXES: tuple[str, ...] = (
 	"frappe/",
 	"frappe_profiler/",
 )
+
+# v0.5.2: official Frappe-maintained apps. When a finding's BLAME
+# frame resolves inside one of these apps, the user can't practically
+# act on it — fixes live upstream, not in their bench. The renderer
+# routes these into the collapsed Observations subsection (see the
+# split in renderer.py + redundant_calls / explain_flags / n_plus_one
+# filters).
+#
+# Production trigger: a raw session on a Sales Invoice Save+Submit
+# surfaced 10 "Redundant cache lookup: <hash> (106 times)" findings
+# all landing in apps/erpnext/.../sales_invoice.py:300-321 — a loop
+# inside ERPNext that the application developer can't patch.
+FRAMEWORK_APPS: frozenset[str] = frozenset({
+	"frappe",
+	"frappe_profiler",
+	"erpnext",
+	"payments",
+	"hrms",
+	"lms",
+	"helpdesk",
+	"insights",
+	"crm",
+	"builder",
+	"wiki",
+	"drive",
+})
+
+# Well-known third-party libs to catch even when sys.path manipulation
+# bypasses site-packages/. Checked by is_framework_callsite().
+_THIRD_PARTY_LIB_FRAGMENTS: tuple[str, ...] = (
+	"werkzeug/",
+	"gunicorn/",
+	"/rq/",
+	"pyinstrument/",
+	"pytz/",
+	"dateutil/",
+	"MySQLdb/",
+	"pymysql/",
+)
+
+
+def _extract_app_segment(norm: str) -> str | None:
+	"""Return the app name from a normalized filename, or None.
+
+	Handles both path shapes we see in recorder stacks:
+	- ``apps/<app>/<app>/foo.py`` (bench-relative)
+	- ``<app>/foo.py`` (pyinstrument short form after path strip)
+	- ``/abs/path/to/apps/<app>/<app>/foo.py`` (absolute)
+
+	For the short form we treat the first path segment as the app.
+	For the bench-relative / absolute forms we return the segment
+	that follows ``apps/``.
+	"""
+	if not norm:
+		return None
+	# Split on 'apps/' if present.
+	marker = "apps/"
+	idx = norm.find(marker)
+	if idx != -1:
+		tail = norm[idx + len(marker):]
+		first = tail.split("/", 1)[0]
+		if first:
+			return first
+	# Short form — first segment.
+	first = norm.split("/", 1)[0]
+	return first or None
+
+
+def is_framework_callsite(
+	filename: str | None,
+	tracked_apps: tuple[str, ...] | None = None,
+) -> bool:
+	"""True if ``filename`` lives inside framework or third-party code
+	that the application developer can't practically patch.
+
+	Two modes, chosen by whether ``tracked_apps`` is provided:
+
+	**Inclusion mode** — when ``tracked_apps`` is a non-empty tuple, the
+	classifier flips: a callsite is framework *unless* its app matches
+	one of the tracked apps. This is what ``Profiler Settings ▸ Tracked
+	Apps`` configures — it lets the site admin say "I only care about
+	findings in myapp" and get everything else routed to Observations
+	without having to enumerate every framework app.
+
+	**Exclusion mode** — when ``tracked_apps`` is None or empty, the
+	classifier uses the built-in ``FRAMEWORK_APPS`` set + third-party
+	heuristics. This is the default for sites that haven't configured
+	the Single.
+
+	Matching is boundary-sensitive (``/app/`` or ``startswith(app/)``)
+	so ``crm/`` does NOT false-positive on ``my_crm/``.
+
+	Used by redundant_calls, explain_flags, and n_plus_one to route
+	findings with framework-only callsites into the Observations bucket.
+	Tests and internal callers pass ``tracked_apps`` explicitly;
+	production runtime passes ``None`` and lets the caller plumb in
+	the value from ``frappe_profiler.settings.get_tracked_apps()`` to
+	avoid circular imports here.
+	"""
+	if not filename:
+		return False
+	norm = filename.replace("\\", "/")
+
+	if tracked_apps:
+		# Inclusion mode: framework UNLESS the app is in the allowlist.
+		app = _extract_app_segment(norm)
+		if app and app in tracked_apps:
+			return False
+		return True
+
+	# Exclusion mode (default): framework if the app is in the built-in
+	# FRAMEWORK_APPS set or the path contains a known third-party marker.
+	for app in FRAMEWORK_APPS:
+		token = f"{app}/"
+		if norm.startswith(token) or f"/{token}" in norm:
+			return True
+	if "site-packages/" in norm or "dist-packages/" in norm:
+		return True
+	for lib in _THIRD_PARTY_LIB_FRAGMENTS:
+		if lib in norm:
+			return True
+	return False
 
 
 def is_profiler_own_query(stack: list | None) -> bool:

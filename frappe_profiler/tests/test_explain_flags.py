@@ -500,6 +500,22 @@ def test_alias_helper_distinguishes_real_tables_from_aliases():
 	for synthetic in ("<derived2>", "<subquery1>", "<union3,4>"):
 		assert _is_likely_alias(synthetic) is True
 
+	# v0.5.2 round 4: INFORMATION_SCHEMA / MariaDB metadata views —
+	# they're real tables but the user can't add indexes to them. A
+	# production report showed "Full table scan on columns — ~129ms"
+	# and "Full table scan on tables — ~21ms" cluttering actionable
+	# findings; these are INFORMATION_SCHEMA.columns / .tables, not
+	# user-addressable. Treat them as aliases (suppressed).
+	for system_table in (
+		"columns", "tables", "schemata", "statistics", "routines",
+		"triggers", "views", "processlist", "key_column_usage",
+		"referential_constraints", "table_constraints",
+	):
+		assert _is_likely_alias(system_table) is True, (
+			f"{system_table!r} is an INFORMATION_SCHEMA view; user "
+			"cannot add an index — must be filtered as alias/noise"
+		)
+
 	# Edge cases
 	assert _is_likely_alias("") is True
 	assert _is_likely_alias(None) is True

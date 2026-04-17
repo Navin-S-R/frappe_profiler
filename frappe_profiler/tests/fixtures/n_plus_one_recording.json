@@ -23,7 +23,7 @@
                 {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
                 {"filename": "frappe/client.py", "lineno": 200, "function": "save"},
                 {"filename": "frappe/model/document.py", "lineno": 400, "function": "save"},
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 120, "function": "validate"}
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 120, "function": "validate"}
             ]
         },
         {
@@ -36,7 +36,7 @@
             "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
             "stack": [
                 {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 212, "function": "calculate_taxes"},
                 {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
                 {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
             ]
@@ -51,7 +51,7 @@
             "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
             "stack": [
                 {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 212, "function": "calculate_taxes"},
                 {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
                 {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
             ]
@@ -66,7 +66,7 @@
             "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
             "stack": [
                 {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 212, "function": "calculate_taxes"},
                 {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
                 {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
             ]
@@ -81,7 +81,7 @@
             "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
             "stack": [
                 {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 212, "function": "calculate_taxes"},
                 {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
                 {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
             ]
@@ -96,7 +96,7 @@
             "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
             "stack": [
                 {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 212, "function": "calculate_taxes"},
                 {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
                 {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
             ]
@@ -111,7 +111,7 @@
             "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
             "stack": [
                 {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 212, "function": "calculate_taxes"},
                 {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
                 {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
             ]
@@ -126,7 +126,7 @@
             "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
             "stack": [
                 {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 212, "function": "calculate_taxes"},
                 {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
                 {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
             ]
@@ -141,7 +141,7 @@
             "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
             "stack": [
                 {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 212, "function": "calculate_taxes"},
                 {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
                 {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
             ]
@@ -156,7 +156,7 @@
             "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
             "stack": [
                 {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 212, "function": "calculate_taxes"},
                 {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
                 {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
             ]
@@ -171,7 +171,7 @@
             "explain_result": [{"table": "tabItem Tax", "type": "ALL", "rows": 1500, "Extra": ""}],
             "stack": [
                 {"filename": "frappe/api.py", "lineno": 100, "function": "handle"},
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 212, "function": "calculate_taxes"},
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 212, "function": "calculate_taxes"},
                 {"filename": "frappe/database/database.py", "lineno": 318, "function": "get_value"},
                 {"filename": "frappe/database/database.py", "lineno": 742, "function": "sql"}
             ]
@@ -185,7 +185,7 @@
             "normalized_copies": 1,
             "explain_result": [{"table": "tabSales Invoice", "type": "range", "rows": 1, "Extra": ""}],
             "stack": [
-                {"filename": "erpnext/accounts/doctype/sales_invoice/sales_invoice.py", "lineno": 350, "function": "on_save"}
+                {"filename": "acme_sales/acme_sales/doctype/custom_invoice/custom_invoice.py", "lineno": 350, "function": "on_save"}
             ]
         }
     ]

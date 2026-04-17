@@ -22,7 +22,7 @@
                 {"table": "tabCustomer", "type": "ref", "key": "disabled", "rows": 20, "Extra": ""}
             ],
             "stack": [
-                {"filename": "erpnext/selling/page/customer_list.py", "lineno": 45, "function": "get_customers"}
+                {"filename": "acme_selling/acme_selling/page/customer_list.py", "lineno": 45, "function": "get_customers"}
             ]
         },
         {
@@ -36,7 +36,7 @@
                 {"table": "tabCustomer", "type": "ref", "key": "disabled", "rows": 150, "Extra": ""}
             ],
             "stack": [
-                {"filename": "erpnext/selling/page/customer_list.py", "lineno": 60, "function": "get_count"}
+                {"filename": "acme_selling/acme_selling/page/customer_list.py", "lineno": 60, "function": "get_count"}
             ]
         }
     ]
