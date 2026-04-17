@@ -569,12 +569,58 @@ def _action_to_dict(child: Any) -> dict:
 	}
 
 
+def _normalize_callsite(callsite) -> dict | None:
+	"""Normalize the two callsite shapes the analyzers produce into a
+	single dict: ``{"filename": str, "lineno": int|None, "function": str}``.
+
+	Historical context: ``n_plus_one`` / ``redundant_calls`` /
+	``explain_flags`` emit a dict ``{filename, lineno, function}``,
+	while ``top_queries`` emits a pre-formatted string like
+	``"apps/myapp/foo.py:456"`` (via ``walk_callsite_str``). Before
+	this normalizer, ``_app_from_finding`` crashed on Slow Query
+	findings with ``AttributeError: 'str' object has no attribute
+	'get'`` because it assumed dict-only.
+
+	Normalizing here means the template and app-bucketing see a
+	consistent shape regardless of which analyzer produced the
+	finding, without needing to rewrite the analyzers.
+
+	Returns ``None`` when the input is falsy/unrecognized so callers
+	can short-circuit with ``if not callsite: ...``.
+	"""
+	if not callsite:
+		return None
+	if isinstance(callsite, dict):
+		return callsite
+	if isinstance(callsite, str):
+		# Shape: "file.py:lineno" — split from the RIGHT so Windows
+		# paths ("C:\\foo\\bar.py:12") keep their drive letter.
+		filename = callsite
+		lineno: int | None = None
+		if ":" in callsite:
+			head, _, tail = callsite.rpartition(":")
+			if tail.isdigit():
+				filename = head
+				try:
+					lineno = int(tail)
+				except ValueError:
+					lineno = None
+		return {"filename": filename, "lineno": lineno, "function": ""}
+	# Unknown shape — log-worthy but don't crash. Return None so the
+	# template skips the Callsite block entirely.
+	return None
+
+
 def _finding_to_dict(child: Any) -> dict:
 	"""Flatten a Profiler Finding child row, parsing the JSON detail blob."""
 	try:
 		detail = json.loads(child.technical_detail_json or "{}")
 	except Exception:
 		detail = {}
+	# v0.5.3: normalize callsite shape so downstream code (app
+	# bucketing, template) can assume dict.
+	if "callsite" in detail:
+		detail["callsite"] = _normalize_callsite(detail.get("callsite"))
 	return {
 		"finding_type": child.finding_type or "",
 		"severity": child.severity or "Low",
@@ -717,11 +763,18 @@ def _app_from_finding(finding: dict) -> str:
 	boundary-sensitive split as the framework classifier — the goal is
 	that the app name shown in the sub-section header matches what
 	``is_framework_callsite`` would see.
+
+	Defensive: accepts both the dict form (n_plus_one/redundant_calls/
+	explain_flags) and the legacy string form (top_queries Slow Query
+	findings). _finding_to_dict already normalizes these at load time,
+	but we double-check here so direct callers (tests, retry paths)
+	don't crash on an un-normalized finding.
 	"""
 	from frappe_profiler.analyzers.base import _extract_app_segment
 
 	detail = finding.get("technical_detail") or {}
-	callsite = detail.get("callsite") or {}
+	callsite_raw = detail.get("callsite")
+	callsite = _normalize_callsite(callsite_raw) or {}
 	filename = (callsite.get("filename") or "").replace("\\", "/")
 	app = _extract_app_segment(filename)
 	return app or _OTHER_APP_LABEL
