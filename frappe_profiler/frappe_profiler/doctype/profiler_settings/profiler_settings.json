@@ -1,0 +1,131 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "creation": "2026-04-16 18:30:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "general_section",
+  "enabled",
+  "column_break_general",
+  "session_retention_days",
+  "apps_section",
+  "apps_description",
+  "tracked_apps",
+  "thresholds_section",
+  "thresholds_description",
+  "redundant_doc_threshold",
+  "redundant_cache_threshold",
+  "column_break_thresholds",
+  "redundant_perm_threshold",
+  "n_plus_one_min_occurrences"
+ ],
+ "fields": [
+  {
+   "fieldname": "general_section",
+   "fieldtype": "Section Break",
+   "label": "General"
+  },
+  {
+   "default": "1",
+   "description": "Master kill-switch. When unchecked, no requests or jobs are profiled even if users have active sessions. Use this to pause all instrumentation site-wide without touching individual users' widgets.",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Profiler Enabled"
+  },
+  {
+   "fieldname": "column_break_general",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "30",
+   "description": "Profiler Session records older than this are eligible for automatic deletion by the daily housekeeping job. Set to 0 to keep forever.",
+   "fieldname": "session_retention_days",
+   "fieldtype": "Int",
+   "label": "Session Retention (days)",
+   "non_negative": 1
+  },
+  {
+   "fieldname": "apps_section",
+   "fieldtype": "Section Break",
+   "label": "Tracked Apps"
+  },
+  {
+   "fieldname": "apps_description",
+   "fieldtype": "HTML",
+   "options": "<p class=\"text-muted small\"><b>Leave this table empty</b> unless you know you want to override the default. The built-in filter already treats <b>frappe, erpnext, hrms, lms, helpdesk, insights, crm, builder, wiki, drive, payments</b> and any pip-installed library as framework code, so their findings route to the collapsed <i>Framework-level observations</i> sub-section automatically.</p><p class=\"text-muted small\">Populate this table only when you want to <b>narrow</b> the actionable list to a specific custom app. Example: if your custom app is <code>jewellery_erpnext</code>, adding just that app here means <b>only jewellery_erpnext findings show as actionable</b>; everything else (including erpnext, frappe, pip libs) routes to Observations.</p><p class=\"text-muted small\" style=\"color:#b91c1c\"><b>Do not add frappe or erpnext here.</b> Doing so flips them to \"user code\" and floods your actionable findings with framework noise — the opposite of what most users want.</p>"
+  },
+  {
+   "fieldname": "tracked_apps",
+   "fieldtype": "Table",
+   "label": "Tracked Apps",
+   "options": "Profiler Tracked App"
+  },
+  {
+   "fieldname": "thresholds_section",
+   "fieldtype": "Section Break",
+   "label": "Analyzer Thresholds"
+  },
+  {
+   "fieldname": "thresholds_description",
+   "fieldtype": "HTML",
+   "options": "<p class=\"text-muted small\">How many identical calls from the same callsite qualify as a <b>Redundant Call</b> finding, and how many identical queries from the same callsite qualify as an <b>N+1</b> finding. Lower = more sensitive = more findings; higher = fewer findings but less noise.</p>"
+  },
+  {
+   "default": "5",
+   "description": "Minimum get_doc calls for the same (doctype, name) from the same callsite before a Redundant Call finding is emitted.",
+   "fieldname": "redundant_doc_threshold",
+   "fieldtype": "Int",
+   "label": "Redundant get_doc Threshold",
+   "non_negative": 1
+  },
+  {
+   "default": "50",
+   "description": "Minimum cache lookups for the same key from the same callsite before a Redundant Call finding is emitted. Cache lookups aren't individually timed, so low-count loops are indistinguishable from framework background noise — 50 matches the high-severity threshold and cuts 0ms noise.",
+   "fieldname": "redundant_cache_threshold",
+   "fieldtype": "Int",
+   "label": "Redundant Cache Lookup Threshold",
+   "non_negative": 1
+  },
+  {
+   "fieldname": "column_break_thresholds",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "10",
+   "description": "Minimum has_permission calls for the same (doctype, name, ptype) from the same callsite before a Redundant Call finding is emitted.",
+   "fieldname": "redundant_perm_threshold",
+   "fieldtype": "Int",
+   "label": "Redundant Permission Check Threshold",
+   "non_negative": 1
+  },
+  {
+   "default": "10",
+   "description": "Minimum identical queries from the same callsite before an N+1 Query finding is emitted.",
+   "fieldname": "n_plus_one_min_occurrences",
+   "fieldtype": "Int",
+   "label": "N+1 Minimum Occurrences",
+   "non_negative": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-04-16 18:30:00.000000",
+ "modified_by": "Administrator",
+ "module": "Frappe Profiler",
+ "name": "Profiler Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "read": 1,
+   "role": "System Manager",
+   "write": 1
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}

@@ -37,6 +37,49 @@ def after_install():
 		except Exception:
 			pass
 
+	# v0.5.2 round 3: pre-populate Profiler Settings ▸ Tracked Apps
+	# with the site's custom apps (anything not in the built-in
+	# FRAMEWORK_APPS set). Admin gets a sensible default inclusion-
+	# mode allowlist on day one — they don't have to remember that
+	# Tracked Apps exists for the framework filter to actually match
+	# their mental model of "user code".
+	try:
+		_seed_tracked_apps_from_installed_apps()
+	except Exception:
+		try:
+			frappe.log_error(title="frappe_profiler after_install tracked-apps seed")
+		except Exception:
+			pass
+
+
+def _seed_tracked_apps_from_installed_apps():
+	"""Populate Profiler Settings.tracked_apps with every installed
+	app that's NOT in the built-in framework allowlist.
+
+	Idempotent: if tracked_apps is already populated (user configured
+	it manually before running migrate again), we do nothing.
+	"""
+	from frappe_profiler.analyzers.base import FRAMEWORK_APPS
+
+	if not frappe.db.exists("DocType", "Profiler Settings"):
+		# Migration hasn't created the Single yet — skip silently.
+		return
+
+	settings = frappe.get_single("Profiler Settings")
+	if settings.tracked_apps:
+		# Respect existing config — never overwrite.
+		return
+
+	installed = frappe.get_installed_apps() or []
+	custom_apps = [a for a in installed if a not in FRAMEWORK_APPS]
+	if not custom_apps:
+		return
+
+	for app_name in custom_apps:
+		settings.append("tracked_apps", {"app_name": app_name})
+	settings.save(ignore_permissions=True)
+	frappe.db.commit()
+
 
 def _assign_profiler_user_to_system_managers():
 	"""Add Profiler User role to every user who has System Manager.

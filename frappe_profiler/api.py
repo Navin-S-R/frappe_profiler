@@ -1110,3 +1110,23 @@ def retry_analyze(session_uuid: str) -> dict:
 		"ran_inline": ran_inline,
 		"status": final_status,
 	}
+
+
+@frappe.whitelist()
+def get_installed_apps_for_tracking() -> list[str]:
+	"""Return the bench's installed apps for the Profiler Settings
+	▸ Tracked Apps Autocomplete field.
+
+	Excludes ``frappe_profiler`` (the profiler's own callsites are
+	already filtered regardless of user config, and listing it here
+	would suggest tracking the tool that's doing the tracking).
+
+	Restricted to System Manager since Profiler Settings itself is.
+	"""
+	if "System Manager" not in (frappe.get_roles() or []):
+		frappe.throw(
+			"Only System Manager can list installed apps for the "
+			"Profiler Settings picker."
+		)
+	apps = frappe.get_installed_apps() or []
+	return [app for app in apps if app != "frappe_profiler"]
