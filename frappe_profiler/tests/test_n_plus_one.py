@@ -257,67 +257,6 @@ def test_user_code_n_plus_one_still_emits_as_actionable(empty_context):
 	assert "frappe.get_all" in detail["fix_hint"]
 
 
-def test_is_framework_callsite_helper_unit():
-	"""Direct unit test of the classifier — covers edge cases
-	without needing a full recording.
-
-	v0.5.2: extended to treat every official Frappe-maintained app
-	(erpnext, hrms, payments, lms, helpdesk, insights, crm, builder,
-	wiki, drive) as framework. Triggered by a production Sales
-	Invoice session that surfaced 10 'Redundant cache lookup'
-	findings landing in apps/erpnext/.../sales_invoice.py:300 —
-	loops inside ERPNext that app developers can't practically
-	patch.
-	"""
-	from frappe_profiler.analyzers.n_plus_one import _is_framework_callsite
-
-	# True: frappe core
-	assert _is_framework_callsite("frappe/query_builder/utils.py") is True
-	assert _is_framework_callsite("frappe/model/document.py") is True
-	assert _is_framework_callsite("frappe/__init__.py") is True
-	assert _is_framework_callsite("frappe_profiler/capture.py") is True
-	# Absolute path containing frappe/
-	assert _is_framework_callsite(
-		"/Users/navin/office/frappe_bench/apps/frappe/frappe/handler.py"
-	) is True
-
-	# True (v0.5.2): official Frappe-maintained apps
-	assert _is_framework_callsite("apps/erpnext/erpnext/foo.py") is True
-	assert _is_framework_callsite(
-		"apps/erpnext/erpnext/accounts/doctype/sales_invoice/sales_invoice.py"
-	) is True
-	assert _is_framework_callsite("apps/hrms/hrms/payroll/utils.py") is True
-	assert _is_framework_callsite("apps/payments/payments/utils.py") is True
-	assert _is_framework_callsite("apps/lms/lms/foo.py") is True
-	assert _is_framework_callsite("apps/helpdesk/helpdesk/api.py") is True
-	assert _is_framework_callsite("apps/insights/insights/api.py") is True
-	assert _is_framework_callsite("apps/crm/crm/fcrm/doctype/foo.py") is True
-	assert _is_framework_callsite("apps/builder/builder/api.py") is True
-	assert _is_framework_callsite("apps/wiki/wiki/api.py") is True
-	assert _is_framework_callsite("apps/drive/drive/api.py") is True
-
-	# True: pip-installed third-party
-	assert _is_framework_callsite(
-		"env/lib/python3.14/site-packages/werkzeug/serving.py"
-	) is True
-
-	# False: user code (custom app, not in the framework allowlist)
-	assert _is_framework_callsite("apps/myapp/controllers/import.py") is False
-	# Look-alike names that superficially contain a framework token but
-	# as part of a different word must NOT match (boundary-sensitive).
-	assert _is_framework_callsite("apps/my_crm/custom.py") is False, (
-		"'crm/' must not match inside 'my_crm/' — boundary check failed"
-	)
-	assert _is_framework_callsite("apps/myerpnext_fork/foo.py") is False, (
-		"'erpnext/' must not match inside 'myerpnext_fork/' — "
-		"boundary check failed"
-	)
-
-	# Empty
-	assert _is_framework_callsite("") is False
-	assert _is_framework_callsite(None) is False
-
-
 def test_title_fits_in_140_chars_for_deeply_nested_module_paths(empty_context):
 	"""Profiler Finding.title is VARCHAR(140). Apps with deeply-nested
 	module paths (jewellery_erpnext has /doctype/<name>/<name>.py with

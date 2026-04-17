@@ -29,32 +29,18 @@ from frappe_profiler.analyzers.base import (
 	walk_callsite,
 )
 
-# A group must have at least this many occurrences to be flagged.
-# Default is intentionally conservative — many legitimate Frappe patterns
-# run 5-9 of the same query (child table operations), and we don't want
-# to flag those. Can be overridden per site via
-# site_config.json: profiler_n_plus_one_threshold
-DEFAULT_MIN_OCCURRENCES = 10
-
 # A group is also required to spend at least this much total time before
 # being flagged. Prevents tiny (<1ms each) queries from generating noisy
-# findings even when they repeat many times.
+# findings even when they repeat many times. The per-occurrence
+# threshold now lives in Profiler Settings as
+# ``n_plus_one_min_occurrences`` (default 10) — see
+# ``frappe_profiler.settings``.
 DEFAULT_MIN_TOTAL_TIME_MS = 20
 
 # Severity heuristics
 HIGH_OCCURRENCES = 50
 HIGH_TOTAL_TIME_MS = 200
 MEDIUM_OCCURRENCES = 20
-
-def _get_threshold() -> int:
-	"""Kept for backwards-compat with external importers. New callers
-	should go through ``frappe_profiler.settings.get_config()``."""
-	from frappe_profiler.settings import get_config
-	try:
-		return get_config().n_plus_one_min_occurrences
-	except Exception:
-		return DEFAULT_MIN_OCCURRENCES
-
 
 def _get_min_total_time() -> float:
 	try:
@@ -172,27 +158,6 @@ def _severity(count: int, total_time_ms: float) -> str:
 	if count >= MEDIUM_OCCURRENCES:
 		return "Medium"
 	return "Low"
-
-
-def _is_framework_callsite(filename: str) -> bool:
-	"""True when the blamed file is inside a framework or official
-	Frappe-maintained app (see base.FRAMEWORK_APPS).
-
-	Used to route N+1 findings into the separate "Framework N+1"
-	bucket (Low severity, transparent description) rather than the
-	normal "N+1 Query" one. The callsite walker already prefers
-	user-code frames over framework core frames, so this only fires
-	when EVERY frame in the stack was in a framework app — which
-	happens for framework background tasks, migrations, and
-	framework-internal query loops (e.g. frappe.query_builder.utils
-	building a SELECT for each input, or erpnext's sales_invoice
-	validation looping over cached lookups).
-
-	Thin wrapper around base.is_framework_callsite — kept as its own
-	module-level name for backwards compatibility with existing tests
-	that import ``n_plus_one._is_framework_callsite``.
-	"""
-	return is_framework_callsite(filename)
 
 
 def _title_for_callsite(short_fn, lineno, count, variant_count) -> str:
