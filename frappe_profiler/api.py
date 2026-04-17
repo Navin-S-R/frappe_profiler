@@ -1113,6 +1113,100 @@ def retry_analyze(session_uuid: str) -> dict:
 
 
 @frappe.whitelist()
+def regenerate_reports(session_uuid: str) -> dict:
+	"""Re-render the safe + raw HTML reports from stored session data.
+
+	Unlike ``retry_analyze``, this does NOT re-run any analyzer. It
+	only invokes ``renderer.render_safe/render_raw`` on the existing
+	Profiler Session row. Typical use: the report template or
+	renderer code changed (e.g. upgrading frappe_profiler to a new
+	version with an improved layout) and you want the new UI applied
+	to an already-analyzed session without the cost of re-running
+	the entire analysis pipeline.
+
+	Characteristics:
+
+	  - **Fast** — milliseconds vs. minutes. No DB-heavy analyzer
+	    passes, no EXPLAIN calls. Just template rendering.
+	  - **Safe to run repeatedly** — idempotent. Each invocation
+	    replaces the existing safe/raw File attachments and clears
+	    the cached PDF.
+	  - **Best-effort recordings** — fetches the original recordings
+	    from Redis by UUID. If they've expired (TTL exceeded),
+	    per-query drill-down / Full recordings sections render empty
+	    but every other section (findings, stats, hot frames, exec
+	    summary, analyzer notes) stays intact because those are
+	    persisted on the Profiler Session row.
+	  - **Allowed on Ready OR Failed sessions** — re-rendering a
+	    Failed session whose analyze partially completed is often
+	    how this feature pays for itself (unblocks a demo when a
+	    render-time bug was fixed).
+
+	Permission: recording user OR System Manager.
+	"""
+	user = _require_profiler_user()
+	if not session_uuid:
+		frappe.throw("session_uuid is required")
+
+	row = frappe.db.get_value(
+		"Profiler Session",
+		{"session_uuid": session_uuid},
+		["name", "user", "status"],
+		as_dict=True,
+	)
+	if not row:
+		frappe.throw(f"No Profiler Session found for uuid {session_uuid}")
+
+	roles = set(frappe.get_roles(user))
+	if (
+		row["user"] != user
+		and "System Manager" not in roles
+		and user != "Administrator"
+	):
+		frappe.throw(
+			"You can only regenerate reports for your own sessions.",
+			frappe.PermissionError,
+		)
+
+	# Best-effort recording fetch. Safe renderer uses DocType fields for
+	# everything important; recordings only power the per-query drill-
+	# down + Full recordings sections. If Redis dropped them, render
+	# with an empty list and the rest of the report is still fine.
+	from frappe_profiler import analyze as _analyze_mod
+
+	doc = frappe.get_doc("Profiler Session", row["name"])
+	recording_uuids = [
+		a.recording_uuid
+		for a in (doc.actions or [])
+		if getattr(a, "recording_uuid", None)
+	]
+	try:
+		recordings = list(_analyze_mod._fetch_recordings(recording_uuids))
+	except Exception:
+		frappe.log_error(title="frappe_profiler regenerate_reports fetch")
+		recordings = []
+
+	# Invalidate the cached PDF — next /api/method/download_pdf call
+	# will regenerate it from the freshly-rendered safe HTML.
+	try:
+		from frappe_profiler import pdf_export
+
+		pdf_export.clear_cached_pdf(session_uuid)
+	except Exception:
+		pass
+
+	_analyze_mod._render_and_attach_reports(row["name"], recordings)
+
+	return {
+		"regenerated": True,
+		"session_uuid": session_uuid,
+		"docname": row["name"],
+		"recordings_available": len(recordings),
+		"actions_total": len(doc.actions or []),
+	}
+
+
+@frappe.whitelist()
 def get_installed_apps_for_tracking() -> list[str]:
 	"""Return the bench's installed apps for the Profiler Settings
 	▸ Tracked Apps Autocomplete field.

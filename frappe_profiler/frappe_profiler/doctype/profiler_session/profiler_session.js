@@ -13,6 +13,7 @@ frappe.ui.form.on("Profiler Session", {
 		render_status_indicator(frm);
 		render_download_buttons(frm);
 		render_retry_button(frm);
+		render_regenerate_report_button(frm);
 		render_findings_summary(frm);
 		render_analyzer_warnings(frm);
 		render_baseline_buttons(frm);
@@ -129,6 +130,65 @@ function render_retry_button(frm) {
 						} else {
 							frappe.show_alert({
 								message: data.reason || __("Retry skipped"),
+								indicator: "gray",
+							});
+						}
+					},
+				});
+			},
+		);
+	});
+}
+
+// v0.5.3: Regenerate Reports button. Re-renders the safe + raw HTML
+// from the stored session data without re-running the analyzer. Shown
+// on Ready / Failed sessions. Typical use: the report template was
+// upgraded (e.g. noise filters or exec summary added) and the admin
+// wants existing sessions to reflect the new layout — or the original
+// render crashed and a fix was deployed.
+function render_regenerate_report_button(frm) {
+	if (frm.is_new()) return;
+	// Only makes sense once the session has content to render.
+	if (!["Ready", "Failed"].includes(frm.doc.status)) return;
+
+	frm.add_custom_button(__("Regenerate Reports"), () => {
+		frappe.confirm(
+			__(
+				"Re-render the safe and raw HTML reports from stored "
+				+ "session data? This does NOT re-run the analyzer — it "
+				+ "only re-invokes the renderer, applying the current "
+				+ "report template to this session. Takes a few seconds."
+			),
+			() => {
+				frappe.call({
+					method: "frappe_profiler.api.regenerate_reports",
+					args: { session_uuid: frm.doc.session_uuid },
+					freeze: true,
+					freeze_message: __("Regenerating reports..."),
+					callback: (r) => {
+						const data = (r && r.message) || {};
+						if (data.regenerated) {
+							const rec = data.recordings_available;
+							const total = data.actions_total;
+							let msg = __("Reports regenerated.");
+							if (total && rec < total) {
+								msg += " "
+									+ __(
+										"Only {0} of {1} recordings were "
+										+ "available (others expired from "
+										+ "Redis); per-query drill-down "
+										+ "may be partial.",
+										[rec, total],
+									);
+							}
+							frappe.show_alert({
+								message: msg,
+								indicator: "green",
+							});
+							setTimeout(() => frm.reload_doc(), 1500);
+						} else {
+							frappe.show_alert({
+								message: __("Regeneration skipped"),
 								indicator: "gray",
 							});
 						}
