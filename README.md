@@ -17,6 +17,7 @@
 - [The customer → partner handoff](#the-customer--partner-handoff)
 - [Finding types](#finding-types)
 - [How it works](#how-it-works)
+- [Dependencies](#dependencies)
 - [Comparison with alternatives](#comparison-with-alternatives)
 - [Production safety](#production-safety)
 - [Scheduler-disabled sites](#scheduler-disabled-sites)
@@ -166,6 +167,56 @@ Five sentences:
 5. **Ten analyzers, all pure functions.** Per-action breakdown, top-N slow queries, N+1 (by callsite), EXPLAIN flags, index suggestions (verified against schema), per-table breakdown, Python call tree (v0.3.0), redundant calls (v0.3.0), infra pressure (v0.5.0), frontend timings (v0.5.0). Each is independently testable from JSON fixtures with no Frappe DB access.
 
 For the full architecture (data-flow diagrams, hook order, edge cases, extension points), see [`ARCHITECTURE.md`](../frappe_profiler_design/ARCHITECTURE.md).
+
+---
+
+## Dependencies
+
+Deliberately minimal. **Only one non-Frappe dependency is declared** in `pyproject.toml`; everything else rides on Frappe, the standard library, or MariaDB's own EXPLAIN output. This keeps installs lightweight and avoids fighting anyone else's package pins.
+
+### Declared (installed by `bench get-app`)
+
+| Package | Version | What it powers |
+|---|---|---|
+| **[`pyinstrument`](https://pypi.org/project/pyinstrument/)** | `>=4.6,<6` | Statistical Python call-tree sampler. Produces the per-recording call tree that drives the **Hot Frames** leaderboard, **Slow Hot Path** findings, **Hook Bottleneck** detection, the **Time Breakdown** donut, and the self-referential hot-path phrasing. Without this, the profiler would only see SQL — no Python context. |
+
+### Inherited from Frappe (no extra install)
+
+| Package | Role in the profiler |
+|---|---|
+| **`frappe.recorder`** | Frappe's built-in SQL recorder. Captures every query + Python stack during a request. We reuse it unchanged for SQL capture; session tracking and analyze pipeline live on top. |
+| **[`sqlparse`](https://pypi.org/project/sqlparse/)** | SQL tokenizer / pretty-printer. Formats queries in the Raw report and normalizes whitespace for the **Top Queries** leaderboard. |
+| **[`sql_metadata`](https://pypi.org/project/sql-metadata/)** | SQL parser used only by `index_suggestions.py` to extract WHERE/JOIN columns for the **Missing Index** finding's suggested DDL. Parser limitations are caught and downgraded to Analyzer Notes warnings — never a hard failure. |
+| **[`psutil`](https://pypi.org/project/psutil/)** | CPU %, worker RSS, load average, swap. Powers the **Server Resource** panel + **Memory Pressure** / **Resource Contention** findings. |
+| **[`rq`](https://pypi.org/project/rq/)** | Redis Queue — reads queue depth (default/short/long) for the **Background Queue Backlog** finding. |
+| **`redis`** (via `frappe.cache`) | Storage of recordings, sidecar argument logs, pyinstrument session pickles. |
+| **[`Jinja2`](https://pypi.org/project/Jinja2/)** | Report template (`templates/report.html`) — the single source of truth for both Safe and Raw modes. |
+
+### Standard-library workhorses (no install, always present)
+
+| Module | Role |
+|---|---|
+| `sys._getframe` | Cheap caller-stack capture in the sidecar wraps on `frappe.get_doc` / `cache.get_value` / `has_permission`. The instrumentation backbone for **Redundant Call** findings. |
+| `hashlib` | SHA-256 of `identifier_raw` → `identifier_safe` so PII never ends up in Safe-mode finding titles (see `capture.py`). |
+| `pickle` | pyinstrument session tree serialization in Redis. |
+| `dataclasses`, `collections.Counter` / `defaultdict`, `re`, `json`, `urllib` | Analyzer plumbing. |
+
+### Test-time only (not shipped with the app)
+
+| Package | Role |
+|---|---|
+| **`pytest`** | Test runner. 472+ tests in the suite. |
+| **[`hypothesis`](https://pypi.org/project/hypothesis/)** | Property-based testing for the call-tree pruner — fuzzes its invariants (hot-path preservation, soft-cap floor, SQL-leaf preservation). |
+
+### Written in-house (no library)
+
+These do real analytical work without pulling a dependency:
+
+- **EXPLAIN-based findings** — Full Table Scan / Filesort / Temporary Table / Low Filter Ratio are derived from MariaDB's own EXPLAIN output dict (no SQL-planning library).
+- **N+1 detection** — groups the recorder's captured stacks by `(filename, lineno)` and collapses multi-variant loops (v0.5.2 callsite dedup).
+- **Framework classifier** — pure path-boundary matching against the `FRAMEWORK_APPS` frozenset (frappe, erpnext, hrms, lms, helpdesk, insights, crm, builder, wiki, drive, payments) + third-party lib heuristics.
+- **Post-fix timing projections** — per-finding-type speedup factors (20× for full-scan, 3× for filesort, 2× for temp-table, `filtered_pct/100` for low filter, 2× avg for N+1 batching). See `analyzers/base.project_post_fix_ms`.
+- **Per-app bucketing, executive summary, analyzer notes, collapsible sections** — pure Python in the renderer + Jinja macros.
 
 ---
 
