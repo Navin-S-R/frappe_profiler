@@ -87,30 +87,39 @@ def test_render_splits_findings_into_actionable_and_observational():
 	)
 
 
-def test_template_has_observations_section():
-	"""The report template must include a separate Observations
-	section that renders observational_findings. Without it the
-	information disappears from the report entirely."""
+def test_template_has_observations_subsection_inside_findings():
+	"""The report template must include the Observations as a nested
+	subsection INSIDE the Findings section (v0.5.2 restructure — user
+	asked: 'If its a framework related issue then move a sub-section').
+	Without it the information disappears from the report entirely."""
 	import os
 	here = os.path.dirname(__file__)
 	tpath = os.path.join(here, "..", "templates", "report.html")
 	with open(tpath) as f:
 		template = f.read()
 
-	# The Observations h2 heading must exist.
-	assert "Observations" in template, (
-		"report.html must have an Observations section heading"
+	# The Framework-level observations heading must exist as a subsection.
+	assert "Framework-level observations" in template, (
+		"report.html must have a Framework-level observations subsection heading"
 	)
 	# It must loop over observational_findings.
 	assert "observational_findings" in template, (
 		"report.html must iterate observational_findings"
 	)
-	# And it's separate from — below — the Findings section.
+	# Observations is now a <details class="subsection"> inside Findings.
 	findings_idx = template.find("Findings &mdash; what to fix")
-	obs_idx = template.find(">Observations<")
+	obs_idx = template.find("Framework-level observations")
+	findings_close_idx = template.find("</details>", obs_idx)
 	assert findings_idx > 0 and obs_idx > 0
 	assert obs_idx > findings_idx, (
-		"Observations must render BELOW the Findings section"
+		"Framework-level observations subsection must live inside the "
+		"Findings section (below its <summary>, above its </details>)"
+	)
+	# And the subsection uses the collapsed-by-default pattern (no `open` attribute).
+	subsection_marker = '<details class="subsection">'
+	assert subsection_marker in template, (
+		"Framework-level observations must be a collapsed-by-default "
+		"<details class='subsection'> block (no `open` attribute)"
 	)
 
 
