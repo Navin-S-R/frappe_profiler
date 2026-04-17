@@ -460,6 +460,19 @@ def render(
 		if line.strip()
 	]
 
+	# v0.5.3: If any warning starts with the TRUNCATED marker, surface
+	# it in its own prominent banner at the top of the report rather
+	# than burying it in the collapsed Analyzer Notes section. Users
+	# read an 8s Submit report without noticing the "566 queries were
+	# truncated" warning because it sat below the fold — then debugged
+	# based on an incomplete picture. The banner forces the visibility
+	# that the severity of the situation deserves.
+	truncation_banner = None
+	for w in analyzer_warnings:
+		if w.startswith("⚠ TRUNCATED:"):
+			truncation_banner = w
+			break
+
 	# v0.5.2: sub-group findings by top-level app so the report reads
 	# "myapp (3 findings, ~420ms)" → 3 cards, instead of a flat list
 	# mixing myapp + erpnext + frappe callsites. Tracked-apps order
@@ -490,6 +503,7 @@ def render(
 		"session": session_doc,
 		"actions": actions,
 		"analyzer_warnings": analyzer_warnings,
+		"truncation_banner": truncation_banner,
 		"findings_by_app": findings_by_app,
 		"observational_findings_by_app": observational_findings_by_app,
 		"executive_summary": executive_summary,

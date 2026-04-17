@@ -441,6 +441,10 @@ def _fetch_recordings(recording_uuids: list[str]):
 # nearly a million DB calls and would exceed the RQ long-queue timeout.
 # We cap at a reasonable upper bound and dedupe EXPLAIN by normalized
 # query shape so we only EXPLAIN each distinct query once per session.
+#
+# v0.5.3: the cap is now configurable via
+# ``Profiler Settings ▸ Max Queries per Recording``. The constant
+# below is the fallback default used when settings can't be read.
 MAX_QUERIES_ENRICHED_PER_RECORDING = 2000
 
 # Cross-session EXPLAIN cache (Round 2 fix #12). On a stable schema, two
@@ -480,6 +484,7 @@ def _enrich_recordings(recordings: list[dict]) -> list[str]:
 
 	warnings: list[str] = []
 	truncated_queries = 0
+	total_queries_seen = 0   # for the truncation-banner percentage
 	# Cache EXPLAIN results by normalized query shape so we don't re-run
 	# EXPLAIN on the same query hundreds of times within a single session.
 	# This is the in-memory first tier; the second tier is the
@@ -494,11 +499,23 @@ def _enrich_recordings(recordings: list[dict]) -> list[str]:
 	)
 	use_shared_cache = cache_ttl > 0
 
+	# v0.5.3: per-recording cap is admin-configurable. Fall back to
+	# the hardcoded default if settings read fails for any reason —
+	# we must never let a settings hiccup starve the analyze pipeline.
+	try:
+		from frappe_profiler.settings import get_config
+		cap = int(get_config().max_queries_per_recording)
+	except Exception:
+		cap = MAX_QUERIES_ENRICHED_PER_RECORDING
+	if cap <= 0:
+		cap = MAX_QUERIES_ENRICHED_PER_RECORDING
+
 	for recording in recordings:
 		calls = recording.get("calls") or []
-		if len(calls) > MAX_QUERIES_ENRICHED_PER_RECORDING:
-			truncated_queries += len(calls) - MAX_QUERIES_ENRICHED_PER_RECORDING
-			calls = calls[:MAX_QUERIES_ENRICHED_PER_RECORDING]
+		total_queries_seen += len(calls)
+		if len(calls) > cap:
+			truncated_queries += len(calls) - cap
+			calls = calls[:cap]
 			recording["calls"] = calls
 
 		for call in calls:
@@ -572,12 +589,29 @@ def _enrich_recordings(recordings: list[dict]) -> list[str]:
 			pass
 
 	if truncated_queries:
+		pct = (
+			round(truncated_queries / total_queries_seen * 100)
+			if total_queries_seen else 0
+		)
+		# v0.5.3: the renderer reads this structured marker and shows
+		# a prominent banner at the top of the report, in addition to
+		# the Analyzer Notes entry. Users were missing truncation
+		# warnings when they only appeared in the collapsed bottom
+		# section — "166 queries truncated" buried below stats cards
+		# and findings led to developers reading an incomplete report
+		# without noticing.
 		warnings.append(
-			f"Truncated {truncated_queries} queries during enrichment "
-			f"(exceeded the {MAX_QUERIES_ENRICHED_PER_RECORDING}-queries-per-"
-			"recording cap). The report covers the first part of each "
-			"recording. If you need full analysis, re-run the profiler on a "
-			"shorter flow."
+			f"⚠ TRUNCATED: {truncated_queries} queries "
+			f"({pct}% of the flow) exceeded the {cap}-queries-per-"
+			"recording enrichment cap and were analyzed without "
+			"EXPLAIN / normalization. The report covers the first "
+			f"{cap} queries per recording; the rest are visible in "
+			"Top Queries but not in index-suggestion / full-scan / "
+			"filter-ratio findings. "
+			"To get full coverage, raise "
+			"<b>Profiler Settings ▸ Max Queries per Recording</b> "
+			"(default 2000, try 5000-10000) and re-run the session "
+			"— OR profile a shorter flow."
 		)
 	return warnings
 

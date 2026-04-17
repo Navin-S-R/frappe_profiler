@@ -40,6 +40,12 @@ _DEFAULTS = {
 	"enabled": True,
 	"session_retention_days": 30,
 	"tracked_apps": (),  # tuple, not list — immutable for caching
+	# v0.5.3: per-recording EXPLAIN / enrichment cap. Long flows (bulk
+	# Submit chains producing 5000+ queries per recording) would exceed
+	# the RQ job timeout if we ran EXPLAIN on every one. Capped so
+	# analyze stays bounded. Most sessions are well under 2000; raise
+	# to 5000/10000 for legitimately-heavy flows.
+	"max_queries_per_recording": 2000,
 	"redundant_doc_threshold": 5,
 	"redundant_cache_threshold": 50,
 	"redundant_perm_threshold": 10,
@@ -68,6 +74,7 @@ class ProfilerConfig:
 	enabled: bool = True
 	session_retention_days: int = 30
 	tracked_apps: tuple[str, ...] = field(default_factory=tuple)
+	max_queries_per_recording: int = 2000
 	redundant_doc_threshold: int = 5
 	redundant_cache_threshold: int = 10
 	redundant_perm_threshold: int = 10
@@ -108,6 +115,7 @@ def _read_doctype_row() -> dict | None:
 			for row in (doc.get("tracked_apps") or [])
 			if (row.app_name or "").strip()
 		),
+		"max_queries_per_recording": int(doc.get("max_queries_per_recording") or 0) or None,
 		"redundant_doc_threshold": int(doc.get("redundant_doc_threshold") or 0) or None,
 		"redundant_cache_threshold": int(doc.get("redundant_cache_threshold") or 0) or None,
 		"redundant_perm_threshold": int(doc.get("redundant_perm_threshold") or 0) or None,
@@ -155,6 +163,7 @@ def _resolve() -> ProfilerConfig:
 			row.get("session_retention_days") or _DEFAULTS["session_retention_days"]
 		),
 		tracked_apps=tuple(row.get("tracked_apps") or ()),
+		max_queries_per_recording=_threshold("max_queries_per_recording"),
 		redundant_doc_threshold=_threshold("redundant_doc_threshold"),
 		redundant_cache_threshold=_threshold("redundant_cache_threshold"),
 		redundant_perm_threshold=_threshold("redundant_perm_threshold"),

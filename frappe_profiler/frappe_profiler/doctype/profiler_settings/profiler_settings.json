@@ -10,6 +10,9 @@
   "enabled",
   "column_break_general",
   "session_retention_days",
+  "capacity_section",
+  "capacity_description",
+  "max_queries_per_recording",
   "apps_section",
   "apps_description",
   "tracked_apps",
@@ -44,6 +47,24 @@
    "fieldname": "session_retention_days",
    "fieldtype": "Int",
    "label": "Session Retention (days)",
+   "non_negative": 1
+  },
+  {
+   "fieldname": "capacity_section",
+   "fieldtype": "Section Break",
+   "label": "Capture Capacity"
+  },
+  {
+   "fieldname": "capacity_description",
+   "fieldtype": "HTML",
+   "options": "<p class=\"text-muted small\">Long-running flows (bulk inserts, complex Submit chains) can exceed the per-recording query cap during analyze-time enrichment — each query needs an <code>EXPLAIN</code> round-trip, so very high counts would exceed RQ's job timeout. When capped, the report covers the first N queries and the rest are truncated; a red banner at the top of the report surfaces the truncation so you know the analysis is partial.</p><p class=\"text-muted small\"><b>Default: 2000</b> — comfortable for most flows. Raise to 5000 or 10000 for flows that legitimately touch more rows (e.g. Manufacturing Plan Submit creating 100+ child orders). Analyze-time cost scales roughly linearly with this value.</p>"
+  },
+  {
+   "default": "2000",
+   "description": "Max queries per recording that get enriched (sqlparse format + EXPLAIN + normalization). Anything beyond this is truncated with a warning. Keep reasonable — each query costs one EXPLAIN round-trip.",
+   "fieldname": "max_queries_per_recording",
+   "fieldtype": "Int",
+   "label": "Max Queries per Recording",
    "non_negative": 1
   },
   {

@@ -219,6 +219,34 @@
     a.callsite-link { border-bottom: none; }
   }
 
+  /* v0.5.3: Truncation banner — sits above the exec-summary when the
+     per-recording cap was exceeded. Red-bordered, full-width, with
+     bold header so nobody can claim they didn't see it. Mirrors the
+     pattern APM tools use for "data sampled at X%" warnings. */
+  .truncation-banner {
+    background: #fef2f2;
+    border: 1px solid #fca5a5;
+    border-left: 6px solid #dc2626;
+    border-radius: 8px;
+    padding: 14px 20px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  }
+  .truncation-banner-title {
+    color: #991b1b;
+    font-weight: 700;
+    font-size: 1.05rem;
+    margin-bottom: 6px;
+  }
+  .truncation-banner-body {
+    color: #7f1d1d;
+    font-size: 0.92rem;
+    line-height: 1.5;
+  }
+  .truncation-banner-body b {
+    color: #991b1b;
+  }
+
   /* v0.5.2 round 3: Executive summary card. The visual weight signals
      "read this first" — colored left border flags session pace
      (green / amber / red), generous padding, bullets styled like an
@@ -583,6 +611,18 @@
       </p>
     {% endif %}
   </div>
+
+  {# v0.5.3: TRUNCATION BANNER — prominent at the top when analyze
+     truncated queries beyond the per-recording cap. Previously only
+     surfaced in the collapsed Analyzer Notes at the bottom, where
+     developers missed it and read incomplete reports. Deliberately
+     placed ABOVE the exec-summary card so it's impossible to miss. #}
+  {% if truncation_banner %}
+  <div class="truncation-banner">
+    <div class="truncation-banner-title">⚠ Report is partial</div>
+    <div class="truncation-banner-body">{{ truncation_banner | safe }}</div>
+  </div>
+  {% endif %}
 
   {# v0.5.2 round 3: EXECUTIVE SUMMARY — TL;DR readable in 30 seconds.
      Placed above the stat-cards so a non-developer sees the "what's

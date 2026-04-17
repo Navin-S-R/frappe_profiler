@@ -57,6 +57,10 @@ class TestDefaults:
 		assert cfg.redundant_cache_threshold == 50
 		assert cfg.redundant_perm_threshold == 10
 		assert cfg.n_plus_one_min_occurrences == 10
+		# v0.5.3: per-recording EXPLAIN / enrichment cap. Fallback
+		# default is 2000 — comfortable for most flows, with a clear
+		# banner when truncation kicks in for heavier flows.
+		assert cfg.max_queries_per_recording == 2000
 
 	def test_config_is_frozen(self):
 		cfg = settings.ProfilerConfig()
