@@ -44,31 +44,104 @@ def _is_synthetic_frame(function: str) -> bool:
 	return function.startswith("<") or function.startswith("[")
 
 
+def _derive_module_path(filename: str) -> str:
+	"""Build a Python module dotted path from a captured filename.
+
+	pyinstrument captures filenames like
+	``apps/erpnext/erpnext/selling/doctype/sales_invoice/sales_invoice.py``
+	(Frappe convention: the Python package directory matches the app name
+	and lives one level deeper than ``apps/<app>/``). This helper strips
+	the ``apps/<app>/`` wrapper and the ``.py`` suffix, then joins the
+	remaining segments with dots.
+
+	Returns "" when the filename can't be parsed (synthetic frames,
+	stdlib paths, etc.).
+	"""
+	if not filename:
+		return ""
+	parts = [p for p in filename.replace("\\", "/").split("/") if p]
+	if not parts:
+		return ""
+	# Strip leading "apps" (or "/apps") — Frappe convention. Subsequent
+	# duplicate (`apps/<app>/<app>/`) is the package-name double we want
+	# to collapse.
+	if "apps" in parts:
+		idx = parts.index("apps")
+		parts = parts[idx + 1 :]
+	if len(parts) >= 2 and parts[0] == parts[1]:
+		parts = parts[1:]
+	# Strip .py from the last segment (handles .pyx and __init__.py too).
+	if parts and parts[-1].endswith(".py"):
+		parts[-1] = parts[-1][: -len(".py")]
+	if parts and parts[-1] == "__init__":
+		parts.pop()
+	return ".".join(parts)
+
+
+def _derive_app(filename: str) -> str:
+	"""Extract the Frappe app name from a filename.
+
+	``apps/erpnext/erpnext/...`` → ``erpnext``. Falls back to the first
+	non-empty segment when the path doesn't follow the bench layout.
+	"""
+	if not filename:
+		return ""
+	parts = [p for p in filename.replace("\\", "/").split("/") if p]
+	if "apps" in parts:
+		idx = parts.index("apps")
+		if idx + 1 < len(parts):
+			return parts[idx + 1]
+	return parts[0] if parts else ""
+
+
+def _build_dotted_path(filename: str, function: str) -> str:
+	"""Combine module path + function name. Function may already include
+	a class qualifier (e.g. ``SalesInvoice.validate``); pass it through
+	unchanged in that case.
+	"""
+	module = _derive_module_path(filename)
+	if not module:
+		# Fall back to just the function name; resolve_freeform will reject
+		# it as a top-level module candidate so the user knows to type a
+		# fuller path in the freeform textbox.
+		return function or ""
+	if not function:
+		return module
+	return f"{module}.{function}"
+
+
 def _walk_tree(node: dict, hits: dict) -> None:
 	"""Recursively walk a pyinstrument tree, accumulating per-function
 	cumulative_ms and hit count into ``hits``.
 
-	hits[function] = {
-	    "dotted_path": str,
-	    "file": str,
-	    "lineno": int,
-	    "cumulative_ms": float,
-	    "hit_count": int,
-	}
+	pyinstrument captures the bare function name in ``function`` and the
+	source path in ``filename``; we combine the two via
+	``_build_dotted_path`` to get something the picker can attempt to
+	import. The aggregation key uses the derived dotted path so frames
+	with the same name in different modules don't collide.
 	"""
 	if not isinstance(node, dict):
 		return
 
 	function = node.get("function") or ""
+	filename = node.get("filename") or ""
 	kind = node.get("kind", "python")
 
 	if kind == "python" and not _is_synthetic_frame(function):
-		entry = hits.get(function)
+		dotted = _build_dotted_path(filename, function)
+		# Use the (filename, function) tuple as the dedup key so two
+		# unrelated functions sharing a name (e.g. multiple ``validate``
+		# methods across different modules) don't collapse into one
+		# entry. The dotted_path is what the picker UI displays.
+		key = (filename, function)
+		entry = hits.get(key)
 		if entry is None:
-			hits[function] = {
-				"dotted_path": function,
-				"file": node.get("filename") or "",
+			hits[key] = {
+				"dotted_path": dotted,
+				"qualname": function,
+				"file": filename,
 				"lineno": int(node.get("lineno") or 0),
+				"app": _derive_app(filename),
 				"cumulative_ms": float(node.get("cumulative_ms") or 0),
 				"hit_count": 1,
 			}
@@ -86,6 +159,15 @@ def _build_candidates_from_trees(trees: list[dict], findings: list[dict]) -> lis
 	``findings`` is currently a placeholder for future enrichment (pulling
 	additional callsites from N+1/Slow-Query findings). The v1 candidate
 	list is purely tree-derived.
+
+	Each output candidate carries:
+	  - ``dotted_path`` derived from filename + function name (best effort
+	    — class methods may need a freeform correction at pick time)
+	  - ``qualname`` the bare function name as captured (e.g. ``validate``)
+	  - ``file`` / ``lineno`` the captured source location
+	  - ``app`` extracted from filename's ``apps/<app>/`` prefix
+	  - ``cumulative_ms`` / ``hit_count`` summed across the input trees
+	  - ``is_framework`` from FRAMEWORK_APPS membership
 	"""
 	hits: dict = {}
 	for tree in trees:
@@ -93,11 +175,12 @@ def _build_candidates_from_trees(trees: list[dict], findings: list[dict]) -> lis
 
 	candidates = []
 	for entry in hits.values():
-		dotted = entry["dotted_path"]
-		app = dotted.split(".", 1)[0] if "." in dotted else dotted
+		app = entry["app"] or (
+			entry["dotted_path"].split(".", 1)[0] if "." in entry["dotted_path"] else ""
+		)
 		candidates.append({
-			"dotted_path": dotted,
-			"qualname": dotted.rsplit(".", 1)[-1] if "." in dotted else dotted,
+			"dotted_path": entry["dotted_path"],
+			"qualname": entry["qualname"],
 			"file": entry["file"],
 			"lineno": entry["lineno"],
 			"app": app,
@@ -176,16 +259,60 @@ def resolve_freeform(dotted_path: str) -> dict:
 		)
 
 	# Walk the remaining parts as attribute access on the resolved module.
+	# Special-case the common pyinstrument shape: filename → module +
+	# bare function name from a class method (e.g. validate is on
+	# SalesInvoice). When direct getattr on the module fails for a
+	# single-part suffix, scan classes in the module and substitute the
+	# matching one. This lets the curated picker show "module.method"
+	# labels and still resolve to the right callable when the user picks.
 	obj = module
-	for attr in parts[module_parts:]:
+	remaining = parts[module_parts:]
+	resolved_qualname_parts: list[str] = []
+
+	for idx, attr in enumerate(remaining):
 		try:
 			obj = getattr(obj, attr)
+			resolved_qualname_parts.append(attr)
 		except AttributeError:
+			# Try class-method search ONLY for the very next attribute on
+			# a fresh module, and only when there's exactly one matching
+			# class — anything else is too ambiguous to pick automatically
+			# and the user should use the freeform textbox to disambiguate.
+			if idx == 0 and len(remaining) == 1:
+				import inspect as _inspect
+
+				owners = []
+				for member_name, member in vars(module).items():
+					if not _inspect.isclass(member):
+						continue
+					if member.__module__ != module.__name__:
+						continue  # imported, not defined here
+					if attr in vars(member):
+						owners.append((member_name, member))
+				if len(owners) == 1:
+					class_name, class_obj = owners[0]
+					try:
+						obj = getattr(class_obj, attr)
+						resolved_qualname_parts.extend([class_name, attr])
+						continue
+					except AttributeError:
+						pass
+				if len(owners) > 1:
+					choices = ", ".join(f"{cn}.{attr}" for cn, _ in owners)
+					raise PickerError(
+						f"'{attr}' is defined on multiple classes in "
+						f"{module.__name__}: {choices}. Type the full "
+						"path you want in the freeform textbox to disambiguate."
+					)
 			raise PickerError(
 				f"attribute '{attr}' not found while resolving '{dotted_path}'"
 			)
 
-	qualname = ".".join(parts[module_parts:])
+	qualname = ".".join(resolved_qualname_parts) if resolved_qualname_parts else ""
+	# Rewrite dotted_path so downstream (LineProfiler.add_function et al.)
+	# use the actual resolved path, not the user's possibly-class-omitting
+	# input.
+	rewritten = ".".join(parts[:module_parts] + resolved_qualname_parts)
 	eligible, reason = _check_eligibility(obj)
 
 	code = getattr(obj, "__code__", None)
@@ -193,7 +320,7 @@ def resolve_freeform(dotted_path: str) -> dict:
 	lineno = code.co_firstlineno if code is not None else 0
 
 	return {
-		"dotted_path": dotted_path,
+		"dotted_path": rewritten or dotted_path,
 		"qualname": qualname,
 		"file": file,
 		"lineno": lineno,
