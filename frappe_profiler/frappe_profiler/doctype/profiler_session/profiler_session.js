@@ -34,6 +34,42 @@ function render_phase2_button(frm) {
 	if (frm.is_new()) return;
 	if (frm.doc.status !== "Ready") return;
 
+	// If there's an in-flight Recording row, surface Stop as the primary
+	// affordance — that's what the user is looking for after they've
+	// reproduced their flow.
+	var recording = (frm.doc.phase_2_runs || []).find(function (r) {
+		return r.status === "Recording";
+	});
+
+	if (recording) {
+		var stop_btn = frm.add_custom_button(
+			__("Stop Phase 2 Run"),
+			function () {
+				frappe.call({
+					method: "frappe_profiler.api.stop_line_profile_pass",
+					args: { run_uuid: recording.run_uuid },
+					freeze: true,
+					freeze_message: __("Stopping phase 2..."),
+					callback: function () {
+						frappe.show_alert({
+							message: __(
+								"Phase 2 stopped. Analyzing now — the report " +
+								"section will refresh when ready."
+							),
+							indicator: "blue",
+						});
+						frm.reload_doc();
+					},
+				});
+			},
+			__("Phase 2")
+		);
+		// Visually emphasize the stop action while a run is live.
+		try {
+			stop_btn.removeClass("btn-default").addClass("btn-warning");
+		} catch (e) { /* noop */ }
+	}
+
 	frm.add_custom_button(__("Run Line-Profile Pass"), function () {
 		open_phase2_picker(frm);
 	}, __("Phase 2"));

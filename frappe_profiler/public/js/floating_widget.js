@@ -335,7 +335,15 @@
 		if (currentState.display === "inactive") {
 			openStartDialog();
 		} else if (currentState.display === "recording") {
-			confirmAndStop();
+			// v0.6.0: phase-2 recording uses a different stop API and a
+			// different active-flag in Redis. Route the click accordingly
+			// — confirmAndStop calls api.stop which only knows about
+			// phase-1's flag and would no-op silently for phase 2.
+			if (currentState.phase2 && currentState.run_uuid) {
+				stopPhase2();
+			} else {
+				confirmAndStop();
+			}
 		} else if (currentState.display === "ready") {
 			// Navigate to the session detail view
 			if (currentState.docname) {
@@ -345,6 +353,31 @@
 			}
 		}
 		// stopping/analyzing: clicks are no-op until the state resolves
+	}
+
+	function stopPhase2() {
+		const run_uuid = currentState.run_uuid;
+		if (!run_uuid) return;
+		// Optimistic UI: the realtime phase_2_run_analyzing event will
+		// arrive within ~1s and confirm the transition.
+		setDisplay("stopping", "Stopping phase 2…", "");
+		frappe.call({
+			method: "frappe_profiler.api.stop_line_profile_pass",
+			args: { run_uuid: run_uuid },
+			callback: () => {
+				frappe.show_alert({
+					message: __(
+						"Phase 2 stopped — analyzing now. Open the session " +
+						"to see the line-level report when it's ready."
+					),
+					indicator: "blue",
+				});
+			},
+			error: () => {
+				// Server rejected: surface the error and revert state.
+				setDisplay("recording", "Phase 2 recording…", "click form to stop");
+			},
+		});
 	}
 
 	function openStartDialog() {
@@ -680,13 +713,20 @@
 			if (!matchesCurrentSession(data)) return;
 			currentState.display = "recording";
 			currentState.phase2 = true;
-			setDisplay("recording", "Phase 2 recording…", "click form to stop");
+			currentState.run_uuid = data.run_uuid;
+			currentState.session_uuid = data.session_uuid;
+			setDisplay(
+				"recording",
+				"Phase 2 recording…",
+				"click pill or form to stop"
+			);
 		});
 
 		frappe.realtime.on("phase_2_run_analyzing", (data) => {
 			if (!matchesCurrentSession(data)) return;
 			currentState.display = "analyzing";
 			currentState.phase2 = true;
+			currentState.run_uuid = data.run_uuid || currentState.run_uuid;
 			setDisplay("analyzing", "Phase 2 analyzing…", "");
 		});
 
@@ -694,6 +734,7 @@
 			if (!matchesCurrentSession(data)) return;
 			currentState.display = "ready";
 			currentState.phase2 = false;
+			currentState.run_uuid = null;
 			currentState.docname = data.parent || currentState.docname;
 			setDisplay("ready", "Phase 2 report ready", "click to view");
 			frappe.show_alert({
