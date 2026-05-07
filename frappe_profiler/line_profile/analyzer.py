@@ -254,8 +254,8 @@ def run_analyze(session_uuid: str, run_uuid: str) -> None:
 
 		# Re-render the parent session's safe + raw reports so the new
 		# phase-2 panel appears. Reuses the existing regenerate_reports
-		# code path so we don't duplicate the renderer entry point.
-		_regenerate_parent_reports(parent_docname)
+		# code path (which expects session_uuid, not docname).
+		_regenerate_parent_reports(session_uuid)
 
 		# Done — drop ephemeral Redis state.
 		capture.cleanup_run(run_uuid)
@@ -368,22 +368,22 @@ def _mark_run_failed(parent_docname: str, run_uuid: str, error: str, tb: str) ->
 			pass
 
 
-def _regenerate_parent_reports(parent_docname: str) -> None:
+def _regenerate_parent_reports(session_uuid: str) -> None:
 	"""Trigger re-render of the parent Profiler Session's HTML reports.
 
-	Phase 1's existing ``api.regenerate_reports`` performs the same job
-	for phase-1 findings; we reuse that pathway so phase-2 doesn't get a
+	Phase 1's existing ``api.regenerate_reports(session_uuid)`` does the
+	same job for phase-1 findings; reuse it so phase-2 doesn't get a
 	bespoke re-render path that drifts from the canonical one.
 	"""
 	try:
 		from frappe_profiler import api as profiler_api
 
-		profiler_api.regenerate_reports(parent_docname)  # type: ignore[attr-defined]
+		profiler_api.regenerate_reports(session_uuid)  # type: ignore[attr-defined]
 	except Exception as exc:
 		# Re-render failure is non-fatal: data is persisted, the customer
 		# just needs to click "Regenerate Reports" manually. Surface the
 		# error in the run row for debuggability.
 		frappe.log_error(
 			title="phase 2 re-render failed",
-			message=f"{parent_docname}: {exc}\n{traceback.format_exc()}",
+			message=f"{session_uuid}: {exc}\n{traceback.format_exc()}",
 		)

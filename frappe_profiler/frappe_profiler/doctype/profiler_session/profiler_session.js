@@ -70,6 +70,39 @@ function render_phase2_button(frm) {
 		} catch (e) { /* noop */ }
 	}
 
+	// Surface a Retry button for any Phase 2 Run row stuck in Analyzing
+	// or Failed. The most common cause of stuck Analyzing is a dev site
+	// running without `bench start` — no RQ worker picks up the long
+	// queue. retry_phase2_analyze runs inline so the click resolves
+	// directly to Ready or Failed.
+	(frm.doc.phase_2_runs || []).forEach(function (row) {
+		if (row.status !== "Analyzing" && row.status !== "Failed") return;
+		frm.add_custom_button(
+			__("Retry Phase 2 Analyze (" + row.run_uuid.slice(0, 8) + ")"),
+			function () {
+				frappe.call({
+					method: "frappe_profiler.api.retry_phase2_analyze",
+					args: { run_uuid: row.run_uuid },
+					freeze: true,
+					freeze_message: __("Re-running phase-2 analyzer..."),
+					callback: function (r) {
+						var msg = (r && r.message) || {};
+						frappe.show_alert({
+							message: __(
+								"Retry finished — status: " +
+								(msg.status || "unknown") +
+								(msg.error ? " · " + msg.error : "")
+							),
+							indicator: msg.status === "Ready" ? "green" : "red",
+						});
+						frm.reload_doc();
+					},
+				});
+			},
+			__("Phase 2")
+		);
+	});
+
 	frm.add_custom_button(__("Run Line-Profile Pass"), function () {
 		open_phase2_picker(frm);
 	}, __("Phase 2"));

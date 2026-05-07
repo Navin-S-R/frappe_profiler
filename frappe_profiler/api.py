@@ -1487,7 +1487,50 @@ def stop_line_profile_pass(run_uuid: str) -> dict:
 	parent.save(ignore_permissions=True)
 	frappe.db.commit()
 
-	# Enqueue the analyzer.
+	frappe.publish_realtime("phase_2_run_analyzing", {
+		"session_uuid": session_uuid,
+		"run_uuid": run_uuid,
+	}, user=user)
+
+	# When the scheduler is disabled (e.g. dev sites without
+	# `bench start`), no RQ worker will pick up the long-queue job and
+	# the run gets stuck in Analyzing. Mirror api.stop's inline fallback:
+	# run the analyzer in-process so the request completes with results.
+	from frappe.utils.scheduler import is_scheduler_disabled
+
+	run_inline = False
+	try:
+		run_inline = bool(is_scheduler_disabled())
+	except Exception:
+		frappe.log_error(title="frappe_profiler phase-2 scheduler check")
+
+	if run_inline:
+		frappe.logger().warning(
+			f"frappe_profiler: scheduler disabled; running phase-2 "
+			f"analyze inline for run {run_uuid}. Caller will block."
+		)
+		from frappe_profiler.line_profile import analyzer as _lp_analyzer
+
+		try:
+			_lp_analyzer.run_analyze(session_uuid, run_uuid)
+		except Exception as exc:
+			# run_analyze marks the run Failed itself; surface the error
+			# in the API response so the caller isn't silently puzzled.
+			return {
+				"run_uuid": run_uuid,
+				"session_uuid": session_uuid,
+				"status": "Failed",
+				"error": str(exc),
+				"ran_inline": True,
+			}
+		return {
+			"run_uuid": run_uuid,
+			"session_uuid": session_uuid,
+			"status": "Ready",
+			"ran_inline": True,
+		}
+
+	# Otherwise enqueue normally.
 	frappe.enqueue(
 		"frappe_profiler.line_profile.analyzer.run_analyze",
 		queue="long",
@@ -1496,13 +1539,60 @@ def stop_line_profile_pass(run_uuid: str) -> dict:
 		run_uuid=run_uuid,
 	)
 
-	frappe.publish_realtime("phase_2_run_analyzing", {
-		"session_uuid": session_uuid,
-		"run_uuid": run_uuid,
-	}, user=user)
-
 	return {
 		"run_uuid": run_uuid,
 		"session_uuid": session_uuid,
 		"status": "Analyzing",
+	}
+
+
+@frappe.whitelist()
+def retry_phase2_analyze(run_uuid: str) -> dict:
+	"""Re-trigger run_analyze for a Phase 2 Run row stuck in Analyzing or
+	Failed. Useful when the original RQ enqueue never landed (no worker)
+	or when the analyzer crashed and the user wants another shot.
+
+	Resets the row to Analyzing, then runs inline so the response carries
+	the final status (Ready or Failed) — no waiting for a worker to come
+	online.
+	"""
+	from frappe_profiler.line_profile import analyzer as _lp_analyzer
+
+	_require_profiler_user()
+
+	rows = frappe.get_all(
+		"Profiler Phase 2 Run",
+		filters={"run_uuid": run_uuid},
+		fields=["name", "parent", "status"],
+		limit=1,
+	)
+	if not rows:
+		frappe.throw(f"Phase 2 run {run_uuid!r} not found.")
+	row = rows[0]
+	parent_docname = row["parent"]
+	session_uuid = frappe.db.get_value("Profiler Session", parent_docname, "session_uuid")
+
+	# Reset to Analyzing so the realtime event flow still makes sense.
+	parent = frappe.get_doc("Profiler Session", parent_docname)
+	for child in (parent.phase_2_runs or []):
+		if child.run_uuid == run_uuid:
+			child.status = "Analyzing"
+			break
+	parent.flags.ignore_validate_update_after_submit = True
+	parent.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	try:
+		_lp_analyzer.run_analyze(session_uuid, run_uuid)
+	except Exception as exc:
+		return {
+			"run_uuid": run_uuid,
+			"session_uuid": session_uuid,
+			"status": "Failed",
+			"error": str(exc),
+		}
+	return {
+		"run_uuid": run_uuid,
+		"session_uuid": session_uuid,
+		"status": "Ready",
 	}
