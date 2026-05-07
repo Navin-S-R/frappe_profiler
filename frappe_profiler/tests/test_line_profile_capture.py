@@ -138,3 +138,69 @@ class TestAggregateSamplesMultiplePicks:
 		results = capture.aggregate_samples(samples=[], picks=picks)
 
 		assert [r["dotted_path"] for r in results] == ["my_app.beta", "my_app.alpha"]
+
+
+class _FakeStats:
+	"""Stand-in for ``line_profiler.LineStats`` — same attribute surface but
+	no install dependency on the package."""
+
+	def __init__(self, timings: dict, unit: float = 1e-6):
+		self.timings = timings
+		self.unit = unit
+
+
+class _FakeProfiler:
+	def __init__(self, stats: _FakeStats):
+		self._stats = stats
+
+	def get_stats(self):
+		return self._stats
+
+
+class TestSerializeStats:
+	def test_none_profiler_returns_empty(self):
+		assert capture.serialize_stats(None) == []
+
+	def test_microsecond_unit_passes_through(self):
+		stats = _FakeStats(
+			timings={
+				("/p/x.py", 10, "MyClass.method"): [(11, 5, 2000), (12, 3, 600)],
+			},
+			unit=1e-6,
+		)
+		profiler = _FakeProfiler(stats)
+
+		samples = capture.serialize_stats(profiler)
+
+		assert len(samples) == 2
+		first = next(s for s in samples if s["lineno"] == 11)
+		assert first["file"] == "/p/x.py"
+		assert first["qualname"] == "MyClass.method"
+		assert first["hits"] == 5
+		assert first["total_us"] == 2000
+
+	def test_millisecond_unit_converted_to_microseconds(self):
+		# Some line_profiler versions expose stats.unit = 1e-3 (ms). The
+		# serializer must scale to a uniform microsecond shape.
+		stats = _FakeStats(
+			timings={("/p/x.py", 1, "fn"): [(1, 1, 5)]},  # 5 ms
+			unit=1e-3,
+		)
+		samples = capture.serialize_stats(_FakeProfiler(stats))
+
+		assert samples[0]["total_us"] == 5000
+
+	def test_empty_timings_yields_empty(self):
+		stats = _FakeStats(timings={})
+		assert capture.serialize_stats(_FakeProfiler(stats)) == []
+
+	def test_three_or_more_tuple_fields_handled(self):
+		# line_profiler may emit (lineno, hits, time, time_per_hit) or
+		# similar — serializer reads only the first three.
+		stats = _FakeStats(
+			timings={("/p/x.py", 1, "fn"): [(1, 4, 800, 200, "extra")]},
+		)
+		samples = capture.serialize_stats(_FakeProfiler(stats))
+
+		assert samples[0]["hits"] == 4
+		assert samples[0]["total_us"] == 800
