@@ -93,8 +93,14 @@ boot_session = "frappe_profiler.boot.boot_session"
 # `after_request` runs after frappe.recorder.dump(), so the recording is
 # already in Redis by the time we register its UUID with our session.
 
-before_request = ["frappe_profiler.hooks_callbacks.before_request"]
-after_request = ["frappe_profiler.hooks_callbacks.after_request"]
+before_request = [
+	"frappe_profiler.hooks_callbacks.before_request",
+	"frappe_profiler.line_profile.hooks.before_request_line_profile",
+]
+after_request = [
+	"frappe_profiler.hooks_callbacks.after_request",
+	"frappe_profiler.line_profile.hooks.after_request_line_profile",
+]
 
 # Background job lifecycle (Phase 2)
 # ----------------------------------
@@ -107,8 +113,14 @@ after_request = ["frappe_profiler.hooks_callbacks.after_request"]
 # both the synchronous HTTP requests AND the background jobs that the
 # submit triggers (GL postings, stock updates, etc.) under one session.
 
-before_job = ["frappe_profiler.hooks_callbacks.before_job"]
-after_job = ["frappe_profiler.hooks_callbacks.after_job"]
+before_job = [
+	"frappe_profiler.hooks_callbacks.before_job",
+	"frappe_profiler.line_profile.hooks.before_job_line_profile",
+]
+after_job = [
+	"frappe_profiler.hooks_callbacks.after_job",
+	"frappe_profiler.line_profile.hooks.after_job_line_profile",
+]
 
 # Janitor (Phase 6)
 # -----------------

@@ -1224,3 +1224,220 @@ def get_installed_apps_for_tracking() -> list[str]:
 		)
 	apps = frappe.get_installed_apps() or []
 	return [app for app in apps if app != "frappe_profiler"]
+
+
+# ---------------------------------------------------------------------------
+# Phase-2 line profiler API
+# ---------------------------------------------------------------------------
+# Three whitelisted endpoints that the Profiler Session form's "Phase 2:
+# Line Profile" section calls into:
+#
+#   get_phase2_candidates(session_uuid) — populate the curated picker
+#   start_line_profile_pass(session_uuid, picks) — begin a phase-2 run
+#   stop_line_profile_pass(run_uuid) — end the run, enqueue analyze
+#
+# Phase-2 implementation lives in frappe_profiler.line_profile.* —
+# this surface is the thin transport layer.
+
+
+@frappe.whitelist()
+def get_phase2_candidates(session_uuid: str) -> dict:
+	"""Return the curated candidate list for the phase-2 picker UI.
+
+	Reads the parent Profiler Session's actions, parses each action's
+	``call_tree_json``, and builds a top-30 list of frames from user-app
+	code (with framework apps surfaced separately under "observations").
+	"""
+	import json as _json
+
+	from frappe_profiler.line_profile import capture as _lp_capture
+	from frappe_profiler.line_profile import picker as _lp_picker
+
+	_require_profiler_user()
+
+	parent_docname = frappe.db.get_value(
+		"Profiler Session",
+		{"session_uuid": session_uuid},
+		"name",
+	)
+	if not parent_docname:
+		frappe.throw(f"Profiler Session {session_uuid!r} not found.")
+
+	doc = frappe.get_doc("Profiler Session", parent_docname)
+
+	trees = []
+	for action in (doc.actions or []):
+		raw = action.call_tree_json
+		if not raw:
+			continue
+		try:
+			tree = _json.loads(raw)
+		except (TypeError, ValueError):
+			continue
+		# pyinstrument trees are stored either as the full session shape
+		# (``{root: {...}}``) or just the root node.
+		if isinstance(tree, dict) and "root" in tree:
+			tree = tree["root"]
+		trees.append(tree)
+
+	candidates = _lp_picker._build_candidates_from_trees(trees, doc.findings or [])
+
+	return {
+		"session_uuid": session_uuid,
+		"docname": parent_docname,
+		"candidates": [c for c in candidates if not c["is_framework"]],
+		"observations": [c for c in candidates if c["is_framework"]],
+		"line_profiler_available": _lp_capture.is_line_profiler_available(),
+	}
+
+
+@frappe.whitelist()
+def start_line_profile_pass(session_uuid: str, picks) -> dict:
+	"""Begin a phase-2 line-profile run on a finished session.
+
+	``picks`` is a JSON-encoded (or already-parsed) list of
+	``{dotted_path, source}`` entries the customer ticked / typed.
+	"""
+	import json as _json
+	import uuid as _uuid
+
+	from frappe_profiler.line_profile import capture as _lp_capture
+
+	user = _require_profiler_user()
+
+	# The picks arg often arrives as a string from JS — accept both shapes.
+	if isinstance(picks, str):
+		try:
+			picks_list = _json.loads(picks)
+		except _json.JSONDecodeError:
+			frappe.throw("picks must be a JSON list of {dotted_path, source} entries.")
+	else:
+		picks_list = picks
+	if not isinstance(picks_list, list) or not picks_list:
+		frappe.throw("Provide at least one function to line-profile.")
+
+	# Phase-1 must not be active for the same user — phase 1 and phase 2
+	# read separate Redis flags but only one can be active at a time.
+	if session.get_active_session_for(user):
+		frappe.throw(
+			"You currently have a phase-1 session recording. Stop it before "
+			"starting a phase-2 line-profile run.",
+		)
+
+	# Look up the parent Profiler Session and verify it's Ready.
+	parent_docname = frappe.db.get_value(
+		"Profiler Session",
+		{"session_uuid": session_uuid},
+		"name",
+	)
+	if not parent_docname:
+		frappe.throw(f"Profiler Session {session_uuid!r} not found.")
+	parent_status = frappe.db.get_value("Profiler Session", parent_docname, "status")
+	if parent_status != "Ready":
+		frappe.throw(
+			f"Phase-2 requires a finished session (status=Ready); current "
+			f"status is {parent_status!r}.",
+		)
+
+	# Reject if the user already has a phase-2 run in flight elsewhere.
+	if _lp_capture.is_active(user):
+		frappe.throw("You already have a phase-2 line-profile run active.")
+
+	run_uuid = _uuid.uuid4().hex
+
+	# Resolve picks + persist Redis state. Raises CaptureError if no pick
+	# is eligible.
+	try:
+		resolved = _lp_capture.start_line_profile_pass(
+			session_uuid=session_uuid,
+			run_uuid=run_uuid,
+			user=user,
+			picks=picks_list,
+		)
+	except _lp_capture.CaptureError as exc:
+		frappe.throw(str(exc))
+
+	# Append the Phase 2 Run row in Recording status.
+	parent = frappe.get_doc("Profiler Session", parent_docname)
+	parent.append("phase_2_runs", {
+		"run_uuid": run_uuid,
+		"status": "Recording",
+		"started_at": now_datetime(),
+		"picks_json": frappe.as_json([
+			{"dotted_path": r["dotted_path"], "source": r.get("source", "freeform")}
+			for r in resolved if r.get("eligible")
+		]),
+	})
+	parent.flags.ignore_validate_update_after_submit = True
+	parent.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	frappe.publish_realtime("phase_2_run_recording", {
+		"session_uuid": session_uuid,
+		"run_uuid": run_uuid,
+	}, user=user)
+
+	return {
+		"run_uuid": run_uuid,
+		"session_uuid": session_uuid,
+		"docname": parent_docname,
+		"resolved_picks": resolved,
+	}
+
+
+@frappe.whitelist()
+def stop_line_profile_pass(run_uuid: str) -> dict:
+	"""End a phase-2 run, mark it Analyzing, enqueue the analyzer."""
+	from frappe_profiler.line_profile import capture as _lp_capture
+
+	user = _require_profiler_user()
+
+	# Find the run row + parent session.
+	rows = frappe.get_all(
+		"Profiler Phase 2 Run",
+		filters={"run_uuid": run_uuid},
+		fields=["name", "parent", "status"],
+		limit=1,
+	)
+	if not rows:
+		frappe.throw(f"Phase 2 run {run_uuid!r} not found.")
+	row = rows[0]
+	if row["status"] != "Recording":
+		frappe.throw(f"Phase 2 run is in status {row['status']!r}, not Recording.")
+
+	parent_docname = row["parent"]
+	session_uuid = frappe.db.get_value("Profiler Session", parent_docname, "session_uuid")
+
+	# Clear the active flag (capture won't instrument further requests).
+	_lp_capture.stop_line_profile_pass(run_uuid, user)
+
+	# Mark run Analyzing.
+	parent = frappe.get_doc("Profiler Session", parent_docname)
+	for child in (parent.phase_2_runs or []):
+		if child.run_uuid == run_uuid:
+			child.status = "Analyzing"
+			child.ended_at = now_datetime()
+			break
+	parent.flags.ignore_validate_update_after_submit = True
+	parent.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	# Enqueue the analyzer.
+	frappe.enqueue(
+		"frappe_profiler.line_profile.analyzer.run_analyze",
+		queue="long",
+		timeout=25 * 60,
+		session_uuid=session_uuid,
+		run_uuid=run_uuid,
+	)
+
+	frappe.publish_realtime("phase_2_run_analyzing", {
+		"session_uuid": session_uuid,
+		"run_uuid": run_uuid,
+	}, user=user)
+
+	return {
+		"run_uuid": run_uuid,
+		"session_uuid": session_uuid,
+		"status": "Analyzing",
+	}
