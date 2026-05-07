@@ -7,6 +7,7 @@ dynamic = ["version"]
 dependencies = [
 	# "frappe~=15.0.0" # Installed and managed by bench.
 	"pyinstrument>=4.6,<6",
+	"line_profiler>=4.0,<5",
 ]
 
 [build-system]
