@@ -28,6 +28,7 @@
   "detail_section",
   "actions",
   "findings",
+  "phase_2_runs",
   "reports_section",
   "safe_report_file",
   "raw_report_file",
@@ -189,6 +190,14 @@
    "fieldtype": "Table",
    "label": "Findings",
    "options": "Profiler Finding",
+   "read_only": 1
+  },
+  {
+   "description": "Phase-2 line-profile runs attached to this session. Each row is one customer drill-down pass.",
+   "fieldname": "phase_2_runs",
+   "fieldtype": "Table",
+   "label": "Phase 2 Runs",
+   "options": "Profiler Phase 2 Run",
    "read_only": 1
   },
   {

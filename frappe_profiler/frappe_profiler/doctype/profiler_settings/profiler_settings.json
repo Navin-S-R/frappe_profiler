@@ -8,6 +8,7 @@
  "field_order": [
   "general_section",
   "enabled",
+  "safe_report_include_source_lines",
   "column_break_general",
   "session_retention_days",
   "capacity_section",
@@ -36,6 +37,13 @@
    "fieldname": "enabled",
    "fieldtype": "Check",
    "label": "Profiler Enabled"
+  },
+  {
+   "default": "1",
+   "description": "When checked, the Safe Report includes the actual source code text alongside phase-2 line timings. Uncheck for closed-source business logic — the safe report will then show line numbers and timings only, with source-line text omitted.",
+   "fieldname": "safe_report_include_source_lines",
+   "fieldtype": "Check",
+   "label": "Safe Report: Include Source Lines (Phase 2)"
   },
   {
    "fieldname": "column_break_general",
