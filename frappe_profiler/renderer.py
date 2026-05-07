@@ -544,9 +544,308 @@ def render(
 		"frontend_summary": v5.get("frontend_summary") or {},
 		"safe_url": _safe_url,
 		"notes_html": notes_html,  # sanitized, safe to pass through |safe
+		# v0.6.0 phase-2 line profiler — pre-rendered HTML so the existing
+		# report.html template only needs a single {{ phase2_html | safe }}
+		# include instead of growing by 100+ lines of new markup.
+		"phase2_html": _render_phase2_panel(session_doc, mode),
 	}
 
 	return template.render(**context)
+
+
+def _phase2_safe_show_source() -> bool:
+	"""Read the per-instance ``safe_report_include_source_lines`` setting.
+	Defaults to True (show source). Decoupled from get_config() to keep
+	this helper testable without a full settings load.
+	"""
+	try:
+		import frappe
+
+		val = frappe.db.get_single_value(
+			"Profiler Settings", "safe_report_include_source_lines"
+		)
+	except Exception:
+		return True
+	# Frappe Check returns 1/0 (or None for unset); default to True on
+	# missing so the feature is on by default per the design.
+	if val is None:
+		return True
+	return bool(int(val))
+
+
+def _e(text: object) -> str:
+	"""HTML-escape — small alias to keep the phase-2 builder readable."""
+	import html as _html
+	return _html.escape("" if text is None else str(text))
+
+
+def _render_phase2_function_table(
+	fn: dict,
+	show_source: bool,
+	mode: str,
+) -> str:
+	"""Per-function line table inside one phase-2 run.
+
+	Columns: line number, hit count, total ms, per-hit µs, source. In safe
+	mode with the toggle off, the source column shows ``<source omitted>``.
+	"""
+	rows = fn.get("lines") or []
+	dotted = fn.get("dotted_path", "")
+	file = fn.get("file", "")
+
+	html = [
+		'<div class="phase2-function" '
+		'style="margin: 12px 0; padding: 8px; '
+		'border: 1px solid #d1d5db; border-radius: 4px;">',
+		f'<div style="font-family: ui-monospace, Menlo, monospace; '
+		f'font-weight: 600; margin-bottom: 4px;">{_e(dotted)}</div>',
+		f'<div style="color: #6b7280; font-size: 12px; margin-bottom: 8px;">'
+		f'{_e(file)}</div>',
+	]
+
+	if not rows:
+		html.append(
+			'<div style="font-style: italic; color: #6b7280;">'
+			'Function was instrumented but never invoked during phase 2.'
+			'</div></div>'
+		)
+		return "".join(html)
+
+	html.append(
+		'<table style="width: 100%; border-collapse: collapse; '
+		'font-family: ui-monospace, Menlo, monospace; font-size: 12px;">'
+		'<thead style="background: #f9fafb;">'
+		'<tr>'
+		'<th style="text-align: right; padding: 4px 8px; '
+		'border-bottom: 1px solid #e5e7eb;">#</th>'
+		'<th style="text-align: right; padding: 4px 8px; '
+		'border-bottom: 1px solid #e5e7eb;">hits</th>'
+		'<th style="text-align: right; padding: 4px 8px; '
+		'border-bottom: 1px solid #e5e7eb;">total ms</th>'
+		'<th style="text-align: right; padding: 4px 8px; '
+		'border-bottom: 1px solid #e5e7eb;">per hit µs</th>'
+		'<th style="text-align: left; padding: 4px 8px; '
+		'border-bottom: 1px solid #e5e7eb;">source</th>'
+		'</tr></thead><tbody>'
+	)
+
+	# Find the hot line so we can highlight it.
+	max_ms = max((r.get("total_ms") or 0) for r in rows)
+
+	for line in rows:
+		ms = line.get("total_ms") or 0
+		# Highlight rows that account for ≥25% of the function's max line ms
+		# AND > 0 — gives the eye a heat-map of where time goes.
+		highlight = max_ms > 0 and ms / max_ms >= 0.25
+		row_style = (
+			'background: #fef3c7;' if highlight and ms > 0 else 'background: transparent;'
+		)
+		if mode == "safe" and not show_source:
+			source_cell = '<em style="color: #6b7280;">&lt;source omitted&gt;</em>'
+		else:
+			source_cell = (
+				f'<code style="white-space: pre;">{_e(line.get("content", ""))}</code>'
+			)
+		html.append(
+			f'<tr style="{row_style}">'
+			f'<td style="text-align: right; padding: 2px 8px; color: #6b7280;">{line.get("lineno", "")}</td>'
+			f'<td style="text-align: right; padding: 2px 8px;">{line.get("hits", 0)}</td>'
+			f'<td style="text-align: right; padding: 2px 8px;">{ms:.2f}</td>'
+			f'<td style="text-align: right; padding: 2px 8px;">{(line.get("per_hit_us") or 0):.2f}</td>'
+			f'<td style="padding: 2px 8px;">{source_cell}</td>'
+			'</tr>'
+		)
+
+	html.append('</tbody></table></div>')
+	return "".join(html)
+
+
+def _render_phase2_diff_table(diff_rows: list[dict], show_source: bool, mode: str) -> str:
+	"""Render the cross-run delta table for one function profiled in 2+
+	runs — the verify-the-fix view."""
+	if not diff_rows:
+		return ""
+
+	html = [
+		'<table style="width: 100%; border-collapse: collapse; '
+		'font-family: ui-monospace, Menlo, monospace; font-size: 12px; '
+		'margin-top: 8px;">',
+		'<thead style="background: #f9fafb;"><tr>'
+		'<th style="text-align: left; padding: 4px 8px; border-bottom: 1px solid #e5e7eb;">status</th>'
+		'<th style="text-align: right; padding: 4px 8px; border-bottom: 1px solid #e5e7eb;">prev #</th>'
+		'<th style="text-align: right; padding: 4px 8px; border-bottom: 1px solid #e5e7eb;">curr #</th>'
+		'<th style="text-align: right; padding: 4px 8px; border-bottom: 1px solid #e5e7eb;">prev ms</th>'
+		'<th style="text-align: right; padding: 4px 8px; border-bottom: 1px solid #e5e7eb;">curr ms</th>'
+		'<th style="text-align: right; padding: 4px 8px; border-bottom: 1px solid #e5e7eb;">Δ ms</th>'
+		'<th style="text-align: left; padding: 4px 8px; border-bottom: 1px solid #e5e7eb;">source</th>'
+		'</tr></thead><tbody>',
+	]
+
+	for row in diff_rows:
+		status = row.get("status", "")
+		# Status background: green for matched-faster, red for matched-slower,
+		# blue for added, gray for removed.
+		bg = "transparent"
+		delta = row.get("delta_ms")
+		if status == "matched" and delta is not None:
+			if delta < -0.5:
+				bg = "#dcfce7"  # green-50
+			elif delta > 0.5:
+				bg = "#fee2e2"  # red-50
+		elif status == "added":
+			bg = "#dbeafe"  # blue-50
+		elif status == "removed":
+			bg = "#f3f4f6"  # gray-100
+
+		def _fmt(v):
+			return "—" if v is None else (f"{v:.2f}" if isinstance(v, float) else str(v))
+
+		if mode == "safe" and not show_source:
+			source_cell = '<em style="color: #6b7280;">&lt;source omitted&gt;</em>'
+		else:
+			source_cell = (
+				f'<code style="white-space: pre;">{_e(row.get("content", ""))}</code>'
+			)
+
+		html.append(
+			f'<tr style="background: {bg};">'
+			f'<td style="padding: 2px 8px;">{_e(status)}</td>'
+			f'<td style="text-align: right; padding: 2px 8px; color: #6b7280;">{_fmt(row.get("lineno_old"))}</td>'
+			f'<td style="text-align: right; padding: 2px 8px; color: #6b7280;">{_fmt(row.get("lineno_new"))}</td>'
+			f'<td style="text-align: right; padding: 2px 8px;">{_fmt(row.get("ms_old"))}</td>'
+			f'<td style="text-align: right; padding: 2px 8px;">{_fmt(row.get("ms_new"))}</td>'
+			f'<td style="text-align: right; padding: 2px 8px;">{_fmt(delta)}</td>'
+			f'<td style="padding: 2px 8px;">{source_cell}</td>'
+			'</tr>'
+		)
+	html.append('</tbody></table>')
+	return "".join(html)
+
+
+def _render_phase2_panel(session_doc: Any, mode: str) -> str:
+	"""Build the phase-2 section HTML. Returns an empty string when the
+	session has no phase-2 runs (the template's ``{% if phase2_html %}``
+	guard then skips the section entirely).
+
+	HTML is fully self-contained: inline styles only, no external scripts
+	or stylesheets, system fonts. Honors
+	``Profiler Settings.safe_report_include_source_lines`` in safe mode.
+	"""
+	from frappe_profiler.line_profile import diff as _lp_diff
+
+	runs = list(getattr(session_doc, "phase_2_runs", None) or [])
+	if not runs:
+		return ""
+
+	show_source = True
+	if mode == "safe":
+		show_source = _phase2_safe_show_source()
+
+	# Parse each run's stored JSON into the shape we render against.
+	parsed_runs: list[dict] = []
+	for child in runs:
+		try:
+			results = json.loads(child.results_json or "[]")
+		except Exception:
+			results = []
+		try:
+			picks = json.loads(child.picks_json or "[]")
+		except Exception:
+			picks = []
+		parsed_runs.append({
+			"run_uuid": child.run_uuid,
+			"status": child.status,
+			"started_at": child.started_at,
+			"ended_at": child.ended_at,
+			"total_ms": child.total_ms or 0,
+			"picks": picks,
+			"functions": results,
+		})
+
+	# Cross-run diff: when a function appears in 2+ runs, align the latest
+	# two by content hash and render the delta panel.
+	function_history: dict[str, list] = {}
+	for idx, run in enumerate(parsed_runs):
+		for fn in run["functions"]:
+			function_history.setdefault(fn["dotted_path"], []).append((idx, fn))
+
+	diffs: dict[str, dict] = {}
+	for path, history in function_history.items():
+		if len(history) < 2:
+			continue
+		prev_idx, prev_fn = history[-2]
+		curr_idx, curr_fn = history[-1]
+		diffs[path] = {
+			"prev_run_idx": prev_idx,
+			"curr_run_idx": curr_idx,
+			"rows": _lp_diff.align_function(prev_fn["lines"], curr_fn["lines"]),
+		}
+
+	html = [
+		'<section style="margin-top: 32px; padding: 16px; '
+		'border: 1px solid #d1d5db; border-radius: 6px; background: #ffffff;">',
+		'<h2 style="margin: 0 0 8px 0;">Phase 2: Line-Level Drilldown</h2>',
+		'<div style="background: #fef3c7; border-left: 4px solid #f59e0b; '
+		'padding: 8px 12px; margin-bottom: 16px; font-size: 13px;">'
+		'Phase 2 captures only the flow you ran during the line-profile '
+		'recording. Make sure your phase-2 reproduction exercises the same '
+		'code paths as phase 1 — function-not-invoked warnings indicate '
+		"otherwise."
+		'</div>',
+	]
+
+	for run_idx, run in enumerate(parsed_runs, start=1):
+		started = _e(run.get("started_at"))
+		picks_summary = ", ".join(
+			_e(p.get("dotted_path", "?")) for p in run.get("picks", [])
+		)
+		status_color = {
+			"Ready": "#16a34a",
+			"Recording": "#0ea5e9",
+			"Analyzing": "#f59e0b",
+			"Failed": "#dc2626",
+		}.get(run.get("status", ""), "#6b7280")
+		html.append(
+			f'<div style="margin: 16px 0; padding: 12px; '
+			f'background: #f9fafb; border-radius: 4px;">'
+			f'<div style="display: flex; justify-content: space-between; '
+			f'align-items: baseline; margin-bottom: 8px;">'
+			f'<strong>Run {run_idx}</strong> '
+			f'<span style="color: {status_color}; font-size: 12px;">'
+			f'{_e(run.get("status", ""))} · {run.get("total_ms", 0):.2f}ms · '
+			f'{started}</span></div>'
+			f'<div style="font-size: 12px; color: #6b7280; margin-bottom: 8px;">'
+			f'<em>Picks:</em> {picks_summary or "—"}</div>'
+		)
+
+		for fn in run.get("functions", []):
+			html.append(_render_phase2_function_table(fn, show_source, mode))
+		html.append('</div>')
+
+	if diffs:
+		html.append(
+			'<h3 style="margin-top: 24px;">Cross-Run Comparison</h3>'
+			'<div style="font-size: 13px; color: #4b5563; margin-bottom: 8px;">'
+			'For functions profiled in two or more runs, the table below shows '
+			'a line-by-line delta between the most recent two runs (aligned by '
+			'content hash so file edits between runs don\'t break the diff).'
+			'</div>'
+		)
+		for path, diff_meta in diffs.items():
+			label = (
+				f"{path} — Run {diff_meta['prev_run_idx'] + 1} → "
+				f"Run {diff_meta['curr_run_idx'] + 1}"
+			)
+			html.append(
+				f'<div style="margin: 16px 0;">'
+				f'<div style="font-family: ui-monospace, Menlo, monospace; '
+				f'font-weight: 600; margin-bottom: 4px;">{_e(label)}</div>'
+			)
+			html.append(_render_phase2_diff_table(diff_meta["rows"], show_source, mode))
+			html.append('</div>')
+
+	html.append('</section>')
+	return "".join(html)
 
 
 def render_safe(session_doc: Any, recordings: list[dict] | None = None) -> str:
@@ -939,6 +1238,8 @@ _ACTIONABLE_FINDING_TYPES = frozenset({
 	# Frontend — user can trim responses / optimize JS
 	"Slow Frontend Render",
 	"Heavy Response",
+	# v0.6.0 phase-2 line profiler
+	"Hot Line",            # one source line concentrates the function's time
 })
 # Observation-only finding types (informational, no direct fix):
 #   Framework N+1            — loop inside frappe/*

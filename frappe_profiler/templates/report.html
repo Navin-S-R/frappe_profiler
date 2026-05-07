@@ -1416,6 +1416,16 @@
      which read as a wall of text. Moving them here keeps the header
      tight while preserving full transparency for users who want to
      understand what the analyzers filtered and why. #}
+  {# v0.6.0 phase-2 line-profile panel — pre-rendered in renderer.py so this
+     template stays slim. _render_phase2_panel returns "" when the session
+     has no phase-2 runs, so the section silently disappears for sessions
+     that never had drill-down. The HTML is fully self-contained (inline
+     styles, no external assets) so the safe-report self-containment canary
+     still passes. #}
+  {% if phase2_html %}
+  {{ phase2_html | safe }}
+  {% endif %}
+
   {% if analyzer_warnings %}
   <details class="section" id="analyzer-notes">
     <summary><h2>Analyzer notes</h2></summary>
