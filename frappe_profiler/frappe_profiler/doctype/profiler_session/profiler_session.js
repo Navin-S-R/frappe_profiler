@@ -67,8 +67,10 @@ function open_phase2_picker(frm) {
 }
 
 function show_phase2_dialog(frm, data) {
-	var candidates = data.candidates || [];
-	var options_html = candidates.map(function (c) {
+	var primary = data.candidates || [];
+	var framework = data.observations || [];
+
+	function to_option(c) {
 		return {
 			label:
 				c.dotted_path +
@@ -81,46 +83,92 @@ function show_phase2_dialog(frm, data) {
 				")",
 			value: c.dotted_path,
 		};
+	}
+
+	var primary_options = primary.map(to_option);
+	var framework_options = framework.map(to_option);
+
+	// When there are no user-app frames at all (vanilla ERPNext or a
+	// site without custom apps), the framework list IS the primary
+	// list — the customer is profiling erpnext / frappe code. Promote
+	// it to default-expanded so the dialog shows usable candidates
+	// instead of an empty primary section.
+	var no_user_app = primary_options.length === 0 && framework_options.length > 0;
+
+	var fields = [
+		{
+			fieldname: "intro_html",
+			fieldtype: "HTML",
+			options:
+				"<p style='margin-bottom:8px;'>Tick functions from phase-1's " +
+				"top hot frames, or paste a dotted path below. " +
+				"Phase 2 will instrument <strong>only</strong> these " +
+				"functions during your next reproduction of the flow.</p>",
+		},
+	];
+
+	if (primary_options.length) {
+		fields.push({
+			fieldname: "curated",
+			fieldtype: "MultiCheck",
+			label: __("Hot frames from your apps"),
+			options: primary_options,
+			columns: 1,
+		});
+	}
+
+	if (framework_options.length) {
+		fields.push({
+			fieldname: "section_break_framework",
+			fieldtype: "Section Break",
+			label: no_user_app
+				? __("Hot frames (frappe / erpnext / framework code)")
+				: __(
+					"+ " +
+					framework_options.length +
+					" framework frames (frappe / erpnext) — actionable for " +
+					"customizations or framework-level fixes"
+				),
+			collapsible: !no_user_app,
+			collapsible_depends_on: no_user_app ? "" : "0",
+		});
+		fields.push({
+			fieldname: "framework_picks",
+			fieldtype: "MultiCheck",
+			label: "",
+			options: framework_options,
+			columns: 1,
+		});
+	}
+
+	fields.push({
+		fieldname: "section_break_freeform",
+		fieldtype: "Section Break",
+		label: __("Additional dotted paths"),
+	});
+	fields.push({
+		fieldname: "freeform",
+		fieldtype: "Small Text",
+		label: __("One dotted path per line"),
+		description: __(
+			"e.g. <code>my_app.tasks.heavy_helper</code>. Paths that " +
+			"can't be imported are rejected before phase 2 starts. Use " +
+			"this when the curated list above doesn't surface the " +
+			"function you want, or to disambiguate a class method."
+		),
 	});
 
 	var d = new frappe.ui.Dialog({
 		title: __("Phase 2: Pick Functions to Line-Profile"),
 		size: "large",
-		fields: [
-			{
-				fieldname: "intro_html",
-				fieldtype: "HTML",
-				options:
-					"<p style='margin-bottom:8px;'>Tick functions from phase-1's " +
-					"top hot frames, or paste a dotted path below. " +
-					"Phase 2 will instrument <strong>only</strong> these " +
-					"functions during your next reproduction of the flow.</p>",
-			},
-			{
-				fieldname: "curated",
-				fieldtype: "MultiCheck",
-				label: __("Hot frames from phase 1"),
-				options: options_html,
-				columns: 1,
-			},
-			{
-				fieldname: "section_break_freeform",
-				fieldtype: "Section Break",
-			},
-			{
-				fieldname: "freeform",
-				fieldtype: "Small Text",
-				label: __("Additional dotted paths (one per line)"),
-				description: __(
-					"e.g. <code>my_app.tasks.heavy_helper</code>. Paths that " +
-					"can't be imported are rejected before phase 2 starts."
-				),
-			},
-		],
+		fields: fields,
 		primary_action_label: __("Run Line-Profile Pass"),
 		primary_action: function (values) {
 			var picks = [];
 			(values.curated || []).forEach(function (path) {
+				picks.push({ dotted_path: path, source: "curated" });
+			});
+			(values.framework_picks || []).forEach(function (path) {
 				picks.push({ dotted_path: path, source: "curated" });
 			});
 			(values.freeform || "")
@@ -144,13 +192,6 @@ function show_phase2_dialog(frm, data) {
 			start_phase2(frm, picks);
 		},
 	});
-
-	if (data.observations && data.observations.length) {
-		d.fields_dict.section_break_freeform.df.label = __(
-			"+ " + data.observations.length + " framework frames hidden — " +
-			"paste a dotted path below to profile a framework function explicitly."
-		);
-	}
 
 	d.show();
 }
