@@ -258,6 +258,23 @@ function show_phase2_dialog(frm, data) {
 			"function you want, or to disambiguate a class method."
 		),
 	});
+	fields.push({
+		fieldname: "section_break_options",
+		fieldtype: "Section Break",
+	});
+	fields.push({
+		fieldname: "auto_expand",
+		fieldtype: "Check",
+		label: __("Auto-expand hot chain (recommended)"),
+		default: 1,
+		description: __(
+			"For each curated pick, walks phase-1's call tree downward " +
+			"following the hottest user-code child until it hits an ORM " +
+			"call or framework wrapper. The run instruments the entire " +
+			"chain so you see exactly which descendant line is the time " +
+			"sink — no need to re-pick and re-record level by level."
+		),
+	});
 
 	var d = new frappe.ui.Dialog({
 		title: __("Phase 2: Pick Functions to Line-Profile"),
@@ -289,34 +306,47 @@ function show_phase2_dialog(frm, data) {
 				return;
 			}
 
+			var auto_expand = values.auto_expand !== 0;
 			d.hide();
-			start_phase2(frm, picks);
+			start_phase2(frm, picks, auto_expand);
 		},
 	});
 
 	d.show();
 }
 
-function start_phase2(frm, picks) {
+function start_phase2(frm, picks, auto_expand) {
 	frappe.call({
 		method: "frappe_profiler.api.start_line_profile_pass",
 		args: {
 			session_uuid: frm.doc.session_uuid,
 			picks: JSON.stringify(picks),
+			auto_expand: auto_expand ? 1 : 0,
 		},
 		callback: function (r) {
 			if (!r || !r.message) return;
 			var run_uuid = r.message.run_uuid;
-			frappe.show_alert({
-				message: __(
-					"Phase 2 recording started. Reproduce your flow now, then " +
-					"click Stop on the floating widget."
-				),
-				indicator: "blue",
-			});
-			// The floating widget picks up the active flag on its next poll
-			// (or via the phase_2_run_recording realtime event we emit
-			// from start_line_profile_pass).
+			var resolved = r.message.resolved_picks || [];
+			var instrumented = resolved.filter(function (p) { return p.eligible; }).length;
+			var expansions = r.message.expansions || [];
+
+			var msg = __(
+				"Phase 2 recording started — instrumenting " +
+				instrumented +
+				" function" + (instrumented === 1 ? "" : "s") +
+				". Reproduce your flow now, then click Stop on the floating widget."
+			);
+			if (expansions.length) {
+				// Show the first expansion inline so the dev sees what was
+				// added; remaining expansions appear in the form's run row.
+				var first = expansions[0];
+				msg += __(
+					" Auto-expanded " + first.original.split(".").pop() +
+					" → " + first.chain.length + " functions" +
+					(expansions.length > 1 ? " (+ " + (expansions.length - 1) + " more)" : "")
+				);
+			}
+			frappe.show_alert({ message: msg, indicator: "blue" });
 			frm.dashboard.add_indicator(
 				__("Phase 2 recording — run " + run_uuid.slice(0, 8) + "..."),
 				"blue"

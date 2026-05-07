@@ -588,17 +588,34 @@ def _render_phase2_function_table(
 
 	Columns: line number, hit count, total ms, per-hit µs, source. In safe
 	mode with the toggle off, the source column shows ``<source omitted>``.
+
+	When ``fn`` carries a ``source == "auto_expand"`` marker (set by the
+	renderer from the run's picks_json), the function header is indented
+	and prefixed with ``↳`` so the chain reads visually as a stack: the
+	user's pick appears flush-left, each auto-expanded descendant a
+	level deeper.
 	"""
 	rows = fn.get("lines") or []
 	dotted = fn.get("dotted_path", "")
 	file = fn.get("file", "")
+	source = fn.get("source") or "curated"
+
+	# Auto-expanded descendants get a chain-indent + arrow so the report
+	# reads top-down as "you picked X; we drilled into ↳ Y; ↳ Z; …".
+	is_descendant = source == "auto_expand"
+	container_margin_left = "24px" if is_descendant else "0"
+	header_prefix = (
+		'<span style="color: #9ca3af; margin-right: 6px;">↳</span>'
+		if is_descendant
+		else ""
+	)
 
 	html = [
-		'<div class="phase2-function" '
-		'style="margin: 12px 0; padding: 8px; '
-		'border: 1px solid #d1d5db; border-radius: 4px;">',
+		f'<div class="phase2-function" '
+		f'style="margin: 12px 0 12px {container_margin_left}; padding: 8px; '
+		f'border: 1px solid #d1d5db; border-radius: 4px;">',
 		f'<div style="font-family: ui-monospace, Menlo, monospace; '
-		f'font-weight: 600; margin-bottom: 4px;">{_e(dotted)}</div>',
+		f'font-weight: 600; margin-bottom: 4px;">{header_prefix}{_e(dotted)}</div>',
 		f'<div style="color: #6b7280; font-size: 12px; margin-bottom: 8px;">'
 		f'{_e(file)}</div>',
 	]
@@ -742,6 +759,10 @@ def _render_phase2_panel(session_doc: Any, mode: str) -> str:
 		show_source = _phase2_safe_show_source()
 
 	# Parse each run's stored JSON into the shape we render against.
+	# Annotate each function entry with its pick ``source`` (curated vs
+	# auto_expand) by looking up dotted_path in the run's picks_json so
+	# the per-function table can render auto-expanded descendants with
+	# the chain-indent visual.
 	parsed_runs: list[dict] = []
 	for child in runs:
 		try:
@@ -752,6 +773,17 @@ def _render_phase2_panel(session_doc: Any, mode: str) -> str:
 			picks = json.loads(child.picks_json or "[]")
 		except Exception:
 			picks = []
+		picks_source: dict[str, str] = {
+			p.get("dotted_path"): p.get("source", "curated")
+			for p in picks
+			if p.get("dotted_path")
+		}
+		annotated_results = []
+		for fn in results:
+			annotated_results.append({
+				**fn,
+				"source": picks_source.get(fn.get("dotted_path"), "curated"),
+			})
 		parsed_runs.append({
 			"run_uuid": child.run_uuid,
 			"status": child.status,
@@ -759,7 +791,7 @@ def _render_phase2_panel(session_doc: Any, mode: str) -> str:
 			"ended_at": child.ended_at,
 			"total_ms": child.total_ms or 0,
 			"picks": picks,
-			"functions": results,
+			"functions": annotated_results,
 		})
 
 	# Cross-run diff: when a function appears in 2+ runs, align the latest

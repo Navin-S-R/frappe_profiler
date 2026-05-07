@@ -1292,16 +1292,23 @@ def get_phase2_candidates(session_uuid: str) -> dict:
 
 
 @frappe.whitelist()
-def start_line_profile_pass(session_uuid: str, picks) -> dict:
+def start_line_profile_pass(session_uuid: str, picks, auto_expand=True) -> dict:
 	"""Begin a phase-2 line-profile run on a finished session.
 
 	``picks`` is a JSON-encoded (or already-parsed) list of
 	``{dotted_path, source}`` entries the customer ticked / typed.
+
+	When ``auto_expand`` is true (the default), each curated pick is
+	walked down phase-1's call tree via ``picker.expand_hot_chain`` so
+	the run instruments the full hot chain in one shot — the developer
+	doesn't have to re-pick descendants. Free-form picks pass through
+	unchanged (we have no chain to walk for them).
 	"""
 	import json as _json
 	import uuid as _uuid
 
 	from frappe_profiler.line_profile import capture as _lp_capture
+	from frappe_profiler.line_profile import picker as _lp_picker
 
 	user = _require_profiler_user()
 
@@ -1315,6 +1322,12 @@ def start_line_profile_pass(session_uuid: str, picks) -> dict:
 		picks_list = picks
 	if not isinstance(picks_list, list) or not picks_list:
 		frappe.throw("Provide at least one function to line-profile.")
+
+	# Coerce auto_expand from the JS payload (frappe.call sends "true"/"false"
+	# strings; whitelisted view fns accept Python types when available).
+	if isinstance(auto_expand, str):
+		auto_expand = auto_expand.lower() in ("true", "1", "yes")
+	auto_expand = bool(auto_expand)
 
 	# Phase-1 must not be active for the same user — phase 1 and phase 2
 	# read separate Redis flags but only one can be active at a time.
@@ -1342,6 +1355,68 @@ def start_line_profile_pass(session_uuid: str, picks) -> dict:
 	# Reject if the user already has a phase-2 run in flight elsewhere.
 	if _lp_capture.is_active(user):
 		frappe.throw("You already have a phase-2 line-profile run active.")
+
+	# Auto-expand curated picks via phase-1's call tree. Curated picks come
+	# in as {dotted_path, source: "curated"}; the expansion adds their hot
+	# user-code descendants up to the framework boundary. Free-form picks
+	# (source != "curated") aren't expanded — we don't know if they appeared
+	# in phase 1 at all.
+	expansions: list[dict] = []
+	if auto_expand:
+		# Load the phase-1 call trees once so expand_hot_chain can search
+		# across all action recordings for the hottest match.
+		parent_doc = frappe.get_doc("Profiler Session", parent_docname)
+		trees: list[dict] = []
+		for action in (parent_doc.actions or []):
+			raw = action.call_tree_json
+			if not raw:
+				continue
+			try:
+				tree = _json.loads(raw)
+			except (TypeError, ValueError):
+				continue
+			if isinstance(tree, dict) and "root" in tree:
+				tree = tree["root"]
+			trees.append(tree)
+
+		seen: set[str] = set()
+		expanded_picks: list[dict] = []
+		for entry in picks_list:
+			dotted = entry.get("dotted_path") or ""
+			source = entry.get("source", "freeform")
+			# Free-form picks pass through unchanged; we keep them as-is so
+			# the resolver can still flag import errors inline.
+			if source != "curated":
+				if dotted and dotted not in seen:
+					seen.add(dotted)
+					expanded_picks.append(entry)
+				continue
+			chain = _lp_picker.expand_hot_chain(trees, dotted)
+			if not chain:
+				# Picked function wasn't in any phase-1 call tree (rare —
+				# the picker UI sources from those same trees). Pass it
+				# through so the resolver can still attempt it.
+				if dotted and dotted not in seen:
+					seen.add(dotted)
+					expanded_picks.append(entry)
+				continue
+			# Track that the chain came from this curated pick so the form
+			# can show "instrumented N functions: validate → ... → ..."
+			expansions.append({
+				"original": dotted,
+				"chain": [c["dotted_path"] for c in chain],
+			})
+			for chain_entry in chain:
+				cdp = chain_entry["dotted_path"]
+				if cdp and cdp not in seen:
+					seen.add(cdp)
+					expanded_picks.append({
+						"dotted_path": cdp,
+						"source": "curated" if chain_entry["depth"] == 0 else "auto_expand",
+					})
+		picks_list = expanded_picks
+		if not picks_list:
+			frappe.throw("Provide at least one function to line-profile.")
 
 	run_uuid = _uuid.uuid4().hex
 
@@ -1382,6 +1457,8 @@ def start_line_profile_pass(session_uuid: str, picks) -> dict:
 		"session_uuid": session_uuid,
 		"docname": parent_docname,
 		"resolved_picks": resolved,
+		"expansions": expansions,
+		"auto_expanded": bool(auto_expand and expansions),
 	}
 
 

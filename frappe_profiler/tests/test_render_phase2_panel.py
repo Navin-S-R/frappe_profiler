@@ -132,6 +132,86 @@ class TestRenderPhase2PanelDiff:
 		assert "Cross-Run Comparison" not in html
 
 
+class TestRenderPhase2PanelAutoExpandChain:
+	"""When a curated pick was auto-expanded into a chain, the run's
+	picks_json marks descendant functions with source='auto_expand'.
+	The renderer should indent those function headers and prefix with
+	an arrow so the chain reads top-down as a stack."""
+
+	def _run_with_chain(self, root_path, descendant_path):
+		# picks_json captures the source of each pick.
+		picks = [
+			{"dotted_path": root_path, "source": "curated"},
+			{"dotted_path": descendant_path, "source": "auto_expand"},
+		]
+		results = [
+			_function(root_path, [_line(1, "self.descendant()", 1, 100.0)]),
+			_function(descendant_path, [_line(5, "compute()", 1, 95.0)]),
+		]
+		return SimpleNamespace(
+			run_uuid="r1",
+			status="Ready",
+			started_at="2026-05-07 12:00:00",
+			ended_at="2026-05-07 12:01:00",
+			total_ms=195.0,
+			picks_json=json.dumps(picks),
+			results_json=json.dumps(results),
+		)
+
+	def test_root_pick_renders_flush_left(self):
+		session = SimpleNamespace(phase_2_runs=[
+			self._run_with_chain("my_app.x.root_fn", "my_app.x.descendant"),
+		])
+
+		with patch.object(renderer, "_phase2_safe_show_source", return_value=True):
+			html = renderer._render_phase2_panel(session, "safe")
+
+		# rfind targets the function-table header (the descendant appears
+		# earlier in the run's "Picks:" summary line as well).
+		root_idx = html.rfind("my_app.x.root_fn")
+		assert root_idx > -1
+		nearby = html[max(0, root_idx - 200):root_idx]
+		assert "margin: 12px 0 12px 24px" not in nearby
+		assert "↳" not in nearby
+
+	def test_auto_expanded_descendant_renders_indented(self):
+		session = SimpleNamespace(phase_2_runs=[
+			self._run_with_chain("my_app.x.root_fn", "my_app.x.descendant"),
+		])
+
+		with patch.object(renderer, "_phase2_safe_show_source", return_value=True):
+			html = renderer._render_phase2_panel(session, "safe")
+
+		desc_idx = html.rfind("my_app.x.descendant")
+		assert desc_idx > -1
+		nearby = html[max(0, desc_idx - 300):desc_idx]
+		assert "margin: 12px 0 12px 24px" in nearby
+		assert "↳" in nearby
+
+	def test_no_picks_json_falls_back_to_curated_no_indent(self):
+		# Older runs may not carry source markers; renderer should treat
+		# everything as curated (no indent) rather than break.
+		results = [_function("my_app.x.fn", [_line(1, "x = 1", 1, 100.0)])]
+		run = SimpleNamespace(
+			run_uuid="r1",
+			status="Ready",
+			started_at="2026-05-07 12:00:00",
+			ended_at="2026-05-07 12:01:00",
+			total_ms=100.0,
+			picks_json="",
+			results_json=json.dumps(results),
+		)
+		session = SimpleNamespace(phase_2_runs=[run])
+
+		with patch.object(renderer, "_phase2_safe_show_source", return_value=True):
+			html = renderer._render_phase2_panel(session, "safe")
+
+		fn_idx = html.rfind("my_app.x.fn")
+		assert fn_idx > -1
+		nearby = html[max(0, fn_idx - 200):fn_idx]
+		assert "↳" not in nearby
+
+
 class TestRenderPhase2PanelSelfContainment:
 	def test_no_external_urls_in_output(self):
 		# Critical: safe-report self-containment invariant. The phase-2
