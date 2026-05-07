@@ -18,8 +18,203 @@ frappe.ui.form.on("Profiler Session", {
 		render_analyzer_warnings(frm);
 		render_baseline_buttons(frm);
 		render_no_baseline_banner(frm);
+		render_phase2_button(frm);
+		subscribe_phase2_events(frm);
 	},
 });
+
+// v0.6.0: Phase-2 line-profile picker.
+//
+// Adds a "Run Line-Profile Pass" custom button when the session is Ready.
+// Clicking opens a dialog that fetches curated candidates (top hot frames
+// from phase-1) plus a free-form textbox for dotted paths the user types.
+// Submission posts to api.start_line_profile_pass; realtime events drive
+// the form's Phase-2 history child table updates.
+function render_phase2_button(frm) {
+	if (frm.is_new()) return;
+	if (frm.doc.status !== "Ready") return;
+
+	frm.add_custom_button(__("Run Line-Profile Pass"), function () {
+		open_phase2_picker(frm);
+	}, __("Phase 2"));
+}
+
+function open_phase2_picker(frm) {
+	// First fetch the candidate list from the API. We wait for the data
+	// before opening the dialog so the MultiCheck field populates with
+	// real options rather than rendering empty and re-rendering later.
+	frappe.call({
+		method: "frappe_profiler.api.get_phase2_candidates",
+		args: { session_uuid: frm.doc.session_uuid },
+		freeze: true,
+		freeze_message: __("Loading phase-1 hot frames..."),
+		callback: function (r) {
+			var data = r.message || {};
+			if (!data.line_profiler_available) {
+				frappe.msgprint({
+					title: __("line_profiler not installed"),
+					message: __(
+						"Phase 2 needs the line_profiler package. Install it via " +
+						"<code>bench pip install line_profiler</code> and restart."
+					),
+					indicator: "red",
+				});
+				return;
+			}
+			show_phase2_dialog(frm, data);
+		},
+	});
+}
+
+function show_phase2_dialog(frm, data) {
+	var candidates = data.candidates || [];
+	var options_html = candidates.map(function (c) {
+		return {
+			label:
+				c.dotted_path +
+				" (" +
+				(c.cumulative_ms || 0).toFixed(1) +
+				"ms · " +
+				(c.hit_count || 0) +
+				"× hits · " +
+				c.app +
+				")",
+			value: c.dotted_path,
+		};
+	});
+
+	var d = new frappe.ui.Dialog({
+		title: __("Phase 2: Pick Functions to Line-Profile"),
+		size: "large",
+		fields: [
+			{
+				fieldname: "intro_html",
+				fieldtype: "HTML",
+				options:
+					"<p style='margin-bottom:8px;'>Tick functions from phase-1's " +
+					"top hot frames, or paste a dotted path below. " +
+					"Phase 2 will instrument <strong>only</strong> these " +
+					"functions during your next reproduction of the flow.</p>",
+			},
+			{
+				fieldname: "curated",
+				fieldtype: "MultiCheck",
+				label: __("Hot frames from phase 1"),
+				options: options_html,
+				columns: 1,
+			},
+			{
+				fieldname: "section_break_freeform",
+				fieldtype: "Section Break",
+			},
+			{
+				fieldname: "freeform",
+				fieldtype: "Small Text",
+				label: __("Additional dotted paths (one per line)"),
+				description: __(
+					"e.g. <code>my_app.tasks.heavy_helper</code>. Paths that " +
+					"can't be imported are rejected before phase 2 starts."
+				),
+			},
+		],
+		primary_action_label: __("Run Line-Profile Pass"),
+		primary_action: function (values) {
+			var picks = [];
+			(values.curated || []).forEach(function (path) {
+				picks.push({ dotted_path: path, source: "curated" });
+			});
+			(values.freeform || "")
+				.split("\n")
+				.map(function (line) {
+					return line.trim();
+				})
+				.filter(function (line) {
+					return line.length > 0;
+				})
+				.forEach(function (path) {
+					picks.push({ dotted_path: path, source: "freeform" });
+				});
+
+			if (!picks.length) {
+				frappe.msgprint(__("Pick at least one function to line-profile."));
+				return;
+			}
+
+			d.hide();
+			start_phase2(frm, picks);
+		},
+	});
+
+	if (data.observations && data.observations.length) {
+		d.fields_dict.section_break_freeform.df.label = __(
+			"+ " + data.observations.length + " framework frames hidden — " +
+			"paste a dotted path below to profile a framework function explicitly."
+		);
+	}
+
+	d.show();
+}
+
+function start_phase2(frm, picks) {
+	frappe.call({
+		method: "frappe_profiler.api.start_line_profile_pass",
+		args: {
+			session_uuid: frm.doc.session_uuid,
+			picks: JSON.stringify(picks),
+		},
+		callback: function (r) {
+			if (!r || !r.message) return;
+			var run_uuid = r.message.run_uuid;
+			frappe.show_alert({
+				message: __(
+					"Phase 2 recording started. Reproduce your flow now, then " +
+					"click Stop on the floating widget."
+				),
+				indicator: "blue",
+			});
+			// The floating widget picks up the active flag on its next poll
+			// (or via the phase_2_run_recording realtime event we emit
+			// from start_line_profile_pass).
+			frm.dashboard.add_indicator(
+				__("Phase 2 recording — run " + run_uuid.slice(0, 8) + "..."),
+				"blue"
+			);
+		},
+		error: function (xhr) {
+			// Frappe surfaces validation errors through frappe.throw — they
+			// already render as a modal; we just re-enable the button.
+		},
+	});
+}
+
+// Listen for phase-2 realtime events on this session and refresh the form
+// so the Phase 2 Runs child table picks up status transitions without the
+// user having to reload manually.
+function subscribe_phase2_events(frm) {
+	if (frm.is_new()) return;
+	if (frm._phase2_subscribed) return;
+	frm._phase2_subscribed = true;
+
+	["phase_2_run_recording", "phase_2_run_analyzing", "phase_2_run_ready", "phase_2_run_failed"].forEach(
+		function (event) {
+			frappe.realtime.on(event, function (payload) {
+				if (!payload || payload.session_uuid !== frm.doc.session_uuid) return;
+				if (event === "phase_2_run_ready") {
+					frappe.show_alert({
+						message: __("Phase 2 report ready"),
+						indicator: "green",
+					});
+				} else if (event === "phase_2_run_failed") {
+					frappe.show_alert({
+						message: __("Phase 2 analyze failed: " + (payload.error || "unknown")),
+						indicator: "red",
+					});
+				}
+				frm.reload_doc();
+			});
+		}
+	);
+}
 
 // v0.4.0: Pin / Unpin / Compare baseline buttons
 function render_baseline_buttons(frm) {

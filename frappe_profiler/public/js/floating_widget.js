@@ -667,6 +667,51 @@
 			const pct = typeof data.percent === "number" ? Math.round(data.percent) : 0;
 			setDisplay("analyzing", `Analyzing ${pct}%`, data.description || "");
 		});
+
+		// v0.6.0: phase-2 line-profile events. Widget reflects the same
+		// state-machine slots as phase-1 (recording → analyzing → ready),
+		// but the labels are prefixed with "Phase 2" so the user knows
+		// which mode is running. Phase 2 is started/stopped from the
+		// Profiler Session form, not the floating widget — clicking the
+		// widget while Phase 2 is recording still means "stop" via the
+		// existing Stop API path (api.stop_line_profile_pass), which the
+		// form's history list reflects after refresh.
+		frappe.realtime.on("phase_2_run_recording", (data) => {
+			if (!matchesCurrentSession(data)) return;
+			currentState.display = "recording";
+			currentState.phase2 = true;
+			setDisplay("recording", "Phase 2 recording…", "click form to stop");
+		});
+
+		frappe.realtime.on("phase_2_run_analyzing", (data) => {
+			if (!matchesCurrentSession(data)) return;
+			currentState.display = "analyzing";
+			currentState.phase2 = true;
+			setDisplay("analyzing", "Phase 2 analyzing…", "");
+		});
+
+		frappe.realtime.on("phase_2_run_ready", (data) => {
+			if (!matchesCurrentSession(data)) return;
+			currentState.display = "ready";
+			currentState.phase2 = false;
+			currentState.docname = data.parent || currentState.docname;
+			setDisplay("ready", "Phase 2 report ready", "click to view");
+			frappe.show_alert({
+				message: __("Phase 2 line-profile report ready"),
+				indicator: "blue",
+			});
+		});
+
+		frappe.realtime.on("phase_2_run_failed", (data) => {
+			if (!matchesCurrentSession(data)) return;
+			currentState.display = "ready";
+			currentState.phase2 = false;
+			setDisplay("ready", "Phase 2 failed", "click to view");
+			frappe.show_alert({
+				message: __("Phase 2 analyze failed: " + (data.error || "unknown")),
+				indicator: "red",
+			});
+		});
 	}
 
 	function computeElapsed() {
