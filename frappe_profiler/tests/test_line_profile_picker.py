@@ -314,6 +314,205 @@ class TestResolveFreeform:
 			picker.resolve_freeform("json")
 
 
+class TestExpandHotChain:
+	"""Walks down phase-1's call tree from the picked function, following
+	the hottest user-code child at each level. Stops at pure-helper /
+	ORM / wrapper boundary, depth cap, or min_ms floor.
+	"""
+
+	def test_picked_not_in_tree_returns_empty(self):
+		tree = _root(_frame("other", "apps/my_app/my_app/x.py", 1, 100.0))
+
+		chain = picker.expand_hot_chain([tree], "my_app.tasks.heavy_job")
+
+		assert chain == []
+
+	def test_picked_with_no_children_returns_self_only(self):
+		tree = _root(_frame(
+			"compute_total", "apps/my_app/my_app/x.py", 10, 100.0,
+		))
+
+		chain = picker.expand_hot_chain([tree], "my_app.x.compute_total")
+
+		assert len(chain) == 1
+		assert chain[0]["dotted_path"] == "my_app.x.compute_total"
+		assert chain[0]["depth"] == 0
+		assert chain[0]["cumulative_ms"] == 100.0
+
+	def test_descends_through_user_code_chain(self):
+		# Simulates the smoke-test scenario:
+		#   validate (sales_invoice) → set_missing_values → _get_party_details
+		gp = _frame(
+			"_get_party_details", "apps/erpnext/erpnext/accounts/party.py", 50, 125.0,
+		)
+		smv = _frame(
+			"set_missing_values",
+			"apps/erpnext/erpnext/accounts/doctype/sales_invoice/sales_invoice.py",
+			88,
+			188.0,
+			children=[gp],
+		)
+		validate = _frame(
+			"validate",
+			"apps/erpnext/erpnext/accounts/doctype/sales_invoice/sales_invoice.py",
+			142,
+			292.0,
+			children=[smv],
+		)
+		tree = _root(validate)
+
+		chain = picker.expand_hot_chain(
+			[tree],
+			"erpnext.accounts.doctype.sales_invoice.sales_invoice.validate",
+		)
+
+		paths = [c["dotted_path"] for c in chain]
+		assert paths == [
+			"erpnext.accounts.doctype.sales_invoice.sales_invoice.validate",
+			"erpnext.accounts.doctype.sales_invoice.sales_invoice.set_missing_values",
+			"erpnext.accounts.party._get_party_details",
+		]
+		assert [c["depth"] for c in chain] == [0, 1, 2]
+
+	def test_stops_at_pure_helper_boundary(self):
+		# Hot chain ends exactly when descent would cross into framework
+		# plumbing (frappe.recorder, frappe.db, document.py, etc.).
+		sql = _frame(
+			"record_sql", "apps/frappe/frappe/recorder.py", 1, 140.0,
+		)
+		gp = _frame(
+			"_get_party_details", "apps/erpnext/erpnext/accounts/party.py", 50, 125.0,
+			children=[sql],
+		)
+		validate = _frame(
+			"validate",
+			"apps/erpnext/erpnext/accounts/doctype/sales_invoice/sales_invoice.py",
+			142,
+			292.0,
+			children=[gp],
+		)
+		tree = _root(validate)
+
+		chain = picker.expand_hot_chain(
+			[tree],
+			"erpnext.accounts.doctype.sales_invoice.sales_invoice.validate",
+		)
+
+		paths = [c["dotted_path"] for c in chain]
+		# record_sql is a pure helper → not included; descent stops at gp
+		assert paths[-1].endswith("_get_party_details")
+		assert all("record_sql" not in p for p in paths)
+
+	def test_stops_at_min_ms_floor(self):
+		# Child below 50ms threshold not included.
+		fast = _frame(
+			"trivial_helper", "apps/my_app/my_app/x.py", 5, 10.0,
+		)
+		validate = _frame(
+			"compute_total", "apps/my_app/my_app/x.py", 1, 200.0,
+			children=[fast],
+		)
+		tree = _root(validate)
+
+		chain = picker.expand_hot_chain(
+			[tree], "my_app.x.compute_total", min_ms=50,
+		)
+
+		assert len(chain) == 1
+		assert chain[0]["dotted_path"] == "my_app.x.compute_total"
+
+	def test_stops_at_max_depth(self):
+		# Build a 5-deep linear chain; cap at 2 levels of descent.
+		leaf = _frame("level5", "apps/my_app/my_app/x.py", 5, 100.0)
+		l4 = _frame("level4", "apps/my_app/my_app/x.py", 4, 110.0, children=[leaf])
+		l3 = _frame("level3", "apps/my_app/my_app/x.py", 3, 120.0, children=[l4])
+		l2 = _frame("level2", "apps/my_app/my_app/x.py", 2, 130.0, children=[l3])
+		l1 = _frame("level1", "apps/my_app/my_app/x.py", 1, 140.0, children=[l2])
+		tree = _root(l1)
+
+		chain = picker.expand_hot_chain(
+			[tree], "my_app.x.level1", max_depth=2,
+		)
+
+		# 0 (the pick) + 2 descendants = 3 entries
+		assert len(chain) == 3
+		assert [c["depth"] for c in chain] == [0, 1, 2]
+
+	def test_picks_hottest_child_among_siblings(self):
+		# Two siblings; chain follows the slower one (we want the bigger
+		# time sink). Both above the min_ms floor.
+		hot = _frame("slow_branch", "apps/my_app/my_app/x.py", 10, 200.0)
+		warm = _frame("warm_branch", "apps/my_app/my_app/x.py", 20, 80.0)
+		root_fn = _frame(
+			"compute", "apps/my_app/my_app/x.py", 1, 300.0,
+			children=[warm, hot],
+		)
+		tree = _root(root_fn)
+
+		chain = picker.expand_hot_chain([tree], "my_app.x.compute")
+
+		paths = [c["dotted_path"] for c in chain]
+		assert paths == ["my_app.x.compute", "my_app.x.slow_branch"]
+
+	def test_skips_synthetic_frames_in_descent(self):
+		# <sql> / [finalize] in children must be ignored when picking the
+		# hottest user-code child.
+		synthetic = _frame("<sql>", "", 0, 500.0)  # bigger but synthetic
+		real_child = _frame(
+			"compute_helper", "apps/my_app/my_app/x.py", 5, 100.0,
+		)
+		root_fn = _frame(
+			"compute", "apps/my_app/my_app/x.py", 1, 600.0,
+			children=[synthetic, real_child],
+		)
+		tree = _root(root_fn)
+
+		chain = picker.expand_hot_chain([tree], "my_app.x.compute")
+
+		paths = [c["dotted_path"] for c in chain]
+		assert paths == ["my_app.x.compute", "my_app.x.compute_helper"]
+
+	def test_finds_hottest_match_across_trees(self):
+		# Same function appears in two action trees with different
+		# cumulative_ms — picker should pick the hotter instance and
+		# walk its children.
+		hot_child = _frame(
+			"hot_descendant", "apps/my_app/my_app/x.py", 5, 100.0,
+		)
+		t1 = _root(_frame(
+			"compute", "apps/my_app/my_app/x.py", 1, 50.0,  # cold instance
+		))
+		t2 = _root(_frame(
+			"compute", "apps/my_app/my_app/x.py", 1, 300.0,  # hot instance
+			children=[hot_child],
+		))
+
+		chain = picker.expand_hot_chain([t1, t2], "my_app.x.compute")
+
+		paths = [c["dotted_path"] for c in chain]
+		assert paths == ["my_app.x.compute", "my_app.x.hot_descendant"]
+
+	def test_each_chain_entry_has_required_fields(self):
+		child = _frame(
+			"helper", "apps/my_app/my_app/x.py", 10, 100.0,
+		)
+		root_fn = _frame(
+			"compute", "apps/my_app/my_app/x.py", 1, 200.0,
+			children=[child],
+		)
+		tree = _root(root_fn)
+
+		chain = picker.expand_hot_chain([tree], "my_app.x.compute")
+
+		for entry in chain:
+			assert "dotted_path" in entry
+			assert "qualname" in entry
+			assert "file" in entry
+			assert "lineno" in entry
+			assert "cumulative_ms" in entry
+			assert "depth" in entry
+
+
 class TestResolveFreeformClassMethodFallback:
 	"""When the bare function name only exists on a class inside the
 	module (e.g. ``validate`` is on ``SalesInvoice``), ``resolve_freeform``

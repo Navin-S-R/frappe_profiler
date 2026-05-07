@@ -206,6 +206,127 @@ def _build_candidates_from_trees(trees: list[dict], findings: list[dict]) -> lis
 	return candidates[:CANDIDATE_CAP]
 
 
+def _find_hottest_match(call_trees: list[dict], target_dotted_path: str) -> dict | None:
+	"""Walk every node in every tree; among nodes whose derived dotted
+	path equals ``target_dotted_path``, return the one with the highest
+	``cumulative_ms``. ``None`` when no match exists (free-form pick that
+	never appeared in phase 1, or wrong path).
+	"""
+	best: dict | None = None
+	best_ms = -1.0
+
+	def walk(node):
+		nonlocal best, best_ms
+		if not isinstance(node, dict):
+			return
+		function = node.get("function") or ""
+		filename = node.get("filename") or ""
+		kind = node.get("kind", "python")
+		if kind == "python" and not _is_synthetic_frame(function):
+			derived = _build_dotted_path(filename, function)
+			if derived == target_dotted_path:
+				ms = float(node.get("cumulative_ms") or 0)
+				if ms > best_ms:
+					best = node
+					best_ms = ms
+		for child in node.get("children") or []:
+			walk(child)
+
+	for tree in call_trees:
+		walk(tree)
+	return best
+
+
+def _eligible_descent_children(node: dict, min_ms: float) -> list[dict]:
+	"""Filter a node's children to those eligible for hot-chain descent.
+	Drops synthetic frames, non-Python frames, pure-helper / ORM /
+	wrapper boundaries (so the chain ends at framework code), and frames
+	below the ms floor.
+	"""
+	out = []
+	for child in node.get("children") or []:
+		if not isinstance(child, dict):
+			continue
+		fn = child.get("function") or ""
+		if (child.get("kind", "python") != "python"):
+			continue
+		if _is_synthetic_frame(fn):
+			continue
+		if _is_pure_helper_frame(child):
+			continue
+		if float(child.get("cumulative_ms") or 0) < min_ms:
+			continue
+		out.append(child)
+	return out
+
+
+def expand_hot_chain(
+	call_trees: list[dict],
+	picked_dotted_path: str,
+	max_depth: int = 10,
+	min_ms: float = 50.0,
+) -> list[dict]:
+	"""Return the hottest user-code descent path from ``picked_dotted_path``.
+
+	Walks down phase-1's call tree from the picked frame, following the
+	single hottest user-code child at each level. Stops descending when:
+
+	  • the next hottest child would cross a ``_is_pure_helper_frame``
+	    boundary (frappe ORM / recorder / typing wrappers / document.py),
+	  • the next hottest child has ``cumulative_ms < min_ms``,
+	  • there is no Python child remaining,
+	  • or the chain has reached ``max_depth``.
+
+	Output rows::
+
+	    {
+	        "dotted_path", "qualname", "file", "lineno",
+	        "cumulative_ms", "depth"
+	    }
+
+	The picked frame is depth=0; each descendant carries depth=1, 2, ...
+	Returns ``[]`` when the picked path doesn't appear in any tree (e.g.
+	a free-form pick that wasn't called in phase 1).
+	"""
+	root = _find_hottest_match(call_trees, picked_dotted_path)
+	if root is None:
+		return []
+
+	chain: list[dict] = [{
+		"dotted_path": picked_dotted_path,
+		"qualname": root.get("function") or "",
+		"file": root.get("filename") or "",
+		"lineno": int(root.get("lineno") or 0),
+		"cumulative_ms": round(float(root.get("cumulative_ms") or 0), 2),
+		"depth": 0,
+	}]
+
+	current = root
+	depth = 0
+	while depth < max_depth:
+		eligible = _eligible_descent_children(current, min_ms)
+		if not eligible:
+			break
+		hottest = max(
+			eligible, key=lambda c: float(c.get("cumulative_ms") or 0)
+		)
+		depth += 1
+		chain.append({
+			"dotted_path": _build_dotted_path(
+				hottest.get("filename") or "",
+				hottest.get("function") or "",
+			),
+			"qualname": hottest.get("function") or "",
+			"file": hottest.get("filename") or "",
+			"lineno": int(hottest.get("lineno") or 0),
+			"cumulative_ms": round(float(hottest.get("cumulative_ms") or 0), 2),
+			"depth": depth,
+		})
+		current = hottest
+
+	return chain
+
+
 def _check_eligibility(obj) -> tuple[bool, str | None]:
 	"""Return (eligible, reason). line_profiler can attach to functions
 	with a real ``__code__`` object that aren't lambdas or runtime-eval'd
