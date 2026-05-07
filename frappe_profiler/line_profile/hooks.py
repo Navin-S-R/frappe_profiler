@@ -94,27 +94,41 @@ def after_request_line_profile(*args, **kwargs) -> None:
 # ---------------------------------------------------------------------------
 
 
-def before_job_line_profile(*args, **kwargs) -> None:
+def before_job_line_profile(method=None, kwargs=None, **rest) -> None:
 	"""Phase-2 equivalent of ``hooks_callbacks.before_job``. Reads
 	``_lp_session_id`` injected by the extended enqueue patch (see
-	``frappe_profiler/__init__.py:_patch_enqueue``). When present and the
-	user's flag still points to that run, attach line_profiler.
+	``frappe_profiler/__init__.py:_patch_enqueue``).
+
+	**Critical**: ``_lp_session_id`` is popped from the job's kwargs
+	dict *unconditionally*, even if we end up not instrumenting (run
+	already stopped, line_profiler unavailable, user is Guest, etc.).
+	The kwargs dict is the same one Frappe's ``execute_job`` will splat
+	into the user's method via ``method(**kwargs)`` — leaving our
+	marker in there crashes the method with an unexpected-keyword-
+	argument error.
+
+	Hook signature mirrors phase-1's ``hooks_callbacks.before_job`` so
+	Frappe's hook dispatcher passes ``method`` + ``kwargs`` as named
+	parameters.
 	"""
+	# Always pop our marker first — before any control-flow that might
+	# return early. The mutation propagates because ``kwargs`` is a
+	# reference to the dict execute_job will use.
+	if isinstance(kwargs, dict):
+		run_uuid = kwargs.pop("_lp_session_id", None)
+	else:
+		run_uuid = None
+
+	if not run_uuid:
+		return
+
 	try:
-		# The enqueue patch injects _lp_session_id into job kwargs at
-		# enqueue time so the job knows whether to record. Pop it before
-		# the job's own function runs so we don't disturb its signature.
-		job = kwargs.get("job") or (args[0] if args else None)
-		if job is None:
-			return
-		job_kwargs = getattr(job, "kwargs", None) or {}
-		run_uuid = job_kwargs.pop("_lp_session_id", None)
-		if not run_uuid:
+		user = getattr(frappe.session, "user", None)
+		if not user or user == "Guest":
 			return
 
-		# Confirm the run is still active (user may have stopped it before
-		# the job dequeued).
-		user = frappe.session.user
+		# Confirm the run is still active (user may have stopped it
+		# between enqueue and the worker picking up the job).
 		if capture.is_active(user) != run_uuid:
 			return
 
@@ -132,9 +146,11 @@ def before_job_line_profile(*args, **kwargs) -> None:
 		)
 
 
-def after_job_line_profile(*args, **kwargs) -> None:
+def after_job_line_profile(method=None, kwargs=None, result=None, **rest) -> None:
 	"""Phase-2 equivalent of ``hooks_callbacks.after_job``. Same as
-	``after_request_line_profile`` but called from the job lifecycle."""
+	``after_request_line_profile`` but called from the job lifecycle.
+	Signature mirrors phase-1's ``hooks_callbacks.after_job``.
+	"""
 	profiler = getattr(frappe.local, "_lp_profiler", None)
 	run_uuid = getattr(frappe.local, "_lp_run_uuid", None)
 	frappe.local._lp_profiler = None

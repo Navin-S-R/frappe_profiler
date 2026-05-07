@@ -296,9 +296,23 @@ def start_line_profile_pass(
 def stop_line_profile_pass(run_uuid: str, user: str) -> None:
 	"""Clear the active flag so phase-2 hooks stop instrumenting. The Redis
 	picks/source/samples keys persist until ``cleanup_run`` runs at the end
-	of the analyze pipeline so the analyzer can read them."""
+	of the analyze pipeline so the analyzer can read them.
+
+	Also clears ``frappe.local._lp_active`` so the same web request that
+	called stop doesn't see a stale cached flag from earlier in the
+	request — the enqueue patch in __init__.py reads this to decide
+	whether to propagate ``_lp_session_id`` into job kwargs.
+	"""
 	_require_frappe()
 	frappe.cache.delete_value(_active_key(user))
+	# Force-invalidate the per-request is_active cache. Without this,
+	# any code path later in this request (e.g. the enqueue patch) sees
+	# the stale truthy value and treats phase 2 as still active, leaking
+	# _lp_session_id into the analyze job's kwargs.
+	try:
+		frappe.local._lp_active = None
+	except Exception:
+		pass
 
 
 def is_active(user: str) -> str | None:
