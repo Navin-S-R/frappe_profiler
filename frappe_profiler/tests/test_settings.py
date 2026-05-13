@@ -16,25 +16,34 @@ import types
 
 import pytest
 
-# Stub frappe so the lazy import inside settings.py can be monkeypatched
-# in tests without a real bench. We unconditionally REPLACE any existing
-# stub other tests may have registered — other pure-logic test modules
-# (test_boot_session, test_pdf_expand_collapsibles) install bare
-# types.ModuleType("frappe") stubs that lack cache/conf/db, which would
-# break monkeypatching here.
-_stub = types.ModuleType("frappe")
-_cache = types.SimpleNamespace(
-	get_value=lambda k: None,
-	set_value=lambda k, v: None,
-	delete_value=lambda k: None,
-)
-_stub.cache = _cache
-_stub.conf = {}
-_stub.db = types.SimpleNamespace(exists=lambda *a, **kw: False)
-_stub.get_cached_doc = lambda *a, **kw: None
-sys.modules["frappe"] = _stub
+# settings.py imports ``frappe`` lazily inside each function (see the
+# NOTE at the top of frappe_profiler/settings.py), so a frappe stub
+# isn't needed at module-load time. But a handful of tests below DO
+# need ``frappe.cache.get_value`` to exist (so they can patch it). We
+# install a per-test stub via an autouse fixture below — that way the
+# stub doesn't leak to other test files (was the leading source of the
+# "80 failed" pollution: a module-level ``sys.modules["frappe"] = stub``
+# replaced the real frappe for the entire pytest session).
+from frappe_profiler import settings
 
-from frappe_profiler import settings  # noqa: E402
+
+@pytest.fixture(autouse=True)
+def _frappe_stub(monkeypatch):
+	"""Install a minimal frappe stub for the duration of each test. The
+	conftest.py ``_sys_modules_fence`` would catch the swap and restore
+	at teardown anyway, but monkeypatch.setitem makes the contract
+	explicit and the auto-restore guaranteed."""
+	stub = types.ModuleType("frappe")
+	stub.cache = types.SimpleNamespace(
+		get_value=lambda k: None,
+		set_value=lambda k, v: None,
+		delete_value=lambda k: None,
+	)
+	stub.conf = {}
+	stub.db = types.SimpleNamespace(exists=lambda *a, **kw: False)
+	stub.get_cached_doc = lambda *a, **kw: None
+	monkeypatch.setitem(sys.modules, "frappe", stub)
+	yield stub
 
 
 class TestDefaults:

@@ -138,7 +138,12 @@ class ProfilerConfig:
 	hide_framework_tables: bool = True
 	max_queries_per_recording: int = 2000
 	redundant_doc_threshold: int = 5
-	redundant_cache_threshold: int = 10
+	# v0.5.2 round 4: bumped to 50 alongside ``_DEFAULTS["redundant_cache_threshold"]``.
+	# The dataclass default is the fallback ``get_config()`` returns when
+	# Frappe isn't importable (unit-test path / pre-bench-init); keeping
+	# it in sync with ``_DEFAULTS`` avoids a silent two-defaults drift
+	# that masked low-count cache loops in pure-Python tests.
+	redundant_cache_threshold: int = 50
 	redundant_perm_threshold: int = 10
 	n_plus_one_min_occurrences: int = 10
 	# v0.6.0 Round 6: severity tuning + capture / phase-2 / skip-rule

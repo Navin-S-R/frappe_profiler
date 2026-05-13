@@ -12,17 +12,24 @@ does nothing because before_request short-circuits).
 import sys
 import types
 
+import pytest
+
 
 def _fresh_bootinfo():
 	return types.SimpleNamespace()
 
 
+@pytest.fixture(autouse=True)
+def _frappe_stub(monkeypatch):
+	"""Install a minimal frappe stub via monkeypatch.setitem so the
+	stub is restored at teardown (vs. the leak-via-bare-assignment
+	pattern this file used to use)."""
+	if "frappe" not in sys.modules:
+		monkeypatch.setitem(sys.modules, "frappe", types.ModuleType("frappe"))
+
+
 class TestBootSession:
 	def test_enabled_flag_attached_when_settings_enabled(self, monkeypatch):
-		# Stub frappe so the boot module's lazy import succeeds.
-		if "frappe" not in sys.modules:
-			sys.modules["frappe"] = types.ModuleType("frappe")
-
 		from frappe_profiler import boot, settings
 		monkeypatch.setattr(settings, "is_enabled", lambda: True)
 
@@ -31,9 +38,6 @@ class TestBootSession:
 		assert bootinfo.profiler_enabled is True
 
 	def test_enabled_flag_false_when_settings_disabled(self, monkeypatch):
-		if "frappe" not in sys.modules:
-			sys.modules["frappe"] = types.ModuleType("frappe")
-
 		from frappe_profiler import boot, settings
 		monkeypatch.setattr(settings, "is_enabled", lambda: False)
 
@@ -45,9 +49,6 @@ class TestBootSession:
 		"""If settings.is_enabled raises, default to True. Hiding the
 		widget due to a settings-read error would be a very confusing
 		support issue ('why can't I see the profiler button?')."""
-		if "frappe" not in sys.modules:
-			sys.modules["frappe"] = types.ModuleType("frappe")
-
 		from frappe_profiler import boot, settings
 
 		def boom():
@@ -67,9 +68,6 @@ class TestBootSession:
 		"""The JS guard does strict `=== false` comparison — so this
 		must always be a Python bool, not a truthy/falsy value that
 		would serialize oddly (e.g. 0, 1, None)."""
-		if "frappe" not in sys.modules:
-			sys.modules["frappe"] = types.ModuleType("frappe")
-
 		from frappe_profiler import boot, settings
 
 		# settings returns 1 (truthy int, but not bool).
