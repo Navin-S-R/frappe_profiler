@@ -23,56 +23,36 @@ framework-tables default, safe-mode field deletions, AI fix fields
 revamp), and the per-finding drill-down chain that walks pyinstrument
 trees down to the first signal-floor leaf.
 
-### Breaking
+### Install
 
-All existing installs must run `bench migrate` after upgrading. The
-migration patches in `optimus.patches.v0_7_0` handle:
+**Fresh deploy only** — no upgrade path from a pre-v0.7.0
+`frappe_profiler` install is supported. The 0.7.0 rename moves the
+package directory, renames every DocType / Role / realtime channel /
+HTTP header / `frappe.local.profiler_*` attribute / `frappe.conf
+.get("profiler_*")` key, and changes the `tabModule Def` row name —
+an in-place upgrade would need a substantial migration patch set,
+which is intentionally out of scope for the 0.7.0 release.
 
-  - **`tabPatch Log`** entries rewritten from `frappe_profiler.patches.*`
-    → `optimus.patches.*` so historical patches aren't re-run under
-    their new module paths.
-  - **`tabModule Def`** row renamed: `Frappe Profiler` → `Optimus`,
-    `app_name` updated to `optimus`.
-  - **DocTypes** (6) renamed via `frappe.rename_doc`:
-    - `Profiler Action` → `Optimus Action`
-    - `Profiler Finding` → `Optimus Finding`
-    - `Profiler Phase Two Run` → `Optimus Phase Two Run`
-    - `Profiler Session` → `Optimus Session`
-    - `Profiler Settings` → `Optimus Settings`
-    - `Profiler Tracked App` → `Optimus Tracked App`
-    Under the hood `rename_doc` rewrites every `tab<DocType>` SQL
-    table name plus child-table `parenttype` columns.
-  - **Role** renamed: `Profiler User` → `Optimus User`. Every
-    `tabHas Role` row carrying the old role keeps its user assignment
-    through the rename.
-  - **`Optimus Tracked App.app_name`** child rows updated:
-    `frappe_profiler` → `optimus` if present.
-  - **Realtime channels** renamed: `profiler_session_*` →
-    `optimus_session_*`, `profiler_progress` → `optimus_progress`.
-    Live widget pages reconnect to the new channels on reload.
-  - **HTTP header** renamed: `X-Profiler-Recording-Id` →
-    `X-Optimus-Recording-Id`. External integrations reading the
-    header must update.
-  - **`frappe.local.profiler_*` attributes** and **`frappe.conf.get
-    ("profiler_*")` keys** renamed to `optimus_*`. Users who set
-    `profiler_max_recordings_per_session` / `profiler_sampler_
-    interval_ms` / etc. in `site_config.json` need to rename those
-    keys manually.
-
-### User-side upgrade (from v0.5.x or v0.6.x)
+Install fresh:
 
 ```bash
-bench stop
-sed -i.bak 's/^frappe_profiler$/optimus/' sites/apps.txt
-mv apps/frappe_profiler apps/optimus
-cd apps/optimus && git remote set-url origin https://github.com/Aerele-RnD/optimus.git && git pull origin main
-bench start  # in another terminal
-bench --site <yoursite> migrate
+bench get-app https://github.com/Aerele-RnD/optimus.git
+bench --site <yoursite> install-app optimus
 ```
 
-The `git remote set-url` step picks up the renamed GitHub repo;
-GitHub auto-redirects the old URL indefinitely so the step is
-optional but cleaner.
+### Renamed in 0.7.0
+
+  - **DocTypes** (6): `Profiler Action / Finding / Phase Two Run /
+    Session / Settings / Tracked App` → `Optimus X`.
+  - **Role**: `Profiler User` → `Optimus User`.
+  - **Realtime channels**: `profiler_session_*` → `optimus_session_*`,
+    `profiler_progress` → `optimus_progress`.
+  - **HTTP correlation header**: `X-Profiler-Recording-Id` →
+    `X-Optimus-Recording-Id`.
+  - **`frappe.local.profiler_*` attributes** + **`frappe.conf.get
+    ("profiler_*")` keys** → `optimus_*`.
+  - **GitHub repo**: `Aerele-RnD/frappe_profiler` →
+    `Aerele-RnD/optimus`. GitHub auto-redirects the old git URL.
 
 ### Added (rolled in from v0.6.x development)
 
