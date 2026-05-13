@@ -57,6 +57,14 @@ def sweep_stale_sessions():
 	except Exception:
 		frappe.log_error(title="frappe_profiler janitor sweep_stuck_analyzing")
 
+	# v0.6.0: phase-2 line-profile runs follow the same staleness model
+	# but live on the Profiler Phase 2 Run child rows. Reuses the same
+	# thresholds (recording → 11min, analyzing → 30min).
+	try:
+		_sweep_stale_phase2_runs()
+	except Exception:
+		frappe.log_error(title="frappe_profiler janitor sweep_stale_phase2_runs")
+
 
 def sweep_old_sessions():
 	"""Run from scheduler daily. Delete old Ready/Failed sessions per retention policy.
@@ -185,8 +193,8 @@ def _sweep_old_sessions():
 			"started_at": ["<", cutoff],
 		},
 		fields=[
-			"name", "title", "is_baseline",
-			"safe_report_file", "raw_report_file", "safe_report_pdf_file",
+			"name", "title",
+			"raw_report_file", "raw_report_pdf_file",
 		],
 		limit=MAX_DELETIONS_PER_RUN,
 		order_by="started_at asc",
@@ -195,23 +203,13 @@ def _sweep_old_sessions():
 	deleted = 0
 	for row in old:
 		try:
-			# v0.4.0: clear baseline cache key before deleting if this session
-			# is the active baseline for its label, to prevent dangling pointers.
-			if row.get("is_baseline"):
-				try:
-					from frappe_profiler.api import _baseline_key
-
-					frappe.cache.delete_value(_baseline_key(row.get("title") or ""))
-				except Exception:
-					pass
-
 			# Delete attached report files first so we don't leave
-			# orphaned File docs behind. v0.4.0 adds safe_report_pdf_file
-			# to this cleanup.
+			# orphaned File docs behind. v0.6.0 Round 7: dropped the
+			# safe_report_file / safe_report_pdf_file slots — single
+			# raw report + lazy PDF.
 			for file_url in (
-				row.get("safe_report_file"),
 				row.get("raw_report_file"),
-				row.get("safe_report_pdf_file"),
+				row.get("raw_report_pdf_file"),
 			):
 				if not file_url:
 					continue
@@ -304,3 +302,70 @@ def _sweep_stuck_analyzing():
 			},
 		)
 		frappe.db.commit()
+
+
+def _sweep_stale_phase2_runs():
+	"""Force-stop Profiler Phase 2 Run rows stuck in Recording (>11min) or
+	Analyzing (>30min). Mirrors the phase-1 sweep logic but operates on
+	the child rows.
+
+	Stale Recording rows: clear the per-user Redis active flag (so future
+	requests don't keep instrumenting), mark the row Failed with a note.
+	Stale Analyzing rows: mark Failed with the same retry-from-console
+	guidance the phase-1 sweep uses.
+
+	Both cases also cleanup the Redis picks/source/samples keys via
+	line_profile.capture.cleanup_run so storage doesn't drift.
+	"""
+	from frappe_profiler.line_profile import capture as _lp_capture
+
+	rec_cutoff = add_to_date(now_datetime(), minutes=-STALE_RECORDING_MINUTES)
+	rec_stale = frappe.db.get_all(
+		"Profiler Phase 2 Run",
+		filters={"status": "Recording", "modified": ["<", rec_cutoff]},
+		fields=["name", "parent", "run_uuid"],
+	)
+	for row in rec_stale:
+		try:
+			frappe.db.set_value(
+				"Profiler Phase 2 Run",
+				row["name"],
+				{
+					"status": "Failed",
+					"warnings_json": frappe.as_json([
+						"Phase 2 run stuck in Recording — auto-stopped by janitor.",
+					]),
+					"ended_at": now_datetime(),
+				},
+			)
+			_lp_capture.cleanup_run(row["run_uuid"])
+			frappe.db.commit()
+		except Exception:
+			frappe.log_error(title="frappe_profiler janitor stale phase-2 recording")
+
+	ana_cutoff = add_to_date(now_datetime(), minutes=-STALE_ANALYZING_MINUTES)
+	ana_stuck = frappe.db.get_all(
+		"Profiler Phase 2 Run",
+		filters={"status": "Analyzing", "modified": ["<", ana_cutoff]},
+		fields=["name", "parent", "run_uuid"],
+	)
+	for row in ana_stuck:
+		try:
+			frappe.db.set_value(
+				"Profiler Phase 2 Run",
+				row["name"],
+				{
+					"status": "Failed",
+					"warnings_json": frappe.as_json([
+						"Phase 2 analyze timed out or crashed. Retry from a "
+						"Frappe console: "
+						"frappe_profiler.line_profile.analyzer.run_analyze("
+						"'<session_uuid>', '<run_uuid>')",
+					]),
+					"ended_at": now_datetime(),
+				},
+			)
+			_lp_capture.cleanup_run(row["run_uuid"])
+			frappe.db.commit()
+		except Exception:
+			frappe.log_error(title="frappe_profiler janitor stuck phase-2 analyzing")

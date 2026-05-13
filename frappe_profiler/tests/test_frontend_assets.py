@@ -111,12 +111,19 @@ def test_form_js_has_analyzer_warnings_intro():
 	assert "set_intro" in src
 
 
-def test_form_js_raw_report_gated_to_admin():
-	"""Form JS must check for admin role before showing the Raw Report button."""
+def test_form_js_has_download_button():
+	"""Form JS must wire up the report download button.
+
+	v0.6.0 Round 7: safe-mode reports were removed. The form now has a
+	single "Download Report" button — the role-based UX gate moved
+	server-side (permissions.py file_has_permission). The client just
+	exposes the button and lets Frappe's File permission hook deny the
+	actual download for unauthorized users.
+	"""
 	with open(FORM_JS) as f:
 		src = f.read()
-	assert "user_can_see_raw" in src
-	assert "System Manager" in src
+	assert "Download Report" in src
+	assert "raw_report_file" in src
 
 
 def test_list_js_severity_indicators():

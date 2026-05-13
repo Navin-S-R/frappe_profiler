@@ -3,8 +3,8 @@
 
 """Tests for the v0.5.3 regenerate_reports API.
 
-The endpoint re-invokes renderer.render_safe / render_raw against an
-existing Profiler Session WITHOUT re-running the analyzer pipeline.
+The endpoint re-invokes renderer.render_raw against an existing
+Profiler Session WITHOUT re-running the analyzer pipeline.
 Use cases:
 
   - Report template was upgraded; existing sessions should reflect

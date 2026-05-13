@@ -16,6 +16,8 @@ have no TTL — they live until the analyze pipeline finalizes the session
 into a `Profiler Session` DocType row and explicitly deletes them.
 """
 
+import time
+
 import frappe
 
 # Match frappe.recorder.RECORDER_AUTO_DISABLE so a forgotten session
@@ -38,6 +40,10 @@ def _meta_key(session_uuid: str) -> str:
 
 def _recordings_key(session_uuid: str) -> str:
 	return f"profiler:session:{session_uuid}:recordings"
+
+
+def _pending_jobs_key(session_uuid: str) -> str:
+	return f"profiler:session:{session_uuid}:pending_jobs"
 
 
 # ----- active session pointer (per-user) -----------------------------------
@@ -167,6 +173,79 @@ def recording_count(session_uuid: str) -> int:
 	return len(get_recordings(session_uuid))
 
 
+# ----- background jobs the flow enqueued (v0.6.0) --------------------------
+# When a profiled flow calls frappe.enqueue, the __init__.py monkey-patch
+# registers the returned RQ job id here. analyze.run waits (capped) for these
+# to finish before gathering recordings, and before_job keeps recording them
+# even after Stop (see `draining_until` below) so they aren't lost.
+
+
+def register_pending_job(session_uuid: str, job_id: str) -> None:
+	"""Record that the flow enqueued RQ job ``job_id``. Best-effort."""
+	if not session_uuid or not job_id:
+		return
+	try:
+		frappe.cache.sadd(_pending_jobs_key(session_uuid), job_id)
+	except Exception:
+		pass
+
+
+def clear_pending_job(session_uuid: str, job_id: str) -> None:
+	"""Drop a finished/expired job id from the pending set. Best-effort."""
+	if not session_uuid or not job_id:
+		return
+	try:
+		frappe.cache.srem(_pending_jobs_key(session_uuid), job_id)
+	except Exception:
+		pass
+
+
+def get_pending_jobs(session_uuid: str) -> set[str]:
+	"""Return the set of RQ job ids the flow enqueued (and that haven't been
+	cleared as finished). Empty set if none / on any error."""
+	if not session_uuid:
+		return set()
+	try:
+		members = frappe.cache.smembers(_pending_jobs_key(session_uuid)) or set()
+	except Exception:
+		return set()
+	return {m.decode() if isinstance(m, bytes) else m for m in members}
+
+
+# ----- post-Stop "draining" window (v0.6.0) --------------------------------
+# Stop clears the active-session pointer immediately (so the UI shows
+# "stopped/analyzing"), but a draining deadline on the session keeps before_job
+# accepting recordings until the flow's background jobs finish (capped).
+
+
+def set_draining(session_uuid: str, until_ts: float) -> None:
+	"""Keep accepting job recordings for this session until ``until_ts``
+	(a unix timestamp). Stored on the session meta dict (no separate TTL —
+	meta lives until the analyze pipeline deletes it)."""
+	if not session_uuid:
+		return
+	meta = get_session_meta(session_uuid) or {}
+	try:
+		meta["draining_until"] = float(until_ts)
+	except (TypeError, ValueError):
+		return
+	set_session_meta(session_uuid, meta)
+
+
+def is_draining(session_uuid: str) -> bool:
+	"""True while the session is in its post-Stop draining window."""
+	if not session_uuid:
+		return False
+	meta = get_session_meta(session_uuid) or {}
+	until = meta.get("draining_until")
+	if not until:
+		return False
+	try:
+		return time.time() < float(until)
+	except (TypeError, ValueError):
+		return False
+
+
 # ----- cleanup -------------------------------------------------------------
 
 
@@ -178,6 +257,9 @@ def delete_session_state(session_uuid: str) -> None:
 	"""
 	frappe.cache.delete_value(_meta_key(session_uuid))
 	frappe.cache.delete_value(_recordings_key(session_uuid))
+	# v0.6.0: pending-jobs set (the draining_until flag lives inside the
+	# meta hash, deleted above).
+	frappe.cache.delete_value(_pending_jobs_key(session_uuid))
 	# v0.5.0: clean up the frontend metrics Redis lists written by
 	# api.submit_frontend_metrics. Pre-v0.5.1 used a single JSON dict
 	# at profiler:frontend:<uuid> (deleted below for forward compat with

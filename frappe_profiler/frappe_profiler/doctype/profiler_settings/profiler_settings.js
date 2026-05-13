@@ -33,5 +33,44 @@ frappe.ui.form.on("Profiler Settings", {
 				);
 			},
 		});
+
+		// "Test AI connection" — only when the feature is on. Saves the
+		// operator a profiling round-trip just to find out the key/model
+		// are wrong.
+		if (frm.doc.ai_enabled) {
+			frm.add_custom_button(__("Test AI connection"), () => {
+				if (frm.is_dirty()) {
+					frappe.msgprint(
+						__("Save your AI settings first, then test the connection.")
+					);
+					return;
+				}
+				frappe.show_alert({
+					message: __("Pinging the AI provider…"),
+					indicator: "blue",
+				});
+				frappe.call({
+					method: "frappe_profiler.api.test_ai_connection",
+					callback(r) {
+						const m = (r && r.message) || {};
+						frappe.msgprint({
+							title: m.ok
+								? __("AI connection OK")
+								: __("AI connection failed"),
+							indicator: m.ok ? "green" : "red",
+							message:
+								(m.model ? __("Model: {0}", [m.model]) + "<br>" : "") +
+								frappe.utils.escape_html(m.message || ""),
+						});
+					},
+					error() {
+						frappe.show_alert({
+							message: __("AI connection test failed"),
+							indicator: "red",
+						});
+					},
+				});
+			});
+		}
 	},
 });

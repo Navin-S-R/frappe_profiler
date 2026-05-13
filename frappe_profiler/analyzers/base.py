@@ -93,6 +93,141 @@ _THIRD_PARTY_LIB_FRAGMENTS: tuple[str, ...] = (
 	"pymysql/",
 )
 
+# v0.6.0: Frappe's framework-managed columns — every `tab*` table has these.
+# Frappe writes (most of) them on every save (`modified`, `modified_by`,
+# `idx`), on insert (`creation`, `owner`), on submit/cancel (`docstatus`), or
+# they're already auto-indexed (`name` is the PK; `parent` is auto-indexed on
+# child tables). Suggesting an index on any of them is a write-cost trap the
+# developer shouldn't be nudged into — so every index-suggestion path
+# (index_suggestions.py, table_breakdown.py's per-table candidates, and the
+# AI "suggest a fix" prompt) skips them.
+#
+# Mirrors `frappe.model.default_fields` + `frappe.model.optional_fields`.
+# Analyzers are pure (no `import frappe`), so this is a hardcoded snapshot —
+# update it if Frappe adds a standard column.
+FRAPPE_METADATA_COLUMNS: frozenset[str] = frozenset({
+	# frappe.model.default_fields
+	"name", "owner", "creation", "modified", "modified_by",
+	"docstatus", "parent", "parentfield", "parenttype", "idx", "doctype",
+	# frappe.model.optional_fields
+	"_user_tags", "_comments", "_assign", "_liked_by", "_seen",
+})
+
+
+def is_frappe_metadata_column(name) -> bool:
+	"""Case-insensitive membership test for ``FRAPPE_METADATA_COLUMNS``."""
+	return bool(name) and str(name).strip().lower() in FRAPPE_METADATA_COLUMNS
+
+
+# v0.6.0: Frappe's framework "meta" tables — the ones that store the schema
+# itself (DocType / DocField / Custom Field / Property Setter), the Single-
+# doctype value store, the naming-series counters, the global-search index,
+# the migration log, and UI/dashboard/print configuration. `bench migrate`
+# owns these tables' structure (including their indexes), they're tiny or
+# write-on-every-customization, and indexing them by hand via raw SQL is
+# pointless (and would be clobbered on the next migrate). So no index-
+# suggestion path proposes an index on a table in this set; the table
+# breakdown still lists it (you may still want to know "30ms in tabSingles"),
+# it just won't get index candidates.
+#
+# Curated snapshot — content / log / queue tables (`tabFile`, `tabVersion`,
+# `tabEmail Queue`, `tabCommunication`, `tabError Log`, …) are deliberately
+# NOT here: those grow large and DO legitimately want application-chosen
+# indexes.
+FRAPPE_META_TABLES: frozenset[str] = frozenset({
+	# DocType / schema definition
+	"tabDocType", "tabDocField", "tabDocPerm", "tabCustom DocPerm",
+	"tabDocType Action", "tabDocType Link", "tabDocType State",
+	"tabDocType Layout", "tabModule Def",
+	# Customization
+	"tabCustom Field", "tabProperty Setter", "tabClient Script",
+	"tabServer Script", "tabCustom HTML Block",
+	# Single-doctype value store, naming series, global search
+	"tabSingles", "tabSeries", "tab__global_search",
+	# UI / dashboards / print configuration
+	"tabWorkspace", "tabWorkspace Link", "tabWorkspace Shortcut",
+	"tabWorkspace Chart", "tabWorkspace Quick List",
+	"tabWorkspace Number Card", "tabWorkspace Custom Block",
+	"tabDashboard", "tabDashboard Chart", "tabDashboard Chart Source",
+	"tabNumber Card", "tabNumber Card Link",
+	"tabPrint Format", "tabLetter Head",
+	# App / migration bookkeeping
+	"tabPatch Log", "tabInstalled Application", "tabInstalled Applications",
+	"tabPackage", "tabPackage Import",
+	# Misc framework config
+	"tabRole", "tabRole Profile", "tabModule Profile",
+})
+_FRAPPE_META_TABLES_LOWER: frozenset[str] = frozenset(t.lower() for t in FRAPPE_META_TABLES)
+
+
+def is_frappe_meta_table(name) -> bool:
+	"""Case-insensitive membership test for ``FRAPPE_META_TABLES`` (also
+	tolerates a backtick-quoted name, though ``sql_metadata`` returns the
+	bare name)."""
+	return bool(name) and str(name).strip().strip("`").lower() in _FRAPPE_META_TABLES_LOWER
+
+
+# v0.6.x: framework-internal tables — user/session/auth bookkeeping that
+# every Frappe request touches via session.get_user / get_roles / etc.,
+# irrespective of the app code. Distinct from FRAPPE_META_TABLES (= "Frappe
+# owns the schema, no custom indexes survive a migrate"): these *are* real
+# data tables, but app developers can't really change how often they're
+# queried because the queries come from framework machinery. Surfaced via
+# the "Hide framework / internal database tables" setting (default on).
+FRAMEWORK_INTERNAL_TABLES: frozenset[str] = frozenset({
+	"tabHas Role",
+	"tabDefaultValue",
+	"tabUser Social Login",
+	"tabUser Role Profile",
+	"tabBlock Module",
+	"tabUser Email",
+})
+_FRAMEWORK_INTERNAL_TABLES_LOWER: frozenset[str] = frozenset(
+	t.lower() for t in FRAMEWORK_INTERNAL_TABLES
+)
+
+
+def is_framework_db_table(name) -> bool:
+	"""True for tables that are noise in the "Time spent per database table"
+	breakdown — schema/meta (``FRAPPE_META_TABLES``), user/session bookkeeping
+	(``FRAMEWORK_INTERNAL_TABLES``), or MySQL system tables
+	(``information_schema.*``). Case-insensitive + backtick-tolerant."""
+	if not name:
+		return False
+	norm = str(name).strip().strip("`").lower()
+	if not norm:
+		return False
+	if norm in _FRAPPE_META_TABLES_LOWER:
+		return True
+	if norm in _FRAMEWORK_INTERNAL_TABLES_LOWER:
+		return True
+	if norm.startswith("information_schema."):
+		return True
+	return False
+
+
+# Core Frappe/ERPNext tables that take many INSERT/UPDATE rows per business
+# transaction (every submitted voucher, every stock move, …). An extra index
+# on one of these costs write time across many flows even though a single
+# profiling session may only show one write — the report flags that so an
+# index recommendation here is treated conservatively.
+WRITE_HOT_TABLES: frozenset[str] = frozenset({
+	# Accounting / stock ledgers — written in bulk on every submit
+	"tabGL Entry", "tabStock Ledger Entry", "tabPayment Ledger Entry",
+	"tabSerial and Batch Bundle", "tabSerial and Batch Entry",
+	"tabBin", "tabSerial No", "tabBatch", "tabRepost Item Valuation",
+	# Framework write-on-save / high-churn log tables
+	"tabVersion", "tabComment", "tabActivity Log", "tabNotification Log",
+	"tabError Log", "tabScheduled Job Log", "tabEmail Queue", "tabEmail Queue Recipient",
+	"tabDeleted Document", "tabAccess Log", "tabView Log",
+})
+_WRITE_HOT_TABLES_LOWER: frozenset[str] = frozenset(t.lower() for t in WRITE_HOT_TABLES)
+
+
+def is_write_hot_table(name) -> bool:
+	"""Case-insensitive membership test for ``WRITE_HOT_TABLES``."""
+	return bool(name) and str(name).strip().strip("`").lower() in _WRITE_HOT_TABLES_LOWER
+
 
 def _extract_app_segment(norm: str) -> str | None:
 	"""Return the app name from a normalized filename, or None.
@@ -175,6 +310,27 @@ def is_framework_callsite(
 		if lib in norm:
 			return True
 	return False
+
+
+def is_framework_callsite_str(
+	callsite: str | None,
+	tracked_apps: tuple[str, ...] | None = None,
+) -> bool:
+	"""``is_framework_callsite`` for the ``'filename:lineno'`` string form
+	that ``walk_callsite_str`` produces (and that the ``top_queries``
+	aggregate stores per row).
+
+	A missing / empty callsite counts as framework: we can't attribute it
+	to the user's app, so it doesn't belong in a "your app" leaderboard
+	either.
+	"""
+	if not callsite:
+		return True
+	# The line number is always the trailing ':N' segment — strip it to
+	# recover the filename for the path classifier. Recorder stacks use
+	# forward slashes, so a Windows drive-letter ':' isn't a concern.
+	filename = callsite.rsplit(":", 1)[0] if ":" in callsite else callsite
+	return is_framework_callsite(filename, tracked_apps)
 
 
 def is_profiler_own_query(stack: list | None) -> bool:

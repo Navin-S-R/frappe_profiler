@@ -10,11 +10,11 @@ Owns:
      frappe.cache.get_value / frappe.permissions.has_permission for
      argument capture (with PII-safe hashing)
 
-PII safety: argument values that may contain user data are stored in
-two forms — `identifier_raw` (used only by the raw report) and
-`identifier_safe` (a sha256[:12] hash, used by the safe report and as
-the bucket key for redundant-call detection). Doctype names and ptypes
-are NOT hashed because they're schema-level identifiers, not data.
+Argument values that may contain user data are stored in two forms —
+``identifier_raw`` (rendered in the report) and ``identifier_safe``
+(a sha256[:12] hash, used as the bucket key for redundant-call
+detection). Doctype names and ptypes are NOT hashed because they're
+schema-level identifiers, not data.
 
 Activation gate: the sidecar wraps and pyinstrument start are gated on
 the presence of `frappe.local._profiler_active_session_id`. That flag is
@@ -253,7 +253,7 @@ def _make_wrap(orig, fn_name: str, local_proxy=None):
 DEFAULT_SAMPLER_INTERVAL_MS = 1
 
 
-def _start_pyi_session(local_proxy, interval_ms: int = DEFAULT_SAMPLER_INTERVAL_MS):
+def _start_pyi_session(local_proxy, interval_ms: float = DEFAULT_SAMPLER_INTERVAL_MS):
 	"""Start a pyinstrument profiler scoped to this request.
 
 	Stores the running profiler on `local_proxy.profiler_pyinstrument` so

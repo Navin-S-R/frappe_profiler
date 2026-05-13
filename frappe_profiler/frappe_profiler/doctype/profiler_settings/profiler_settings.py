@@ -16,6 +16,7 @@ class ProfilerSettings(Document):
 	def validate(self):
 		self._normalize_tracked_apps()
 		self._warn_on_framework_apps_in_tracked()
+		self._warn_on_incomplete_ai_config()
 
 	def on_update(self):
 		# Settings are read on every request (via the `enabled` gate in
@@ -87,5 +88,37 @@ class ProfilerSettings(Document):
 		frappe.msgprint(
 			msg,
 			title="Tracked Apps — possible misconfiguration",
+			indicator="orange",
+		)
+
+	def _warn_on_incomplete_ai_config(self):
+		"""Non-blocking warning when AI fix suggestions are enabled but
+		the config is incomplete (no model, or no API key for a provider
+		that needs one). The feature stays enabled — the operator just
+		sees a clear hint instead of a cryptic error on first use."""
+		if not self.get("ai_enabled"):
+			return
+		provider = (self.get("ai_provider") or "Anthropic").strip()
+		needs_key = provider != "OpenAI-compatible"
+		# ai_model can be blank when a hosted default exists for the
+		# provider; only "OpenAI-compatible" truly requires it (no
+		# default to fall back to). We still nudge if it's blank for the
+		# custom provider.
+		missing = []
+		if provider == "OpenAI-compatible":
+			if not (self.get("ai_base_url") or "").strip():
+				missing.append("Base URL")
+			if not (self.get("ai_model") or "").strip():
+				missing.append("Model")
+		if needs_key and not (self.get("ai_api_key") or "").strip():
+			missing.append("API Key")
+		if not missing:
+			return
+		frappe.msgprint(
+			"AI Fix Suggestions are enabled but " + ", ".join(missing)
+			+ (" is" if len(missing) == 1 else " are")
+			+ " not set — the <b>Suggest a fix (AI)</b> button will report a "
+			"configuration error until you fill these in.",
+			title="AI Fix Suggestions — incomplete config",
 			indicator="orange",
 		)

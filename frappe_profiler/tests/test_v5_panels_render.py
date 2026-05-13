@@ -34,8 +34,6 @@ def _fake_session_doc(v5_aggregate):
 	doc.total_python_ms = 100
 	doc.total_sql_ms = 500
 	doc.analyzer_warnings = None
-	doc.compared_to_session = None
-	doc.is_baseline = 0
 	doc.v5_aggregate_json = json.dumps(v5_aggregate)
 	doc.actions = []
 	doc.findings = []
@@ -76,14 +74,16 @@ def test_safe_mode_renders_server_resource_panel():
 	}
 
 	doc = _fake_session_doc(v5)
-	html = renderer.render(doc, recordings=[], mode="safe")
+	html = renderer.render(doc, recordings=[])
 
 	assert "Server Resource" in html
 	assert "POST /api/method/save" in html
 	assert "92%" in html  # CPU peak rendered
 
 
-def test_safe_mode_renders_frontend_panel_with_redacted_urls():
+def test_frontend_panel_renders_full_urls():
+	# v0.6.0 Round 7: safe-mode URL redaction was removed. The Frontend
+	# panel now shows full URLs as captured (admin-scoped report).
 	from frappe_profiler import renderer
 
 	v5 = {
@@ -121,12 +121,10 @@ def test_safe_mode_renders_frontend_panel_with_redacted_urls():
 	}
 
 	doc = _fake_session_doc(v5)
-	html = renderer.render(doc, recordings=[], mode="safe")
+	html = renderer.render(doc, recordings=[])
 
 	assert "Frontend" in html
-	# Safe mode must redact the docname from both the XHR URL and the page URL.
-	assert "SI-2026-00123" not in html
-	assert "&lt;name&gt;" in html or "<name>" in html
+	assert "SI-2026-00123" in html
 
 
 def test_raw_mode_keeps_docname_in_urls():
@@ -155,7 +153,7 @@ def test_raw_mode_keeps_docname_in_urls():
 	}
 
 	doc = _fake_session_doc(v5)
-	html = renderer.render(doc, recordings=[], mode="raw")
+	html = renderer.render(doc, recordings=[])
 
 	# Raw mode keeps full URLs.
 	assert "SI-2026-00999" in html
@@ -170,14 +168,17 @@ def test_missing_v5_aggregate_degrades_cleanly():
 	doc = _fake_session_doc({})
 	doc.v5_aggregate_json = None  # simulate pre-v0.5.0 row
 
-	html = renderer.render(doc, recordings=[], mode="safe")
+	html = renderer.render(doc, recordings=[])
 	# The v0.5.0 section headings should NOT appear when there's no data.
 	assert "Server Resource" not in html
 	# Confirm the rest of the report still rendered.
 	assert "Test session" in html
 
 
-def test_empty_orphans_hidden_in_safe_mode():
+def test_orphans_section_appears_when_present():
+	# v0.6.0 Round 7: safe-mode hide-orphans guard was removed; the
+	# Orphaned XHRs section now always appears when frontend_orphans
+	# is non-empty (single admin-scoped report).
 	from frappe_profiler import renderer
 
 	v5 = {
@@ -195,11 +196,27 @@ def test_empty_orphans_hidden_in_safe_mode():
 		"frontend_summary": {"total_xhrs": 1},
 	}
 	doc = _fake_session_doc(v5)
-	html = renderer.render(doc, recordings=[], mode="safe")
+	html = renderer.render(doc, recordings=[])
 
-	# Orphans section is hidden in safe mode entirely.
+	assert "Orphaned XHRs" in html
+
+
+def test_orphans_section_hidden_when_empty():
+	from frappe_profiler import renderer
+
+	v5 = {
+		"infra_timeline": [],
+		"infra_summary": {},
+		"frontend_xhr_matched": [
+			{"action_idx": 0, "action_label": "save", "backend_ms": 100,
+			 "xhr_ms": 150, "network_delta_ms": 50, "response_size_bytes": 0,
+			 "status": 200, "url": "/api/method/foo", "transport": "xhr"},
+		],
+		"frontend_vitals_by_page": {},
+		"frontend_orphans": [],
+		"frontend_summary": {"total_xhrs": 1},
+	}
+	doc = _fake_session_doc(v5)
+	html = renderer.render(doc, recordings=[])
+
 	assert "Orphaned XHRs" not in html
-
-	# But shown in raw mode.
-	html_raw = renderer.render(doc, recordings=[], mode="raw")
-	assert "Orphaned XHRs" in html_raw

@@ -38,6 +38,7 @@ def _patch_enqueue():
 	_original_enqueue = _bg.enqueue
 
 	def _profiler_enqueue(method, *args, **kwargs):
+		active = None
 		try:
 			# Lazy import to avoid circular dependency on app init.
 			from frappe_profiler import session as _profiler_session
@@ -49,10 +50,48 @@ def _patch_enqueue():
 					# Inject our marker into the job kwargs. The before_job
 					# hook will pop it before the method runs.
 					kwargs["_profiler_session_id"] = active
+
+				# Phase-2: independently propagate the line-profile run
+				# UUID. A user can only have phase-1 OR phase-2 active at
+				# any time (enforced at the API), but the two flags are
+				# read-decoupled here so neither layer needs to know about
+				# the other.
+				try:
+					from frappe_profiler.line_profile import capture as _lp_capture
+
+					lp_active = _lp_capture.is_active(user)
+					if lp_active:
+						kwargs["_lp_session_id"] = lp_active
+				except Exception:
+					# line_profiler not installed, or any other failure —
+					# phase 2 stays off for this job; phase 1 (if active)
+					# still rides along.
+					pass
 		except Exception:
 			# Never break enqueue. The profiler is best-effort by design.
 			pass
-		return _original_enqueue(method, *args, **kwargs)
+
+		job = _original_enqueue(method, *args, **kwargs)
+
+		# v0.6.0: register the RQ job id with the session so analyze waits
+		# for it to finish before gathering recordings — so jobs that get
+		# picked up by a worker shortly after Stop aren't lost. `job` is
+		# None for `now=True` inline jobs (nothing async to wait for). Never
+		# track our own analyze job (it would deadlock the wait on itself).
+		try:
+			if (
+				active
+				and job is not None
+				and getattr(job, "id", None)
+				and method != "frappe_profiler.analyze.run"
+			):
+				from frappe_profiler import session as _profiler_session
+
+				_profiler_session.register_pending_job(active, job.id)
+		except Exception:
+			pass
+
+		return job
 
 	_profiler_enqueue._profiler_patched = True
 	_profiler_enqueue.__wrapped__ = _original_enqueue

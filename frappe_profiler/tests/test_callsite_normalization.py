@@ -205,8 +205,7 @@ class TestEndToEndRender:
 		doc.table_breakdown_json = "[]"; doc.hot_frames_json = "[]"
 		doc.session_time_breakdown_json = "{}"
 		doc.total_python_ms = 0; doc.total_sql_ms = 0
-		doc.analyzer_warnings = None; doc.compared_to_session = None
-		doc.is_baseline = 0; doc.v5_aggregate_json = "{}"
+		doc.analyzer_warnings = None; doc.v5_aggregate_json = "{}"
 		doc.actions = []
 
 		# Slow Query with STRING callsite (top_queries shape).
@@ -247,7 +246,7 @@ class TestEndToEndRender:
 
 		# The pre-fix crash was here:
 		#   AttributeError: 'str' object has no attribute 'get'
-		html = renderer.render(doc, recordings=[], mode="raw")
+		html = renderer.render(doc, recordings=[])
 
 		# Both findings rendered — titles present.
 		assert "Slow query: 1374ms" in html

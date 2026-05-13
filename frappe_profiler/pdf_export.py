@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Frappe Profiler contributors
 # For license information, please see license.txt
 
-"""Lazy PDF generation for the safe report.
+"""Lazy PDF generation for the report.
 
 Generated on first request via frappe.utils.pdf.get_pdf (wkhtmltopdf),
 cached to a private File attachment on the Profiler Session. Subsequent
@@ -37,12 +37,12 @@ def get_or_generate_pdf(session_uuid: str) -> str:
 	Raises on generation failure; does NOT cache failed generations.
 	"""
 	doc = _load_session(session_uuid)
-	if doc.safe_report_pdf_file:
-		return doc.safe_report_pdf_file
-	html = _load_safe_html(doc)
+	if doc.raw_report_pdf_file:
+		return doc.raw_report_pdf_file
+	html = _load_raw_html(doc)
 	pdf_bytes = _html_to_pdf(html)
 	url = _save_pdf_attachment(doc.name, session_uuid, pdf_bytes)
-	frappe.db.set_value("Profiler Session", doc.name, "safe_report_pdf_file", url)
+	frappe.db.set_value("Profiler Session", doc.name, "raw_report_pdf_file", url)
 	frappe.db.commit()
 	return url
 
@@ -58,7 +58,7 @@ def clear_cached_pdf(session_uuid: str) -> None:
 	if not docname:
 		return
 	current_url = frappe.db.get_value(
-		"Profiler Session", docname, "safe_report_pdf_file",
+		"Profiler Session", docname, "raw_report_pdf_file",
 	)
 	if not current_url:
 		return
@@ -67,7 +67,7 @@ def clear_cached_pdf(session_uuid: str) -> None:
 		frappe.delete_doc("File", file_row.name, force=True, ignore_permissions=True)
 	except Exception:
 		pass
-	frappe.db.set_value("Profiler Session", docname, "safe_report_pdf_file", None)
+	frappe.db.set_value("Profiler Session", docname, "raw_report_pdf_file", None)
 	frappe.db.commit()
 
 
@@ -80,10 +80,10 @@ def _load_session(session_uuid: str):
 	return frappe.get_doc("Profiler Session", docname)
 
 
-def _load_safe_html(doc) -> str:
-	if not doc.safe_report_file:
-		frappe.throw("This session has no safe report to convert.")
-	file_row = frappe.get_doc("File", {"file_url": doc.safe_report_file})
+def _load_raw_html(doc) -> str:
+	if not doc.raw_report_file:
+		frappe.throw("This session has no report to convert.")
+	file_row = frappe.get_doc("File", {"file_url": doc.raw_report_file})
 	return file_row.get_content().decode("utf-8")
 
 
@@ -109,7 +109,7 @@ def _expand_collapsible_sections(html: str) -> str:
 def _html_to_pdf(html: str) -> bytes:
 	"""Run HTML through wkhtmltopdf via frappe.utils.pdf.get_pdf.
 
-	Options tuned for the safe report's CSS — A4, conservative margins,
+	Options tuned for the report's CSS — A4, conservative margins,
 	UTF-8, print-media-type so any @media print rules in the report are
 	honored (e.g. the SVG donut fallback).
 
@@ -140,13 +140,13 @@ def _save_pdf_attachment(docname: str, session_uuid: str, pdf_bytes: bytes) -> s
 
 	Returns the file_url. Raises on failure (caller decides not to cache).
 	"""
-	filename = f"profiler_safe_report_{session_uuid}.pdf"
+	filename = f"profiler_report_{session_uuid}.pdf"
 	file_doc = frappe.get_doc({
 		"doctype": "File",
 		"file_name": filename,
 		"attached_to_doctype": "Profiler Session",
 		"attached_to_name": docname,
-		"attached_to_field": "safe_report_pdf_file",
+		"attached_to_field": "raw_report_pdf_file",
 		"is_private": 1,
 		"content": pdf_bytes,
 	})

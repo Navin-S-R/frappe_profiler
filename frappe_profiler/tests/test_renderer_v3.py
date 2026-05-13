@@ -45,7 +45,7 @@ def _fake_doc(**fields):
 	return SimpleNamespace(**defaults)
 
 
-def test_render_safe_with_donut_and_hot_frames():
+def test_render_raw_with_donut_and_hot_frames():
 	doc = _fake_doc(
 		session_time_breakdown_json=json.dumps({
 			"sql_ms": 200,
@@ -60,19 +60,19 @@ def test_render_safe_with_donut_and_hot_frames():
 		]),
 		total_python_ms=800,
 		total_sql_ms=200,
+		total_duration_ms=1000,
+		total_query_time_ms=200,
 	)
-	html = renderer.render_safe(doc, recordings=[])
-	# Donut section rendered
-	assert "Time breakdown" in html
-	assert "conic-gradient" in html
-	assert "SQL" in html
-	# Hot frames section rendered
+	html = renderer.render_raw(doc, recordings=[])
+	# v0.6.0: Time breakdown donut was folded into the Total time stat card,
+	# now labelled in plain English: `<server-code>ms server code · <db>ms database`.
+	assert "ms server code" in html
+	assert "ms database" in html
+	# Hot frames section rendered with full app names (v0.6.0 Round 7
+	# removed safe-mode app collapse).
 	assert "Hot frames" in html
-	assert "erpnext.selling.validate" in html  # erpnext is allowlist-passthrough
-	# my_acme_app should appear in collapsed form
-	assert "my_acme_app:discounts" in html
-	# Plaintext my_acme_app function name should NOT appear in safe mode
-	assert "calculate_secret" not in html
+	assert "erpnext.selling.validate" in html
+	assert "my_acme_app.discounts.calc" in html
 
 
 def test_render_raw_shows_full_app_names():
@@ -88,29 +88,28 @@ def test_render_raw_shows_full_app_names():
 		]),
 	)
 	html = renderer.render_raw(doc, recordings=[])
-	# Raw mode: full app name visible in the donut legend AND in hot frames
-	assert "Python (my_acme_app)" in html
+	# Raw mode: full app name visible in hot frames (donut legend was
+	# removed in v0.6.0 when Time breakdown got folded into At a glance).
 	assert "my_acme_app.discounts.calc" in html
 
 
-def test_render_safe_old_session_no_v3_fields():
+def test_render_raw_old_session_no_v3_fields():
 	"""A v0.2.0 session without donut/hot-frames data must still render."""
 	doc = _fake_doc()  # all v0.3.0 fields are None
-	html = renderer.render_safe(doc, recordings=[])
-	# Donut and hot frames sections are skipped
-	assert "Time breakdown" not in html
+	html = renderer.render_raw(doc, recordings=[])
+	# Hot frames section skipped when no data; donut was removed entirely.
 	assert "Hot frames" not in html
 	# But the rest of the report still renders
 	assert "Summary" in html
 	assert "Per-action breakdown" in html
 
 
-def test_render_safe_with_invalid_json_in_v3_fields():
+def test_render_raw_with_invalid_json_in_v3_fields():
 	"""Malformed JSON in the new fields must not crash the renderer."""
 	doc = _fake_doc(
 		session_time_breakdown_json="not-valid-json",
 		hot_frames_json="also-not-valid",
 	)
-	html = renderer.render_safe(doc, recordings=[])
+	html = renderer.render_raw(doc, recordings=[])
 	# Renderer still produces some HTML
 	assert "<html" in html or "<!DOCTYPE" in html.lower()

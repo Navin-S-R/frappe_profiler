@@ -8,10 +8,10 @@ capture.py, buckets entries by (fn_name, identifier_safe), and emits
 one Redundant Call finding per bucket whose count exceeds a configurable
 threshold.
 
-PII safety: the bucket key uses identifier_safe (sha256 hash), so we
-never expose plaintext values to the safe-mode finding title. The
-finding's technical_detail_json carries BOTH identifier_safe AND
-identifier_raw so the renderer can show the appropriate form per mode.
+Bucket key uses identifier_safe (sha256 hash) for redundancy
+detection so equivalent values cluster regardless of literal text.
+The finding's technical_detail_json carries BOTH identifier_safe AND
+identifier_raw — the renderer uses identifier_raw.
 """
 
 import json

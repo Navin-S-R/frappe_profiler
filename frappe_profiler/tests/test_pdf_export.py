@@ -18,8 +18,8 @@ def mock_session(monkeypatch):
 	doc = SimpleNamespace(
 		name="PS-001",
 		session_uuid="uuid-001",
-		safe_report_file="/private/files/safe_report_uuid-001.html",
-		safe_report_pdf_file=None,
+		raw_report_file="/private/files/safe_report_uuid-001.html",
+		raw_report_pdf_file=None,
 	)
 
 	class FakeFileRow:
@@ -27,7 +27,7 @@ def mock_session(monkeypatch):
 			return b"<html><body>fake report</body></html>"
 
 	class FakeFileDoc:
-		file_url = "/private/files/profiler_safe_report_uuid-001.pdf"
+		file_url = "/private/files/profiler_raw_report_uuid-001.pdf"
 
 		def insert(self, ignore_permissions=False):
 			pass
@@ -37,7 +37,7 @@ def mock_session(monkeypatch):
 			if isinstance(filters, dict) and filters.get("session_uuid") == "uuid-001":
 				return doc.name
 			if doctype == "Profiler Session" and filters == "PS-001":
-				return doc.safe_report_pdf_file if field == "safe_report_pdf_file" else None
+				return doc.raw_report_pdf_file if field == "raw_report_pdf_file" else None
 			return None
 
 		def set_value(self, doctype, name, field, value=None):
@@ -78,7 +78,7 @@ def test_first_call_generates_and_caches(mock_session):
 	assert url is not None
 	assert "pdf" in url
 	assert state["pdf_call_count"] == 1
-	assert doc.safe_report_pdf_file == url
+	assert doc.raw_report_pdf_file == url
 
 
 def test_second_call_returns_cached_url(mock_session):
@@ -94,7 +94,7 @@ def test_generation_failure_raises_and_does_not_cache(monkeypatch, mock_session)
 
 	doc, state = mock_session
 	# Reset doc's cache slot
-	doc.safe_report_pdf_file = None
+	doc.raw_report_pdf_file = None
 
 	def fake_get_pdf_failure(html, options=None):
 		raise RuntimeError("wkhtmltopdf crashed")
@@ -104,4 +104,4 @@ def test_generation_failure_raises_and_does_not_cache(monkeypatch, mock_session)
 	with pytest.raises(Exception):
 		pdf_export.get_or_generate_pdf("uuid-001")
 
-	assert doc.safe_report_pdf_file is None
+	assert doc.raw_report_pdf_file is None

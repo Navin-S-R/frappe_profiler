@@ -32,7 +32,7 @@ def test_no_stray_section_div_tags():
 		"Every section must use <details class='section'> — bare "
 		"<div class='section'> means that section is not collapsible."
 	)
-	# Same for the <section class="section"> form used in comparison blocks.
+	# Same for the <section class="section"> form, if any creeps in.
 	assert '<section class="section' not in template, (
 		"The <section class='section'> form must also be converted to "
 		"<details class='section'> for collapsibility."
@@ -63,7 +63,6 @@ def test_primary_sections_are_open_by_default():
 		"Findings &mdash; what to fix",
 		"Server Resource",
 		"Frontend",
-		"Time breakdown",
 		"Hot frames",
 		"Top",               # "Top {{ top_queries|length }} slowest queries"
 		"Queries per action",
@@ -74,13 +73,42 @@ def test_primary_sections_are_open_by_default():
 			f"section heading {section_heading!r} missing from template"
 		)
 
-	# Every open-by-default primary section uses the `open` attribute.
+	# Every open-by-default primary section uses the `open` attribute. The
+	# attribute may be followed by `>` or by another attribute (e.g.
+	# `id="..."` for in-page nav links), so don't require `>` right after.
 	# Count: we expect ≥ 8 such sections (varies with conditional ones).
-	open_sections = re.findall(r'<details class="section[^"]*" open>', template)
+	open_sections = re.findall(r'<details class="section[^"]*" open[ >]', template)
 	assert len(open_sections) >= 8, (
-		f"expected at least 8 <details class='section' open> blocks, "
+		f"expected at least 8 <details class='section' open ...> blocks, "
 		f"found {len(open_sections)}"
 	)
+
+
+def test_heavy_reference_sections_are_collapsed_by_default():
+	"""v0.6.0: the raw-dump sections ("Full recordings", "Queries per action")
+	ship collapsed so the report reads as a digest, not a wall of SQL."""
+	template = _read_template()
+	for heading in ("Full recordings", "Queries per action"):
+		# The <details> right before this <summary><h2>heading</h2> must NOT
+		# carry the `open` attribute.
+		idx = template.index(f"<summary><h2>{heading}</h2>")
+		details_open = template.rindex("<details", 0, idx)
+		details_tag = template[details_open:idx]
+		assert " open" not in details_tag, (
+			f"'{heading}' section must be collapsed by default (no `open`); got: {details_tag!r}"
+		)
+
+
+def test_report_has_navigation_aids():
+	"""v0.6.0: a 'How to read this report' orientation block and a compact
+	in-page 'Jump to:' nav near the top."""
+	template = _read_template()
+	assert "How to read this report" in template
+	assert "Jump to:" in template
+	# The jump links point at sections that carry matching ids.
+	for anchor in ("#findings", "#per-action", "#top-queries", "#db-tables"):
+		assert f'href="{anchor}"' in template, f"jump link {anchor} missing"
+		assert f'id="{anchor[1:]}"' in template, f"section id {anchor[1:]} missing"
 
 
 def test_observations_subsection_is_collapsed_by_default():
@@ -103,21 +131,35 @@ def test_observations_subsection_is_collapsed_by_default():
 def test_observations_is_nested_inside_findings():
 	"""The Observations <details class='subsection'> must appear between
 	the Findings <summary> and its closing </details>. Otherwise the
-	'move a sub-section' part of the user's request isn't satisfied."""
+	'move a sub-section' part of the user's request isn't satisfied.
+
+	v0.6.x: there are now multiple <details class='subsection'> blocks in
+	the template (the per-action / hot-frames / background-jobs /
+	top-queries sections each have a "framework items" sub-block). Find
+	the Observations subsection specifically by anchoring on its <h3>.
+	"""
 	template = _read_template()
 	findings_summary_idx = template.find(
 		"<summary><h2>Findings &mdash; what to fix</h2></summary>"
 	)
-	subsection_idx = template.find('<details class="subsection">')
+	# The Observations subsection's <summary> carries an <h3> labelled
+	# "Framework-level observations". Walk back from there to its opening
+	# <details class="subsection"> tag.
+	observations_summary_idx = template.find(
+		"<summary><h3>Framework-level observations"
+	)
 	assert findings_summary_idx > 0, "Findings summary not found"
-	assert subsection_idx > 0, "Observations subsection not found"
+	assert observations_summary_idx > 0, "Observations summary not found"
+	subsection_idx = template.rfind(
+		'<details class="subsection"', 0, observations_summary_idx
+	)
+	assert subsection_idx > 0, "Observations subsection opening not found"
 	assert subsection_idx > findings_summary_idx, (
 		"Observations subsection must be nested after Findings' <summary>"
 	)
 
 	# And the Findings closing </details> must come AFTER the subsection
 	# (proving containment, not just ordering).
-	findings_close_idx = template.find("</details>", subsection_idx)
 	# Walk forward: the subsection has its own </details>, and Findings
 	# has its own </details> after that. Verify the subsection closes
 	# BEFORE Findings closes.

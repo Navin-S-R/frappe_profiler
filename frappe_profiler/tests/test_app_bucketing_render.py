@@ -29,8 +29,6 @@ def _fake_session_doc_with_findings(*findings_child_rows):
 	doc.total_python_ms = 100
 	doc.total_sql_ms = 500
 	doc.analyzer_warnings = None
-	doc.compared_to_session = None
-	doc.is_baseline = 0
 	doc.v5_aggregate_json = "{}"
 	doc.actions = []
 	doc.findings = list(findings_child_rows)
@@ -68,7 +66,7 @@ def test_single_app_renders_flat_without_wrapper():
 		_finding_row(title="A", callsite_filename="apps/myapp/a.py"),
 		_finding_row(title="B", callsite_filename="apps/myapp/b.py"),
 	)
-	html = renderer.render(doc, recordings=[], mode="safe")
+	html = renderer.render(doc, recordings=[])
 
 	# Findings present as cards.
 	assert ">A<" in html
@@ -96,7 +94,7 @@ def test_multiple_apps_each_in_own_bucket():
 			callsite_filename="apps/other_app/b.py",
 		),
 	)
-	html = renderer.render(doc, recordings=[], mode="safe")
+	html = renderer.render(doc, recordings=[])
 
 	# Both app names appear as bucket headers.
 	assert "myapp" in html
@@ -126,7 +124,7 @@ def test_app_bucket_header_shows_count_and_impact():
 		# Another app so we get the wrapper.
 		_finding_row(title="C", impact=5.0, callsite_filename="apps/other/c.py"),
 	)
-	html = renderer.render(doc, recordings=[], mode="safe")
+	html = renderer.render(doc, recordings=[])
 
 	# myapp bucket: 2 findings, ~30ms total.
 	assert "2 findings" in html, "Header must show plural count"
@@ -142,7 +140,7 @@ def test_singular_finding_header_uses_singular():
 		# Second app so we get the wrapper.
 		_finding_row(title="B", callsite_filename="apps/other/b.py"),
 	)
-	html = renderer.render(doc, recordings=[], mode="safe")
+	html = renderer.render(doc, recordings=[])
 
 	# Cosmetic: "1 finding" not "1 findings".
 	assert "1 finding " in html or "1 finding&middot;" in html or "1 finding\n" in html
@@ -169,7 +167,7 @@ def test_finding_without_callsite_goes_to_other_bucket():
 		_finding_row(title="UserFinding", callsite_filename="apps/myapp/x.py"),
 		row,
 	)
-	html = renderer.render(doc, recordings=[], mode="safe")
+	html = renderer.render(doc, recordings=[])
 
 	# "CPU saturated" is observational, so it's in Observations, not Findings.
 	# Test that the "Other" bucket exists in the Observations area.
@@ -197,7 +195,7 @@ def test_observations_also_bucketed_by_app():
 	)
 	doc = _fake_session_doc_with_findings(frappe_obs, erpnext_obs)
 
-	html = renderer.render(doc, recordings=[], mode="safe")
+	html = renderer.render(doc, recordings=[])
 
 	# Both framework observations present.
 	assert "Framework loop in frappe" in html
@@ -205,3 +203,115 @@ def test_observations_also_bucketed_by_app():
 	# Both app names appear as bucket headers within Observations.
 	assert "frappe" in html
 	assert "erpnext" in html
+
+
+# --------------------------------------------------------------------------
+# v0.6.x: "Ignored Apps" exclusion list — drop findings whose blame app is in
+# Profiler Settings ▸ Apps ▸ Ignored Apps, from BOTH the actionable section
+# and Observations. Surfaces a "(N hidden)" note on the report.
+# --------------------------------------------------------------------------
+
+from unittest.mock import patch  # noqa: E402
+
+
+def _three_apps_doc():
+	from frappe_profiler import renderer  # noqa: F401 — exercised via render
+	return _fake_session_doc_with_findings(
+		_finding_row(title="FrappeFinding", callsite_filename="frappe/model/document.py"),
+		_finding_row(title="ErpnextFinding", callsite_filename="apps/erpnext/erpnext/x.py"),
+		_finding_row(title="MyappFinding", callsite_filename="apps/myapp/myapp/foo.py"),
+	)
+
+
+class TestIgnoredAppsFilter:
+	def test_empty_ignored_apps_renders_all_findings(self):
+		from frappe_profiler import renderer
+
+		html = renderer.render(_three_apps_doc(), recordings=[])
+		assert "FrappeFinding" in html
+		assert "ErpnextFinding" in html
+		assert "MyappFinding" in html
+		# No "(N hidden)" note when nothing was filtered.
+		assert "hidden from ignored apps" not in html
+
+	def test_findings_in_ignored_apps_are_dropped_from_report(self):
+		from frappe_profiler import renderer
+
+		with patch("frappe_profiler.settings.get_ignored_apps",
+		           return_value=("frappe", "erpnext")):
+			html = renderer.render(_three_apps_doc(), recordings=[])
+
+		assert "FrappeFinding" not in html
+		assert "ErpnextFinding" not in html
+		assert "MyappFinding" in html  # myapp survives
+		# The "(N hidden)" note renders with the ignored app names (sorted).
+		assert "hidden from ignored apps" in html
+		assert "<code>erpnext</code>" in html and "<code>frappe</code>" in html
+
+	def test_singular_word_when_one_finding_hidden(self):
+		from frappe_profiler import renderer
+		import re
+
+		with patch("frappe_profiler.settings.get_ignored_apps",
+		           return_value=("erpnext",)):
+			html = renderer.render(_three_apps_doc(), recordings=[])
+
+		assert "ErpnextFinding" not in html
+		assert "FrappeFinding" in html and "MyappFinding" in html
+		# "1 finding hidden" — singular noun, not "1 findings".
+		assert re.search(r">\s*1\s*</strong>\s*finding\b", html)
+		assert "1 findings hidden" not in html
+
+	def test_unknown_app_in_ignored_list_drops_nothing(self):
+		# If an admin lists an app that doesn't appear in any finding,
+		# the filter is a no-op (and there's no spurious "(0 hidden)" note).
+		from frappe_profiler import renderer
+
+		with patch("frappe_profiler.settings.get_ignored_apps",
+		           return_value=("not_an_app_xyzq",)):
+			html = renderer.render(_three_apps_doc(), recordings=[])
+		assert "FrappeFinding" in html and "ErpnextFinding" in html and "MyappFinding" in html
+		assert "hidden from ignored apps" not in html
+
+	def test_findings_with_no_callsite_are_kept_regardless(self):
+		# Findings whose blame app is _OTHER_APP_LABEL ("Other (no callsite)")
+		# never match any real app name, so they survive any Ignored Apps list.
+		from frappe_profiler import renderer
+
+		uncallsite = types.SimpleNamespace()
+		uncallsite.finding_type = "N+1 Query"
+		uncallsite.severity = "Medium"
+		uncallsite.title = "NoCallsiteFinding"
+		uncallsite.customer_description = "desc"
+		uncallsite.affected_count = 1
+		uncallsite.action_ref = ""
+		uncallsite.estimated_impact_ms = 10
+		uncallsite.technical_detail_json = json.dumps({})
+		doc = _fake_session_doc_with_findings(uncallsite,
+			_finding_row(title="FrappeFinding", callsite_filename="frappe/handler.py"))
+
+		with patch("frappe_profiler.settings.get_ignored_apps",
+		           return_value=("frappe",)):
+			html = renderer.render(doc, recordings=[])
+
+		assert "FrappeFinding" not in html
+		assert "NoCallsiteFinding" in html  # no callsite → survives
+
+	def test_severity_counts_reflect_the_kept_set(self):
+		# The "Issues found" stat card sums to the kept count, not the total.
+		# Build 3 high-severity findings (one per app); ignore frappe+erpnext;
+		# the card should show "1" (myapp survives) — not "3".
+		from frappe_profiler import renderer
+		import re
+
+		doc = _fake_session_doc_with_findings(
+			_finding_row(title="F", severity="High", callsite_filename="frappe/x.py"),
+			_finding_row(title="E", severity="High", callsite_filename="apps/erpnext/erpnext/x.py"),
+			_finding_row(title="M", severity="High", callsite_filename="apps/myapp/myapp/x.py"),
+		)
+		with patch("frappe_profiler.settings.get_ignored_apps",
+		           return_value=("frappe", "erpnext")):
+			html = renderer.render(doc, recordings=[])
+		# Only "M" survives; the Issues-found stat card's value is "1".
+		assert ">1 high<" in html or "1 high" in html
+		assert "3 high" not in html

@@ -31,6 +31,7 @@ from frappe.recorder import (
 	RECORDER_REQUEST_SPARSE_HASH,
 	mark_duplicates,
 )
+from frappe.utils.scheduler import is_scheduler_disabled
 
 from frappe_profiler import renderer, session
 from frappe_profiler.analyzers import (
@@ -45,7 +46,7 @@ from frappe_profiler.analyzers import (
 	table_breakdown,
 	top_queries,
 )
-from frappe_profiler.analyzers.base import AnalyzeContext
+from frappe_profiler.analyzers.base import SEVERITY_ORDER, AnalyzeContext
 
 # v0.3.0: per-analyzer wall-clock budget. If the cumulative analyze
 # elapsed time crosses this threshold, remaining analyzers are skipped
@@ -56,6 +57,23 @@ ANALYZE_TOTAL_BUDGET_SECONDS = 20 * 60
 # Per-individual-analyzer soft cap: an analyzer that exceeds this is
 # logged as a warning but doesn't halt the pipeline.
 ANALYZE_PER_ANALYZER_SOFT_CAP_SECONDS = 60
+
+# v0.6.0: when Profiler Settings ▸ AI Fix Suggestions ▸ "Suggest AI fixes
+# by default" is on, the analyze pipeline calls the LLM for the top
+# findings. Cap the total wall time spent on those calls so a slow
+# provider can't push the analyze job past the RQ 25-min timeout.
+AI_AUTO_SUGGEST_TIME_BUDGET_SECONDS = 240
+
+# v0.6.0: same toggle also bakes an LLM-vetted index recommendation onto the
+# top N tables in the breakdown — capped tables + its own wall-time budget.
+AI_AUTO_INDEX_MAX_TABLES = 3
+AI_AUTO_INDEX_TIME_BUDGET_SECONDS = 90
+
+# Tighter budget for the same backfill done from api.regenerate_reports —
+# that runs synchronously inside a web request, so it must stay well under
+# the gunicorn worker timeout (~120s). Anything not done in this window is
+# left for a re-run of Regenerate Reports (or a full Retry Analyze).
+AI_BACKFILL_TIME_BUDGET_SECONDS = 60
 
 # v0.3.0: persistence size limits for call_tree_json on Profiler Action.
 CALL_TREE_OVERFLOW_THRESHOLD_BYTES = 200_000   # write to file above this
@@ -190,8 +208,125 @@ def _publish_session_event(
 		pass
 
 
-def run(session_uuid: str):
-	"""Background-job entry point. Called from api.stop() via frappe.enqueue."""
+# v0.6.0: hard ceiling on how long analyze waits for the flow's background
+# jobs, regardless of the configured `background_job_wait_seconds`.
+_MAX_BG_JOB_WAIT_SECONDS = 300
+# Throttle between re-enqueue cycles while waiting — keeps a wedged ("deferred"
+# forever) job from busy-looping our re-enqueues.
+_BG_WAIT_THROTTLE_SECONDS = 2.0
+
+
+def _rq_job_active(job_id: str) -> bool:
+	"""True if RQ job ``job_id`` is still queued / started / deferred /
+	scheduled. False if it's terminal (finished / failed / stopped /
+	canceled) or no longer fetchable (expired / deleted). Any error → not
+	active (don't make analyze block on it)."""
+	try:
+		from frappe.utils.background_jobs import get_redis_conn
+		from rq.job import Job
+
+		job = Job.fetch(job_id, connection=get_redis_conn())
+		return job.get_status(refresh=True) in ("queued", "started", "deferred", "scheduled")
+	except Exception:
+		return False
+
+
+def _bg_wait_for_pending_jobs(session_uuid: str, docname: str, deadline):
+	"""Make sure the background jobs the profiled flow enqueued have finished
+	before we gather recordings.
+
+	Returns:
+	  * ``None`` — there are still-running jobs and we re-enqueued
+	    ``analyze.run`` to yield the worker; the caller must ``return`` now.
+	  * ``0`` — nothing to wait for / all jobs finished / the wait is disabled
+	    or can't run (scheduler off → analyze is inline): proceed with analysis.
+	  * ``N > 0`` — the wait cap was hit with N jobs still running: proceed,
+	    but the caller should surface a warning.
+
+	Pure best-effort — any failure returns 0 (proceed). Re-enqueuing (rather
+	than sleeping the whole window) lets a single worker actually run those
+	jobs while we wait.
+	"""
+	try:
+		pending = session.get_pending_jobs(session_uuid)
+	except Exception:
+		return 0
+	if not pending:
+		return 0
+
+	try:
+		from frappe_profiler.settings import get_config
+
+		wait_seconds = int(getattr(get_config(), "background_job_wait_seconds", 0) or 0)
+	except Exception:
+		wait_seconds = 0
+	if wait_seconds <= 0:
+		return 0
+	wait_seconds = min(wait_seconds, _MAX_BG_JOB_WAIT_SECONDS)
+
+	# When the scheduler is disabled, analyze is running inline in a web
+	# request and there's no worker to run the pending jobs (or our
+	# re-enqueued self) — better to ship the report now than hang.
+	try:
+		if is_scheduler_disabled():
+			return 0
+	except Exception:
+		pass
+
+	if deadline is None:
+		deadline = time.time() + wait_seconds
+
+	# Prune finished / expired ids so the wait can end.
+	still_running: list[str] = []
+	for jid in pending:
+		if _rq_job_active(jid):
+			still_running.append(jid)
+		else:
+			try:
+				session.clear_pending_job(session_uuid, jid)
+			except Exception:
+				pass
+
+	if not still_running:
+		return 0  # everything finished — proceed
+	if time.time() >= deadline:
+		return len(still_running)  # cap hit — proceed; caller warns
+
+	# Keep the UI honest while we wait.
+	try:
+		frappe.db.set_value("Profiler Session", docname, "status", "Analyzing")
+		frappe.db.commit()
+	except Exception:
+		pass
+	_publish_progress(
+		2, f"Waiting for {len(still_running)} background job(s) to finish…", session_uuid
+	)
+
+	# Throttle, then re-enqueue ourselves so the worker can run the pending
+	# job(s) meanwhile.
+	time.sleep(min(_BG_WAIT_THROTTLE_SECONDS, max(0.0, deadline - time.time())))
+	if time.time() >= deadline:
+		return sum(1 for jid in still_running if _rq_job_active(jid))
+
+	try:
+		frappe.enqueue(
+			"frappe_profiler.analyze.run",
+			queue="long",
+			session_uuid=session_uuid,
+			_bg_wait_until=deadline,
+		)
+	except Exception:
+		frappe.log_error(title="frappe_profiler bg-job wait re-enqueue")
+		return 0  # couldn't re-enqueue — just proceed
+	return None
+
+
+def run(session_uuid: str, _bg_wait_until: float | None = None):
+	"""Background-job entry point. Called from api.stop() via frappe.enqueue.
+
+	``_bg_wait_until`` is set only when ``run`` re-enqueues itself while
+	waiting for the flow's background jobs to finish (see
+	``_bg_wait_for_pending_jobs``) — external callers never pass it."""
 	# Round 2 fix #6: mark this request-context as "analyzing" so our
 	# before_request / before_job hooks don't recursively activate the
 	# recorder on the DocType writes we're about to do. Without this,
@@ -208,8 +343,18 @@ def run(session_uuid: str):
 		return
 
 	analyze_start = time.monotonic()
+	bg_jobs_unfinished = 0
 
 	try:
+		# v0.6.0: wait for the background jobs the profiled flow enqueued to
+		# finish before gathering recordings — so jobs a worker picks up
+		# shortly after Stop aren't lost. Re-enqueues self (yielding the
+		# worker) between checks; no-op when nothing's pending / the wait is
+		# disabled / no async worker is available.
+		bg_jobs_unfinished = _bg_wait_for_pending_jobs(session_uuid, docname, _bg_wait_until)
+		if bg_jobs_unfinished is None:
+			return  # re-enqueued — this invocation is done
+
 		# Phase: Analyzing
 		frappe.db.set_value("Profiler Session", docname, "status", "Analyzing")
 		frappe.db.commit()
@@ -243,6 +388,15 @@ def run(session_uuid: str):
 
 		context = AnalyzeContext(session_uuid=session_uuid, docname=docname)
 		context.warnings.extend(enrichment_warnings)
+
+		# v0.6.0: if we hit the wait cap with jobs still running, say so.
+		if bg_jobs_unfinished:
+			context.warnings.append(
+				f"{bg_jobs_unfinished} background job(s) the flow enqueued were still "
+				"running when analysis started — they aren't included. Click Retry "
+				"Analyze once they finish, or raise 'Wait for Background Jobs' in "
+				"Profiler Settings."
+			)
 
 		# Surface any caps the session hit during recording
 		meta = session.get_session_meta(session_uuid) or {}
@@ -318,11 +472,46 @@ def run(session_uuid: str):
 		# How long did analyze take so far (before report rendering)?
 		analyze_elapsed_ms = (time.monotonic() - analyze_start) * 1000
 
+		# v0.6.0: attach ±1-line source snippets to each finding's callsite
+		# before persisting, so finding cards can show the offending line
+		# without requiring a per-render file read.
+		_enrich_findings_with_source_snippets(context.findings)
+
+		# v0.6.0: optionally bake LLM fix suggestions into the report
+		# (Profiler Settings ▸ AI Fix Suggestions ▸ "Suggest AI fixes by
+		# default"). Best-effort + time-budgeted — and double-wrapped here so
+		# even a bug in the AI path can NEVER fail the analyze. If the LLM
+		# was unavailable / errored, the session still completes; you can
+		# fill the suggestions in afterward via the "Generate AI fixes"
+		# button on the form (api.backfill_ai_fixes).
+		try:
+			_enrich_findings_with_ai_suggestions(context)
+		except Exception:
+			try:
+				context.warnings.append(
+					"AI auto-suggest was skipped after an unexpected error — "
+					"use 'Generate AI fixes' on the session form to fill them in. "
+					"(see error log)"
+				)
+				frappe.log_error(title="frappe_profiler ai auto-suggest (outer)")
+			except Exception:
+				pass
+
+		# v0.6.0: same toggle also bakes an LLM-vetted index recommendation
+		# onto the top few tables in the breakdown. Best-effort + double-wrapped.
+		try:
+			_enrich_table_breakdown_with_ai_suggestions(context, recordings)
+		except Exception:
+			try:
+				frappe.log_error(title="frappe_profiler ai index-suggest (outer)")
+			except Exception:
+				pass
+
 		_publish_progress(80, "Writing session data", session_uuid)
 		_persist(docname, context, recordings, analyze_elapsed_ms)
 
 		_publish_progress(90, "Rendering reports", session_uuid)
-		# Render and attach the safe + raw HTML reports to the DocType.
+		# Render and attach the HTML report to the DocType.
 		# IMPORTANT: this must run BEFORE _cleanup_redis, because raw mode
 		# reads raw SQL, headers, form_dict, and full stack traces from the
 		# in-memory recordings list (not from the DocType, which only has
@@ -765,9 +954,14 @@ def _persist(
 	# the notes field on the doc form between start and stop get their
 	# text left alone.
 	if not (doc.notes or "").strip():
-		auto_notes = _build_auto_notes_html(recordings)
-		if auto_notes:
-			doc.notes = auto_notes
+		# v0.6.0: when AI is enabled, draft a friendly human-readable flow
+		# (with the raw action list kept below); otherwise — or if the LLM
+		# call fails — fall back to the plain labelled list.
+		notes_html = _build_humanized_notes_html(
+			recordings, session_title=(doc.title or None)
+		) or _build_auto_notes_html(recordings)
+		if notes_html:
+			doc.notes = notes_html
 
 	doc.total_requests = total_requests
 	doc.total_queries = total_queries
@@ -775,7 +969,7 @@ def _persist(
 	doc.total_duration_ms = round(total_duration_ms, 2)
 	doc.analyze_duration_ms = round(analyze_elapsed_ms, 2)
 	doc.top_severity = _compute_top_severity(context.findings)
-	doc.summary_html = _build_summary_html(context, total_queries)
+	doc.summary_html = _build_summary_html(context, total_queries, recordings)
 	doc.top_queries_json = json.dumps(
 		context.aggregate.get("top_queries", []), default=str
 	)
@@ -916,6 +1110,500 @@ def _truncate_finding_titles(findings: list[dict]) -> None:
 			finding["title"] = title[:keep].rstrip() + _FINDING_TITLE_ELLIPSIS
 
 
+# v0.6.0: ±1-line source snippet attached to each finding's callsite so
+# the report's finding card can show the actual offending line without the
+# reader having to jump into the codebase. Truncate per-line so a single
+# multi-kilobyte minified string can't blow the technical_detail_json blob.
+_FINDING_SNIPPET_TRUNCATE_CHARS = 200
+
+
+def _enrich_findings_with_source_snippets(findings: list[dict]) -> None:
+	"""Mutate findings in-place: attach a ±1-line source snippet to each
+	finding whose technical_detail.callsite resolves to a readable file.
+
+	Best-effort: missing files, decoding errors, out-of-range linenos,
+	and malformed technical_detail_json all yield no snippet (and no
+	warning). The renderer just skips the snippet block when absent.
+
+	Files are cached per-call so a session with 30 N+1 findings clustered
+	in a handful of source files reads each file once.
+	"""
+	file_cache: dict[str, list[str] | None] = {}
+
+	for finding in findings:
+		raw = finding.get("technical_detail_json")
+		if not raw:
+			continue
+		try:
+			detail = json.loads(raw)
+		except Exception:
+			continue
+		callsite = detail.get("callsite") or {}
+		if not callsite.get("filename"):
+			# call_tree (Slow Hot Path / Hook Bottleneck / Repeated Hot Frame)
+			# and line_profile (Hot Line) store the location at the top level —
+			# synthesize a callsite dict so the snippet lands where
+			# renderer._finding_to_dict expects it (and stop _finding_to_dict
+			# from having to re-synthesize at render time).
+			fname = detail.get("filename") or detail.get("file")
+			if fname and detail.get("lineno") is not None:
+				callsite = {
+					"filename": fname,
+					"lineno": detail.get("lineno"),
+					"function": detail.get("function") or "",
+				}
+				detail["callsite"] = callsite
+				finding["technical_detail_json"] = json.dumps(detail, default=str)
+		filename = callsite.get("filename")
+		try:
+			lineno = int(callsite.get("lineno"))
+		except (TypeError, ValueError):
+			continue
+		if not filename or lineno <= 0 or callsite.get("source_snippet"):
+			continue
+		# renderer._read_source_snippet resolves app-relative callsite paths
+		# (e.g. "ugly_code/python/common.py") to real files; a bare open()
+		# would fail because the worker cwd is <bench>/sites.
+		snippet = renderer._read_source_snippet(filename, lineno, cache=file_cache)
+		if not snippet:
+			continue
+		callsite["source_snippet"] = snippet
+		detail["callsite"] = callsite
+		finding["technical_detail_json"] = json.dumps(detail, default=str)
+
+
+def _enrich_findings_with_ai_suggestions(context) -> None:
+	"""Mutate ``context.findings`` in place: when Profiler Settings has
+	``ai_enabled`` AND ``ai_auto_suggest``, ask the configured LLM for a
+	fix for the top ``ai_auto_suggest_max`` eligible findings (0 = all),
+	highest-severity / highest-impact first, and store the result on each
+	finding's ``llm_fix_json`` so it shows up in the report (and is what
+	the on-demand "Suggest a fix (AI)" button returns from cache).
+
+	Best-effort + bounded: a misconfigured / unreachable provider, an
+	individual finding that errors, or hitting ``AI_AUTO_SUGGEST_TIME_
+	BUDGET_SECONDS`` just means fewer (or no) suggestions — never a failed
+	analyze. The network I/O lives here in the orchestrator, never in an
+	analyzer (the pure-analyzer contract is untouched).
+	"""
+	findings = context.findings or []
+	if not findings:
+		return
+
+	try:
+		from frappe_profiler.settings import get_config
+		cfg = get_config()
+	except Exception:
+		return
+	if not (getattr(cfg, "ai_enabled", False) and getattr(cfg, "ai_suggest_findings", True)
+	        and getattr(cfg, "ai_auto_suggest", False)):
+		return
+
+	from frappe_profiler import ai_fix
+
+	if not ai_fix.is_available(section="findings"):
+		context.warnings.append(
+			"AI auto-suggest is on but the AI provider isn't fully configured — "
+			"no suggestions were generated (see Profiler Settings ▸ AI Fix Suggestions)."
+		)
+		return
+
+	eligible = [
+		f for f in findings
+		if (f.get("finding_type") or "") in ai_fix.AI_ELIGIBLE_FINDING_TYPES
+	]
+	if not eligible:
+		return
+	eligible.sort(key=lambda f: (
+		SEVERITY_ORDER.get(f.get("severity") or "Low", 3),
+		-(f.get("estimated_impact_ms") or 0),
+	))
+	cap = int(getattr(cfg, "ai_auto_suggest_max", 0) or 0)
+	if cap > 0:
+		eligible = eligible[:cap]
+
+	from types import SimpleNamespace
+
+	file_cache: dict = {}
+	phase2_index = _phase2_index_for(getattr(context, "docname", None))
+	started = time.monotonic()
+	failures = 0
+	skipped_for_time = 0
+	total = len(eligible)
+	for idx, f in enumerate(eligible):
+		if time.monotonic() - started > AI_AUTO_SUGGEST_TIME_BUDGET_SECONDS:
+			skipped_for_time = total - idx
+			break
+		# Live progress per finding — the floating widget / form headline
+		# show movement during the (potentially minute-long) LLM round
+		# trips instead of a frozen "Analyzing 78%". Range 78→80 leads into
+		# the next milestone ("Writing session data").
+		try:
+			_publish_progress(
+				78 + (idx / total) * 2.0,
+				f"Asking the AI for fix suggestions ({idx + 1}/{total})…",
+				context.session_uuid,
+			)
+		except Exception:
+			pass
+		try:
+			ns = SimpleNamespace(
+				finding_type=f.get("finding_type") or "",
+				severity=f.get("severity") or "Low",
+				title=f.get("title") or "",
+				customer_description=f.get("customer_description") or "",
+				estimated_impact_ms=f.get("estimated_impact_ms") or 0,
+				affected_count=f.get("affected_count") or 0,
+				action_ref=f.get("action_ref") or "",
+				technical_detail_json=f.get("technical_detail_json") or "{}",
+				llm_fix_json=None,
+			)
+			result = ai_fix.suggest_fix(_ai_payload_for_finding(ns, file_cache, phase2_index=phase2_index))
+			f["llm_fix_json"] = json.dumps(result, default=str)
+		except Exception:
+			failures += 1
+			try:
+				frappe.log_error(title="frappe_profiler ai auto-suggest")
+			except Exception:
+				pass
+
+	if failures:
+		context.warnings.append(
+			f"AI auto-suggest: {failures} finding(s) couldn't get a suggestion "
+			"(provider error / timeout — see error log)."
+		)
+	if skipped_for_time:
+		context.warnings.append(
+			f"AI auto-suggest: {skipped_for_time} finding(s) skipped — hit the "
+			f"{AI_AUTO_SUGGEST_TIME_BUDGET_SECONDS}s budget for AI suggestions."
+		)
+
+
+def _ai_payload_for_finding(child, file_cache: dict, *, phase2_index: dict | None = None) -> dict:
+	"""Build the dict ``ai_fix.suggest_fix`` expects from a finding-like
+	object — a ``Profiler Finding`` child row, or a ``SimpleNamespace``
+	shaped like one (``finding_type`` / ``severity`` / ``title`` /
+	``customer_description`` / ``estimated_impact_ms`` / ``affected_count`` /
+	``action_ref`` / ``technical_detail_json`` / ``llm_fix_json``). It's the
+	renderer's normalized finding dict plus a wider source-code window around
+	the callsite, plus — when a Phase-2 line-profile pass instrumented this
+	finding's function — the hottest line from it (number / content / ms /
+	hits). ``phase2_index`` is a ``renderer._build_phase2_callsite_index``
+	result, ``{(basename, function): hotline}``."""
+	from frappe_profiler import ai_fix
+
+	payload = renderer._finding_to_dict(child, file_cache=file_cache)
+	callsite = (payload.get("technical_detail") or {}).get("callsite") or {}
+	if callsite.get("filename") and callsite.get("lineno") is not None:
+		try:
+			window = renderer._read_source_window(
+				callsite["filename"], callsite["lineno"],
+				before=ai_fix._SOURCE_LINES_BEFORE, after=ai_fix._SOURCE_LINES_AFTER,
+				cache=file_cache,
+			)
+		except Exception:
+			window = None
+		if window:
+			payload["source_window"] = window
+
+	fn = (callsite.get("function") or "").strip()
+	fname = (callsite.get("filename") or "").strip()
+	if phase2_index and fn and fname:
+		base = fname.replace("\\", "/").rsplit("/", 1)[-1]
+		hot = phase2_index.get((base, fn))
+		if isinstance(hot, dict) and hot.get("lineno") is not None:
+			payload["phase2_hotline"] = {
+				"lineno": hot.get("lineno"),
+				"content": hot.get("content") or "",
+				"total_ms": hot.get("total_ms") or 0,
+				"hits": hot.get("hits") or 0,
+			}
+	return payload
+
+
+def _phase2_index_for(doc_or_docname) -> dict:
+	"""``renderer._build_phase2_callsite_index`` for a session doc / docname,
+	or ``{}`` on any error (no phase-2 runs yet, doc gone, etc.)."""
+	try:
+		doc = doc_or_docname
+		if isinstance(doc, str):
+			doc = frappe.get_doc("Profiler Session", doc)
+		return renderer._build_phase2_callsite_index(doc) or {}
+	except Exception:
+		return {}
+
+
+def _run_ai_backfill(doc, *, cap: int | None = None,
+                     time_budget: float = AI_BACKFILL_TIME_BUDGET_SECONDS,
+                     regenerate_all: bool = False) -> dict:
+	"""Generate AI fix suggestions for eligible findings on a persisted
+	Profiler Session ``doc``, persist them (``frappe.db.set_value`` + update
+	the in-memory rows so a subsequent ``_render_and_attach_reports``
+	re-fetch sees them), and report counts.
+
+	By default this only touches eligible findings that DON'T have a
+	suggestion yet — the "fill the gaps" case (``api.backfill_ai_fixes``,
+	the auto-suggest backfill, the analyze pipeline). With
+	``regenerate_all=True`` it (re)generates the suggestion for EVERY
+	eligible finding, overwriting existing ones — the "re-evaluate the whole
+	report" case (e.g. after changing the AI model/prompt). On a failure
+	mid-re-eval the OLD suggestion is left in place (we only write on
+	success), so there's no data loss.
+
+	The CALLER decides whether to invoke this — the analyze pipeline / plain
+	``regenerate_reports`` only do so when Profiler Settings has
+	``ai_auto_suggest`` on (via ``_backfill_ai_suggestions``); the explicit
+	"Generate AI fixes" / "Re-evaluate AI fixes" buttons call it whenever the
+	provider is configured (via ``api.backfill_ai_fixes``). Requires
+	``ai_fix.is_available()`` — returns all-zeros if not.
+
+	``cap``: max findings to do this run. ``None`` → use Profiler Settings'
+	``ai_auto_suggest_max``; ``0`` → no cap (do as many as fit in
+	``time_budget``). Best-effort + time-budgeted (the callers run inside a
+	web request, so this must stay well under the gunicorn worker timeout) —
+	a provider error on one finding doesn't stop the rest.
+
+	Returns ``{"added": int, "failed": int, "skipped_time": int,
+	"total_pending": int}`` — ``total_pending`` is the number of findings
+	this run targeted (before the cap): the missing ones, or — with
+	``regenerate_all`` — all eligible ones.
+	"""
+	out = {"added": 0, "failed": 0, "skipped_time": 0, "total_pending": 0}
+
+	from frappe_profiler import ai_fix
+
+	if not ai_fix.is_available(section="findings"):
+		return out
+
+	rows = list(getattr(doc, "findings", None) or [])
+	chosen = [
+		r for r in rows
+		if (getattr(r, "finding_type", "") or "") in ai_fix.AI_ELIGIBLE_FINDING_TYPES
+		and (regenerate_all or not ((getattr(r, "llm_fix_json", None) or "").strip()))
+	]
+	out["total_pending"] = len(chosen)
+	if not chosen:
+		return out
+	chosen.sort(key=lambda r: (
+		SEVERITY_ORDER.get(getattr(r, "severity", None) or "Low", 3),
+		-(getattr(r, "estimated_impact_ms", 0) or 0),
+	))
+	if cap is None:
+		try:
+			from frappe_profiler.settings import get_config
+			cap = int(getattr(get_config(), "ai_auto_suggest_max", 0) or 0)
+		except Exception:
+			cap = 0
+	if cap and cap > 0:
+		chosen = chosen[:cap]
+
+	file_cache: dict = {}
+	phase2_index = _phase2_index_for(doc)
+	started = time.monotonic()
+	for idx, r in enumerate(chosen):
+		if time.monotonic() - started > time_budget:
+			out["skipped_time"] = len(chosen) - idx
+			break
+		try:
+			result = ai_fix.suggest_fix(_ai_payload_for_finding(r, file_cache, phase2_index=phase2_index))
+			blob = json.dumps(result, default=str)
+			frappe.db.set_value("Profiler Finding", r.name, "llm_fix_json", blob)
+			r.llm_fix_json = blob
+			out["added"] += 1
+		except Exception:
+			out["failed"] += 1
+			try:
+				frappe.log_error(title="frappe_profiler ai backfill")
+			except Exception:
+				pass
+	if out["added"]:
+		try:
+			frappe.db.commit()
+		except Exception:
+			pass
+	return out
+
+
+def _backfill_ai_suggestions(doc) -> bool:
+	"""Auto-suggest-gated AI backfill: run ``_run_ai_backfill`` only when
+	Profiler Settings has ``ai_enabled`` AND ``ai_auto_suggest``. Used by
+	``analyze.run`` (to retry any auto-suggested finding that errored before
+	persistence) and by ``api.regenerate_reports`` (so flipping the
+	"Suggest AI fixes by default" switch and re-rendering an existing
+	session backfills it). Returns True if any suggestion was added.
+
+	The explicit "Generate AI fixes" button bypasses this gate — it calls
+	``_run_ai_backfill`` directly via ``api.backfill_ai_fixes``, so it works
+	even when ``ai_auto_suggest`` is off.
+	"""
+	try:
+		from frappe_profiler.settings import get_config
+		cfg = get_config()
+	except Exception:
+		return False
+	if not (getattr(cfg, "ai_enabled", False) and getattr(cfg, "ai_suggest_findings", True)
+	        and getattr(cfg, "ai_auto_suggest", False)):
+		return False
+	return _run_ai_backfill(doc)["added"] > 0
+
+
+# ---------------------------------------------------------------------------
+# v0.6.0: LLM-vetted per-table index recommendation. Auto (gated by the
+# "Suggest AI fixes by default" toggle, for the top N tables that have a
+# heuristic recommendation) and on-demand (the "Suggest an index (AI)" button
+# → api.suggest_index). The result is stashed on the table's breakdown entry
+# as ``ai_index = {suggestion, model, provider, generated_at}`` — the renderer
+# turns the markdown into safe HTML. Network I/O lives here in the
+# orchestrator / the API endpoint, never in an analyzer.
+# ---------------------------------------------------------------------------
+
+
+def _table_index_sample_queries(recordings: list[dict], table: str, limit: int = 4) -> list[str]:
+	"""A few distinct normalized SELECT queries from the session that touched
+	``table`` — best context for the LLM's index advice. Best-effort."""
+	out: list[str] = []
+	seen: set[str] = set()
+	for recording in recordings or []:
+		for call in recording.get("calls") or []:
+			q = (call.get("normalized_query") or call.get("query") or "").strip()
+			if not q or q in seen:
+				continue
+			try:
+				meta = table_breakdown._parse_query(q)
+			except Exception:
+				continue
+			if meta.get("verb") == "SELECT" and table in (meta.get("tables") or []):
+				seen.add(q)
+				out.append(q)
+				if len(out) >= limit:
+					return out
+	return out
+
+
+def _table_existing_indexes(table: str) -> list[dict]:
+	"""``SHOW INDEX FROM `table`` → ``[{name, columns:[...by seq], unique}]``.
+	Best-effort: returns ``[]`` if the table doesn't exist / on any error."""
+	try:
+		rows = frappe.db.sql(f"SHOW INDEX FROM `{table}`", as_dict=True) or []
+	except Exception:
+		return []
+	by_name: dict[str, dict] = {}
+	for r in rows:
+		name = r.get("Key_name")
+		if not name:
+			continue
+		entry = by_name.setdefault(name, {"name": name, "_cols": [], "unique": not r.get("Non_unique")})
+		entry["_cols"].append((int(r.get("Seq_in_index") or 0), r.get("Column_name")))
+	out = []
+	for e in by_name.values():
+		cols = [c for _seq, c in sorted(e["_cols"]) if c]
+		out.append({"name": e["name"], "columns": cols, "unique": bool(e["unique"])})
+	return out
+
+
+def _ai_payload_for_table(t_entry: dict, recordings: list[dict]) -> dict:
+	"""Build the dict ``ai_fix.suggest_index`` expects from a breakdown entry."""
+	table = t_entry.get("table") or ""
+	rec = t_entry.get("recommended_index") or {}
+	return {
+		"table": table,
+		"doctype": rec.get("doctype") or (table[3:] if table.lower().startswith("tab") else ""),
+		"read_count": t_entry.get("read_count") or 0,
+		"write_count": t_entry.get("write_count") or 0,
+		"is_write_hot": bool(t_entry.get("is_write_hot")),
+		"recommended_index": rec,
+		"candidates": t_entry.get("index_candidates") or [],
+		"framework_cols_filtered": t_entry.get("framework_cols_filtered") or [],
+		"existing_indexes": _table_existing_indexes(table),
+		"sample_queries": _table_index_sample_queries(recordings, table),
+	}
+
+
+def _enrich_table_breakdown_with_ai_suggestions(context, recordings: list[dict]) -> None:
+	"""When Profiler Settings has ``ai_enabled`` AND ``ai_auto_suggest``, ask
+	the LLM for an index recommendation on the top ``AI_AUTO_INDEX_MAX_TABLES``
+	tables that have a heuristic ``recommended_index``, and stash it on the
+	breakdown entry's ``ai_index``. Best-effort + time-budgeted — failures /
+	a slow provider just mean fewer (or no) AI blocks, never a failed analyze."""
+	breakdown = (context.aggregate or {}).get("table_breakdown") or []
+	eligible = [t for t in breakdown if isinstance(t, dict) and t.get("recommended_index")]
+	if not eligible:
+		return
+	try:
+		from frappe_profiler.settings import get_config
+		cfg = get_config()
+	except Exception:
+		return
+	if not (getattr(cfg, "ai_enabled", False) and getattr(cfg, "ai_suggest_indexes", True)
+	        and getattr(cfg, "ai_auto_suggest", False)):
+		return
+	from frappe_profiler import ai_fix
+	if not ai_fix.is_available(section="indexes"):
+		return  # the findings auto-suggest step already warned about this
+
+	eligible = eligible[:AI_AUTO_INDEX_MAX_TABLES]
+	started = time.monotonic()
+	total = len(eligible)
+	for idx, t in enumerate(eligible):
+		if time.monotonic() - started > AI_AUTO_INDEX_TIME_BUDGET_SECONDS:
+			break
+		try:
+			_publish_progress(
+				79 + (idx / total) * 1.0,
+				f"Asking the AI to review index candidates ({idx + 1}/{total})…",
+				context.session_uuid,
+			)
+		except Exception:
+			pass
+		try:
+			t["ai_index"] = ai_fix.suggest_index(_ai_payload_for_table(t, recordings))
+		except Exception:
+			try:
+				frappe.log_error(title="frappe_profiler ai index-suggest")
+			except Exception:
+				pass
+
+
+def _run_table_index_ai_backfill(doc, *, table_name: str) -> dict:
+	"""Generate (or regenerate) the LLM index recommendation for one table on
+	a persisted Profiler Session ``doc`` and write it into
+	``table_breakdown_json``. Ungated (the "Suggest an index (AI)" button asks
+	for it explicitly) — but ``ai_fix.suggest_index`` still needs a configured
+	provider. Returns ``{"ok": bool, "table": str, "reason"?: str}``; lets
+	``ai_fix.AiFixError`` propagate (the API turns it into ``frappe.throw``)."""
+	if not table_name:
+		return {"ok": False, "reason": "no table specified"}
+	from frappe_profiler import ai_fix
+	if not ai_fix.is_available(section="indexes"):
+		return {"ok": False, "table": table_name, "reason": "AI index recommendations not available"}
+	try:
+		breakdown = json.loads(doc.table_breakdown_json or "[]")
+	except Exception:
+		breakdown = []
+	t_entry = next((t for t in breakdown if isinstance(t, dict) and t.get("table") == table_name), None)
+	if t_entry is None:
+		return {"ok": False, "table": table_name, "reason": "table not in the breakdown"}
+	if not t_entry.get("recommended_index"):
+		return {"ok": False, "table": table_name, "reason": "no index candidate for this table"}
+
+	recording_uuids = [
+		a.recording_uuid for a in (doc.actions or []) if getattr(a, "recording_uuid", None)
+	]
+	try:
+		recordings = list(_fetch_recordings(recording_uuids))
+	except Exception:
+		recordings = []
+
+	result = ai_fix.suggest_index(_ai_payload_for_table(t_entry, recordings))
+	t_entry["ai_index"] = result
+	frappe.db.set_value(
+		"Profiler Session", doc.name, "table_breakdown_json",
+		json.dumps(breakdown, default=str),
+	)
+	frappe.db.commit()
+	return {"ok": True, "table": table_name}
+
+
 # v0.5.1: auto-generated "Steps to Reproduce" from captured actions. The
 # dialog no longer asks the user to type notes at start time because (a) it
 # added friction to the one-click "start profiling" flow, and (b) the user
@@ -992,60 +1680,38 @@ def _is_reproducer_noise(rec: dict) -> bool:
 	return False
 
 
-def _build_auto_notes_html(recordings: list[dict]) -> str:
-	"""Render recorded actions as an ordered HTML list for the `notes` field.
+def _recordings_for_reproducer(recordings: list[dict]) -> list[dict]:
+	"""The signal (non-noise) recordings, in order. Shared by the raw
+	auto-notes list and the AI humanizer — see ``_is_reproducer_noise``."""
+	return [r for r in (recordings or []) if not _is_reproducer_noise(r)]
 
-	Each list item is ``<label> — <duration> ms``, where ``label`` comes
-	from ``per_action._label`` (the same humanization the report's action
-	table uses, so "Save Sales Invoice" beats "POST /api/method/…"). HTML-
-	escaped before wrapping so a cmd/path containing <, >, or & can't
-	corrupt the emitted markup.
 
-	Returns an empty string when there are no recordings so the caller
-	can skip writing ``doc.notes`` entirely (leaves the Text Editor
-	field in its default empty state rather than filling it with an
-	empty <ol>).
+def _build_auto_notes_list_html(recordings: list[dict]) -> str:
+	"""The ordered-list body of the "Steps to Reproduce" note (no preamble) —
+	``<ol><li><label> — <ms></li>…</ol>`` plus a "N background requests
+	filtered" footer. Returns "" when there are no signal recordings.
+
+	Labels come from ``per_action.humanized_label`` (English: "Create Sales
+	Invoice", "Submit Delivery Note"); HTML-escaped before wrapping so a
+	cmd/path with <, >, or & can't corrupt the markup.
 	"""
 	if not recordings:
 		return ""
-
-	# v0.5.1: filter Desk polling / static-asset noise before labeling.
-	# See _REPRODUCER_NOISE_* for the full rationale. Preserves the
-	# ORIGINAL total count in the "and N more" overflow so the user
-	# can tell the session had more traffic than the reproducer shows.
-	signal_recordings = [r for r in recordings if not _is_reproducer_noise(r)]
-	total_in_session = len(recordings)
-
+	signal_recordings = _recordings_for_reproducer(recordings)
 	if not signal_recordings:
-		# Session consisted entirely of noise (polling only, no user
-		# actions). Return empty string so the caller leaves notes
-		# blank rather than filling it with an empty list.
 		return ""
 
 	items: list[str] = []
 	for rec in signal_recordings[:_AUTO_NOTES_MAX_ENTRIES]:
-		# v0.5.1: humanized_label is Steps-to-Reproduce ONLY — reads
-		# like English ("Create Sales Invoice", "Submit Delivery
-		# Note"). The per-action table and frontend XHR panel
-		# continue to show the technical label via per_action._label
-		# (raw cmd or METHOD+path) per user feedback:
-		#   "only humanize call name in step to reproduce only not
-		#    on other breakdowns."
 		label = per_action.humanized_label(rec) or "(unnamed action)"
 		duration_ms = round(rec.get("duration") or 0, 1)
-		escaped = html.escape(label)
-		items.append(f"<li>{escaped} — {duration_ms:g} ms</li>")
+		items.append(f"<li>{html.escape(label)} — {duration_ms:g} ms</li>")
 
 	overflow = len(signal_recordings) - _AUTO_NOTES_MAX_ENTRIES
 	if overflow > 0:
-		items.append(
-			f"<li><em>… and {overflow} more action(s) not shown.</em></li>"
-		)
+		items.append(f"<li><em>… and {overflow} more action(s) not shown.</em></li>")
 
-	# Surface when the session had more traffic overall but noise was
-	# filtered — so the user doesn't wonder why only 3 entries showed
-	# up from a 70-request session.
-	noise_count = total_in_session - len(signal_recordings)
+	noise_count = len(recordings) - len(signal_recordings)
 	footer = ""
 	if noise_count > 0:
 		footer = (
@@ -1054,10 +1720,102 @@ def _build_auto_notes_html(recordings: list[dict]) -> str:
 			"out (permission checks, form-metadata loads, static assets)."
 			"</p>"
 		)
+	return "<ol>" + "".join(items) + "</ol>" + footer
 
-	return (
-		_AUTO_NOTES_PREAMBLE + "<ol>" + "".join(items) + "</ol>" + footer
-	)
+
+def _build_auto_notes_html(recordings: list[dict]) -> str:
+	"""Auto-generated "Steps to Reproduce" — preamble + the raw labelled
+	action list. The fallback when AI humanizing is off or fails. Returns ""
+	when there's nothing to list (no recordings, or all noise) so the caller
+	leaves ``doc.notes`` in its default empty state."""
+	body = _build_auto_notes_list_html(recordings)
+	if not body:
+		return ""
+	return _AUTO_NOTES_PREAMBLE + body
+
+
+# v0.6.0: LLM-humanized "Steps to Reproduce" — just the friendly narrative.
+# (The raw labelled action list isn't appended; the per-action breakdown in
+# the report already shows every action with its technical label + timing.)
+_HUMANIZED_NOTES_PREAMBLE = (
+	"<p><em>Steps to Reproduce — drafted by AI from the captured actions. "
+	"Edit to add business context (what you were trying to accomplish, any "
+	"steps taken before recording started, expected vs. actual behavior).</em></p>"
+)
+
+
+def _actions_for_humanizer(recordings: list[dict]) -> list[dict]:
+	"""Compact per-action dicts (label / cmd / path / method / doctype /
+	duration_ms) for ``ai_fix.humanize_steps`` — noise-filtered and capped
+	the same way the raw auto-notes list is."""
+	out: list[dict] = []
+	for rec in _recordings_for_reproducer(recordings)[:_AUTO_NOTES_MAX_ENTRIES]:
+		fd = rec.get("form_dict") or {}
+		doctype = ""
+		if isinstance(fd, dict):
+			doctype = (fd.get("doctype") or fd.get("dt") or fd.get("doc_type") or "").strip()
+			if not doctype:
+				# savedocs embeds the doctype in a `doc` JSON blob; client.*
+				# uses `doc` / `dt`. Reuse per_action's extractors.
+				try:
+					doctype = (per_action._extract_doc_info(fd)[0] or "").strip()
+				except Exception:
+					doctype = ""
+				if not doctype:
+					try:
+						doctype = (per_action._extract_doctype(fd) or "").strip()
+					except Exception:
+						doctype = ""
+		out.append({
+			"label": per_action.humanized_label(rec) or "",
+			"cmd": (rec.get("cmd") or "").strip(),
+			"path": (rec.get("path") or "").strip(),
+			"method": (rec.get("method") or "").strip(),
+			"doctype": doctype,
+			"duration_ms": round(rec.get("duration") or 0, 1),
+		})
+	return out
+
+
+def _assemble_humanized_notes(steps_markdown: str) -> str:
+	"""The HTML stored in ``doc.notes`` for an AI-humanized "Steps to
+	Reproduce": the preamble + the LLM's Markdown steps, rendered + sanitized.
+	No raw captured-actions appendix — the per-action breakdown in the report
+	already lists every action with its technical label and timing."""
+	return _HUMANIZED_NOTES_PREAMBLE + renderer._markdown_to_safe_html(steps_markdown)
+
+
+def _build_humanized_notes_html(
+	recordings: list[dict], *, session_title: str | None = None
+) -> str:
+	"""LLM-humanized "Steps to Reproduce" HTML, or "" when AI isn't
+	enabled/available, there's nothing to summarise, or the LLM call fails
+	(the caller then falls back to ``_build_auto_notes_html``). Best-effort —
+	never raises."""
+	try:
+		from frappe_profiler.settings import get_config
+		cfg = get_config()
+	except Exception:
+		return ""
+	if not (getattr(cfg, "ai_enabled", False) and getattr(cfg, "ai_humanize_steps", True)):
+		return ""
+	from frappe_profiler import ai_fix
+	if not ai_fix.is_available(section="humanize"):
+		return ""
+	actions = _actions_for_humanizer(recordings)
+	if not actions:
+		return ""
+	try:
+		steps_md = ai_fix.humanize_steps(actions, session_title=session_title)
+	except Exception:
+		try:
+			frappe.log_error(title="frappe_profiler humanize_steps")
+		except Exception:
+			pass
+		return ""
+	if not (steps_md or "").strip():
+		return ""
+	return _assemble_humanized_notes(steps_md)
 
 
 def _compute_top_severity(findings: list[dict]) -> str:
@@ -1075,8 +1833,38 @@ def _compute_top_severity(findings: list[dict]) -> str:
 	return "None"
 
 
-def _build_summary_html(context: AnalyzeContext, total_queries: int) -> str:
-	"""Plain-language customer summary, generated from the analyzer findings."""
+_PRIORITY_WORD = {"High": "high", "Medium": "medium", "Low": "low"}
+
+
+def _humanize_action_label(action: dict, recordings: list[dict]) -> str:
+	"""Plain-English label for an action ("Submit Sales Invoice" rather than
+	"frappe.desk.form.save.savedocs:Submit"). Looks up the recording by uuid
+	and runs it through ``per_action.humanized_label``; falls back to the raw
+	``action_label`` when the recording isn't to hand (TTL'd out, etc.)."""
+	raw = str(action.get("action_label") or "?")
+	uid = action.get("recording_uuid")
+	if uid:
+		rec = next((r for r in recordings if r.get("uuid") == uid), None)
+		if rec:
+			try:
+				h = per_action.humanized_label(rec)
+				if h and h not in ("?", ""):
+					return h
+			except Exception:
+				pass
+	return raw
+
+
+def _build_summary_html(
+	context: AnalyzeContext, total_queries: int, recordings: list[dict] | None = None
+) -> str:
+	"""Plain-language customer summary, generated from the analyzer findings.
+
+	Written for a non-developer: "operations" not "actions", humanized action
+	names not raw cmds, "high priority" not "high-severity", and a finding's
+	raw ``cmd:action`` reference swapped for the humanized form.
+	"""
+	recordings = recordings or []
 	n_actions = len(context.actions)
 	findings = context.findings
 	high = sum(1 for f in findings if f.get("severity") == "High")
@@ -1084,27 +1872,48 @@ def _build_summary_html(context: AnalyzeContext, total_queries: int) -> str:
 	low = sum(1 for f in findings if f.get("severity") == "Low")
 
 	parts = [
-		f"<p>We recorded <strong>{n_actions} actions</strong> with "
-		f"<strong>{total_queries} database queries</strong> in this session.</p>"
+		f"<p>This session covered <strong>{n_actions} operation"
+		f"{'s' if n_actions != 1 else ''}</strong> (page loads, saves and "
+		f"background jobs) with <strong>{total_queries} database "
+		f"quer{'ies' if total_queries != 1 else 'y'}</strong>.</p>"
 	]
 
 	if context.actions:
-		# Pair the slowest action with its highest-impact finding (if any)
-		# so the customer immediately sees "X was slow because of Y".
 		slowest_idx = max(
 			range(len(context.actions)),
 			key=lambda i: context.actions[i].get("duration_ms", 0),
 		)
 		slowest = context.actions[slowest_idx]
-		slowest_label = html.escape(str(slowest.get("action_label") or "?"))
 		slowest_ms = slowest.get("duration_ms", 0)
+		slowest_label = _humanize_action_label(slowest, recordings)
+		slowest_label_esc = html.escape(slowest_label)
 
-		# Two-step lookup (Round 2 fix #16):
-		#   1. Prefer a finding tied to this specific action (via action_ref)
-		#   2. If none, fall back to the highest-impact finding overall
-		#      with a "affecting multiple actions" caveat. This handles
-		#      session-wide findings (Missing Index, etc.) that don't
-		#      attribute to a single action.
+		# raw cmd / "Job: x" label  ->  plain-English label, for every action,
+		# so finding titles that reference an action read cleanly too.
+		label_map = {
+			str(a.get("action_label") or ""): _humanize_action_label(a, recordings)
+			for a in context.actions if a.get("action_label")
+		}
+
+		def _finding_phrase(f: dict) -> str:
+			"""Finding title with any raw action references swapped for plain
+			labels (and a leading "In <slowest>, " trimmed since the sentence
+			already names it), + a plain-language impact/priority parenthetical."""
+			title = (f.get("title") or "").strip()
+			for raw, human in label_map.items():
+				if raw and human and raw != human:
+					title = title.replace(raw, human)
+			prefix = f"In {slowest_label}, "
+			if title.startswith(prefix):
+				title = title[len(prefix):]
+			pri = _PRIORITY_WORD.get(f.get("severity") or "", "")
+			impact = f.get("estimated_impact_ms") or 0
+			tail = f" (~{impact:.0f}ms" + (f" — {pri} priority" if pri else "") + ")"
+			return f"<strong>{html.escape(title)}</strong>{tail}"
+
+		# Prefer a finding tied to this specific action (via action_ref);
+		# else the highest-impact finding overall (session-wide ones like a
+		# missing index don't attribute to one action).
 		tied_finding = None
 		for f in findings:
 			ref = f.get("action_ref")
@@ -1113,66 +1922,60 @@ def _build_summary_html(context: AnalyzeContext, total_queries: int) -> str:
 					tied_finding.get("estimated_impact_ms") or 0
 				):
 					tied_finding = f
-
-		overall_finding = None
-		if findings:
-			overall_finding = max(
-				findings, key=lambda f: f.get("estimated_impact_ms") or 0
-			)
+		overall_finding = max(
+			findings, key=lambda f: f.get("estimated_impact_ms") or 0
+		) if findings else None
 
 		if tied_finding:
 			parts.append(
-				f"<p>The slowest action was <strong>{slowest_label}</strong> "
-				f"at {slowest_ms:.0f}ms. The biggest contributor we found was "
-				f"<strong>{html.escape(tied_finding.get('title') or '')}</strong> "
-				f"({tied_finding.get('severity', '?')} severity, ~"
-				f"{tied_finding.get('estimated_impact_ms', 0):.0f}ms). "
-				"See the Findings section below for what to ask your developer to fix.</p>"
+				f"<p>The slowest one was <strong>{slowest_label_esc}</strong> at "
+				f"{slowest_ms:.0f}ms — and most of its time went into "
+				f"{_finding_phrase(tied_finding)}. See the Findings section below "
+				"for what to ask your developer to fix.</p>"
 			)
 		elif overall_finding:
 			parts.append(
-				f"<p>The slowest action was <strong>{slowest_label}</strong> "
-				f"at {slowest_ms:.0f}ms. The highest-impact issue in this session "
-				f"(affecting multiple actions) was "
-				f"<strong>{html.escape(overall_finding.get('title') or '')}</strong> "
-				f"({overall_finding.get('severity', '?')} severity, ~"
-				f"{overall_finding.get('estimated_impact_ms', 0):.0f}ms total). "
+				f"<p>The slowest one was <strong>{slowest_label_esc}</strong> at "
+				f"{slowest_ms:.0f}ms. The biggest issue this session "
+				f"(it affects several operations) was {_finding_phrase(overall_finding)}. "
 				"See the Findings section below.</p>"
 			)
 		else:
 			parts.append(
-				f"<p>The slowest action was "
-				f"<strong>{slowest_label}</strong> at {slowest_ms:.0f}ms.</p>"
+				f"<p>The slowest one was <strong>{slowest_label_esc}</strong> at "
+				f"{slowest_ms:.0f}ms.</p>"
 			)
 
 	if not findings:
 		parts.append(
-			"<p>We analyzed your flow for: "
+			"<p>We checked your flow for the usual culprits — "
 			"<strong>repeated queries (N+1 patterns)</strong>, "
 			"<strong>full table scans</strong>, "
 			"<strong>filesort operations</strong>, "
 			"<strong>temporary table creation</strong>, "
 			"<strong>low filter ratios</strong>, "
 			"<strong>missing indexes</strong>, and "
-			"<strong>individually slow queries</strong> (&gt;200ms). "
-			"Nothing significant was found.</p>"
+			"<strong>individually slow queries</strong> (&gt;200ms) — "
+			"and nothing significant turned up.</p>"
 			"<p>Either your flow is already well-optimized, or the data "
 			"volume is too small to surface bottlenecks at this scale. "
 			"Try running the profiler again with a larger dataset for "
 			"more insight.</p>"
 		)
 	else:
-		severity_parts = []
+		total_issues = high + medium + low
+		bits = []
 		if high:
-			severity_parts.append(f"<strong>{high} high-severity</strong>")
+			bits.append(f"<strong>{high} high priority</strong>")
 		if medium:
-			severity_parts.append(f"{medium} medium-severity")
+			bits.append(f"{medium} medium")
 		if low:
-			severity_parts.append(f"{low} low-severity")
-		joined = ", ".join(severity_parts) if severity_parts else "no"
+			bits.append(f"{low} minor")
+		breakdown = (" — " + ", ".join(bits)) if bits else ""
 		parts.append(
-			f"<p>We identified {joined} performance issues — see the Findings "
-			"section below for details and what to ask your developer to fix.</p>"
+			f"<p>We found <strong>{total_issues} potential issue"
+			f"{'s' if total_issues != 1 else ''}</strong>{breakdown}. See the "
+			"Findings section below for the ones to ask your developer to fix first.</p>"
 		)
 
 	return "\n".join(parts)
@@ -1193,35 +1996,22 @@ def _finalize_with_empty_session(docname: str) -> None:
 
 
 def _render_and_attach_reports(docname: str, recordings: list[dict]) -> None:
-	"""Render the safe and raw HTML reports and attach both to the DocType.
+	"""Render the HTML report and attach it to the DocType.
 
-	Both files are stored as PRIVATE attachments on the Profiler Session.
-	Frappe enforces "user must have read permission on attached_to_doctype"
-	for private files — combined with the `if_owner=1` permission rule on
-	Profiler Session for the Profiler User role, this means non-admin
+	Stored as a PRIVATE attachment on the Profiler Session. Frappe
+	enforces "user must have read permission on attached_to_doctype"
+	for private files — combined with the ``if_owner=1`` permission
+	rule on Profiler Session for the Profiler User role and the
+	additional gate in ``permissions.file_has_permission``, non-admin
 	users can only download reports for their own sessions.
-
-	The Phase 5 UI will additionally hide the "Download Raw" button from
-	users without System Manager role.
 	"""
 	# Re-fetch the doc so child rows persisted by _persist are visible.
 	doc = frappe.get_doc("Profiler Session", docname)
 
-	# Render both modes. Safe doesn't strictly need recordings (only reads
-	# from the doc) but we pass them anyway for symmetry.
-	try:
-		safe_html = renderer.render_safe(doc, recordings)
-		safe_url = _save_report_file(
-			docname=docname,
-			filename=f"profiler_safe_report_{doc.session_uuid}.html",
-			attached_to_field="safe_report_file",
-			content=safe_html,
-		)
-		if safe_url:
-			frappe.db.set_value("Profiler Session", docname, "safe_report_file", safe_url)
-	except Exception:
-		frappe.log_error(title="frappe_profiler render safe report")
-
+	# v0.6.0 Round 7: safe-mode reporting removed. Single admin-scoped
+	# raw report only — see product_thesis_self_hosted.md memory for
+	# the rationale (PII redaction was a moat the user opted to drop in
+	# favor of single-rendering-path simplicity).
 	try:
 		raw_html = renderer.render_raw(doc, recordings)
 		raw_url = _save_report_file(

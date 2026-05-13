@@ -43,8 +43,6 @@ def _fake_session_doc(analyzer_warnings=None):
 	doc.total_python_ms = 0
 	doc.total_sql_ms = 0
 	doc.analyzer_warnings = analyzer_warnings
-	doc.compared_to_session = None
-	doc.is_baseline = 0
 	doc.v5_aggregate_json = "{}"
 	doc.actions = []
 	doc.findings = []
@@ -67,7 +65,7 @@ class TestTruncationBannerRenders:
 			"and re-run the session."
 		)
 		doc = _fake_session_doc(analyzer_warnings=warning)
-		html = renderer.render(doc, recordings=[], mode="safe")
+		html = renderer.render(doc, recordings=[])
 
 		# Banner CSS class must be present.
 		assert 'class="truncation-banner"' in html, (
@@ -102,7 +100,7 @@ class TestTruncationBannerRenders:
 		row.technical_detail_json = json.dumps({})
 		doc.findings = [row]
 
-		html = renderer.render(doc, recordings=[], mode="safe")
+		html = renderer.render(doc, recordings=[])
 		banner_idx = html.find('class="truncation-banner"')
 		exec_idx = html.find('class="exec-summary')
 		assert banner_idx > 0
@@ -116,29 +114,30 @@ class TestTruncationBannerRenders:
 		"""No warning → no banner. Sanity."""
 		from frappe_profiler import renderer
 		doc = _fake_session_doc(analyzer_warnings=None)
-		html = renderer.render(doc, recordings=[], mode="safe")
+		html = renderer.render(doc, recordings=[])
 		assert 'class="truncation-banner"' not in html
 
 	def test_banner_absent_when_warnings_are_not_truncation(self):
 		"""Other analyzer warnings (framework-filter, alias-suppression,
 		etc.) must NOT trigger the truncation banner — it's specifically
-		for the TRUNCATED marker."""
+		for the TRUNCATED marker. (The 'Analyzer notes' section that used
+		to list these was removed, so the warning isn't rendered at all.)"""
 		from frappe_profiler import renderer
 		warning = (
 			"Suppressed SQL findings from 41 call(s) whose callsite was "
 			"inside Frappe framework code."
 		)
 		doc = _fake_session_doc(analyzer_warnings=warning)
-		html = renderer.render(doc, recordings=[], mode="safe")
-		# Warning is in Analyzer Notes...
-		assert "Suppressed SQL findings" in html
-		# ...but NOT in the red banner.
+		html = renderer.render(doc, recordings=[])
 		assert 'class="truncation-banner"' not in html
+		# Non-truncation warnings have no home in the report anymore.
+		assert "Suppressed SQL findings" not in html
 
-	def test_banner_coexists_with_other_warnings(self):
-		"""A session with BOTH truncation AND other warnings must
-		render the banner for the truncation line AND list everything
-		in Analyzer Notes."""
+	def test_banner_picks_out_the_truncation_line_among_mixed_warnings(self):
+		"""A session with BOTH a truncation line AND other analyzer
+		warnings: the banner renders for the truncation line; the other
+		(non-truncation) warnings aren't surfaced anywhere (the 'Analyzer
+		notes' section that used to list them was removed)."""
 		from frappe_profiler import renderer
 		warnings = "\n".join([
 			"⚠ TRUNCATED: 200 queries (10% of the flow) exceeded ...",
@@ -146,13 +145,13 @@ class TestTruncationBannerRenders:
 			"Skipped 30 non-SELECT statements.",
 		])
 		doc = _fake_session_doc(analyzer_warnings=warnings)
-		html = renderer.render(doc, recordings=[], mode="safe")
-		# Banner present.
+		html = renderer.render(doc, recordings=[])
+		# Banner present, with the truncation line's text.
 		assert 'class="truncation-banner"' in html
-		# All three warnings in the bottom Analyzer Notes list.
 		assert "200 queries" in html
-		assert "5 findings from framework" in html
-		assert "30 non-SELECT" in html
+		# The non-truncation lines are gone.
+		assert "5 findings from framework" not in html
+		assert "30 non-SELECT" not in html
 
 
 class TestSettingsDocTypeField:

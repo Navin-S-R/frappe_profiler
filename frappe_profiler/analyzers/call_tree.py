@@ -669,11 +669,38 @@ def _soft_cap_recursive(node: dict, max_nodes: int, state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_HOT_PATH_PCT = 0.25
+# v0.6.0 Round 6: previously-hardcoded thresholds for Slow Hot Path /
+# Hook Bottleneck. The "Medium qualifying" pair (PCT + MS) is now read
+# from Profiler Settings; the "High severity" pair stays as a multiplier
+# of the Medium pair so a single configured threshold drives both.
+DEFAULT_HOT_PATH_PCT = 0.25  # fallback when settings unreachable
 DEFAULT_HOT_PATH_MS = 200
-DEFAULT_HOT_PATH_HIGH_PCT = 0.50
-DEFAULT_HOT_PATH_HIGH_MS = 500
+HOT_PATH_HIGH_PCT_MULTIPLIER = 2.0     # 0.50 / 0.25 — preserves legacy ratio
+HOT_PATH_HIGH_MS_MULTIPLIER = 2.5      # 500 / 200
 SQL_DOMINANCE_SUPPRESSION_PCT = 0.80
+
+
+def _resolve_hot_path_thresholds() -> tuple[float, float, float, float]:
+	"""Return (med_pct, med_ms, high_pct, high_ms). Reads Profiler
+	Settings via the cached config. Falls back to legacy constants
+	when settings are unreachable (pure-test path)."""
+	try:
+		from frappe_profiler.settings import get_config
+		cfg = get_config()
+		# Settings store the percentage as a 0-100 number for UX; the
+		# analyzer compares against fractional. Divide by 100 here so
+		# downstream comparisons stay as-is.
+		med_pct = float(cfg.slow_hot_path_pct_threshold or 25.0) / 100.0
+		med_ms = float(cfg.slow_hot_path_min_ms or DEFAULT_HOT_PATH_MS)
+	except Exception:
+		med_pct = DEFAULT_HOT_PATH_PCT
+		med_ms = float(DEFAULT_HOT_PATH_MS)
+	return (
+		med_pct,
+		med_ms,
+		med_pct * HOT_PATH_HIGH_PCT_MULTIPLIER,
+		med_ms * HOT_PATH_HIGH_MS_MULTIPLIER,
+	)
 
 
 def _largest_sql_child(node: dict):
@@ -793,14 +820,18 @@ def _walk_for_findings(
 	cumulative = node.get("cumulative_ms", 0)
 	pct_of_action = cumulative / action_wall_time_ms if action_wall_time_ms else 0
 
+	# v0.6.0 Round 6: thresholds now read from Profiler Settings (via a
+	# cached resolver) instead of being module constants.
+	med_pct, med_ms, high_pct, high_ms = _resolve_hot_path_thresholds()
+
 	# Qualifies as a hot subtree?
 	# Skip framework frames (frappe.* / frappe_profiler.*) so we descend
 	# through them and emit the finding on the user-code or hook frame
 	# inside. Without this, Document.run_method itself would qualify and
 	# we'd emit a generic Slow Hot Path on it instead of the actual hook.
 	qualifies = (
-		pct_of_action >= DEFAULT_HOT_PATH_PCT
-		and cumulative >= DEFAULT_HOT_PATH_MS
+		pct_of_action >= med_pct
+		and cumulative >= med_ms
 		and node.get("kind") == "python"
 		and not (node.get("function") or "").startswith("[")  # skip [other] / [omitted]
 		and node.get("function") != "<root>"
@@ -821,8 +852,8 @@ def _walk_for_findings(
 				for p in parent_chain
 			)
 			severity = (
-				"High" if (pct_of_action >= DEFAULT_HOT_PATH_HIGH_PCT
-				           and cumulative >= DEFAULT_HOT_PATH_HIGH_MS)
+				"High" if (pct_of_action >= high_pct
+				           and cumulative >= high_ms)
 				else "Medium"
 			)
 			pct_str = f"{pct_of_action * 100:.0f}%"

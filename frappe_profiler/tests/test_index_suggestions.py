@@ -891,29 +891,30 @@ def test_typeerror_from_optimizer_is_also_a_soft_skip(monkeypatch, empty_context
 
 
 def test_modified_column_is_never_suggested(monkeypatch, empty_context):
-	"""v0.5.1: 'modified' is a Frappe lifecycle column — updated on
-	every save. Indexing it causes write amplification that outweighs
-	any read-side gain. Must never be suggested, even when the
-	DBOptimizer heuristic points at it. Exact production case:
-	'Add index on tabDocType(modified)' — user feedback: 'Modified
-	fields can't be indexed as it would affect the system performance.'
+	"""'modified' is a Frappe metadata column — updated on every save.
+	Indexing it causes write amplification that outweighs any read-side
+	gain. Must never be suggested, even when the DBOptimizer heuristic
+	points at it. (Origin: a production report surfaced 'Add index on
+	tabDocType(modified)' — user feedback: 'Modified fields can't be
+	indexed as it would affect the system performance.' We use a non-meta
+	table here so it's the *column* blacklist being exercised, not the
+	separate meta-table rule that also covers tabDocType.)
 
 	Each query is slow enough (50 ms) to clear the per-query-savings
-	floor; the only thing that should suppress this is the lifecycle
-	blacklist.
+	floor; the only thing that should suppress this is the column blacklist.
 	"""
 
 	def fake_optimize(query):
-		return _FakeDBIndex("tabDocType", "modified")
+		return _FakeDBIndex("tabSales Invoice", "modified")
 
 	_install_fake_recorder_module(monkeypatch, fake_optimize)
 	_install_fake_frappe_db(
 		monkeypatch,
-		indexed_columns_by_table={"tabDocType": {"name", "module"}},
+		indexed_columns_by_table={"tabSales Invoice": {"name", "customer"}},
 		column_types_by_table={
-			"tabDocType": {
+			"tabSales Invoice": {
 				"name": "varchar",
-				"module": "varchar",
+				"customer": "varchar",
 				"modified": "datetime",
 			},
 		},
@@ -925,8 +926,8 @@ def test_modified_column_is_never_suggested(monkeypatch, empty_context):
 		"event_type": "HTTP Request", "duration": 500,
 		"calls": [
 			{
-				"query": "SELECT * FROM tabDocType ORDER BY modified DESC LIMIT 20",
-				"normalized_query": "SELECT * FROM tabDocType ORDER BY modified DESC LIMIT ?",
+				"query": "SELECT * FROM `tabSales Invoice` ORDER BY modified DESC LIMIT 20",
+				"normalized_query": "SELECT * FROM `tabSales Invoice` ORDER BY modified DESC LIMIT ?",
 				"duration": 50.0,  # well above per-query floor
 				"stack": [],
 			}
@@ -935,20 +936,20 @@ def test_modified_column_is_never_suggested(monkeypatch, empty_context):
 	result = index_suggestions.analyze([recording], empty_context)
 	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
 	assert missing == [], (
-		"Suggestion on tabDocType.modified must be suppressed — "
-		f"modified is a Frappe lifecycle column. Got: {missing}"
+		"Suggestion on tabSales Invoice.modified must be suppressed — "
+		f"modified is a Frappe metadata column. Got: {missing}"
 	)
 
-	# The warning must explicitly name the blacklist reason and
-	# include the table.column for user verification.
+	# The warning must explicitly name the blacklist reason and include
+	# the table.column for user verification.
 	blacklist_warnings = [
 		w for w in result.warnings
-		if "lifecycle column" in w or "every save" in w
+		if "metadata column" in w or "every save" in w
 	]
 	assert len(blacklist_warnings) == 1, (
 		f"Expected blacklist warning; got warnings={result.warnings}"
 	)
-	assert "tabDocType.modified" in blacklist_warnings[0], (
+	assert "tabSales Invoice.modified" in blacklist_warnings[0], (
 		f"Warning must name the suppressed column; got: {blacklist_warnings[0]}"
 	)
 
@@ -1033,16 +1034,23 @@ def test_never_suggest_skips_schema_lookup(monkeypatch, empty_context):
 		)
 
 
-def test_creation_and_owner_still_analyzed_normally(monkeypatch, empty_context):
-	"""The blacklist is narrow — ``creation`` and ``owner`` are NOT
-	in it. Those columns are set on INSERT and immutable thereafter,
-	so indexing them doesn't cause write amplification. If the
-	optimizer suggests them they go through the normal
-	classify_column → actionable / already_indexed flow."""
+def test_frappe_metadata_columns_are_never_suggested(monkeypatch, empty_context):
+	"""v0.6.0: the blacklist now covers the WHOLE Frappe standard-metadata
+	column set — `creation`, `owner`, `idx`, `parent`, `docstatus`, … —
+	not just the per-save-mutated `modified`/`modified_by`. Even though
+	`creation`/`owner` are insert-only (no write amplification), surfacing
+	them nudges developers toward a class of change they should make
+	deliberately; the EXPLAIN row stays in the report for that. The
+	optimizer's suggestion is dropped and a single "metadata columns"
+	warning names the suppressed table.column pairs."""
 
 	def fake_optimize(query):
 		if "creation" in query:
 			return _FakeDBIndex("tabSomething", "creation")
+		if "idx" in query:
+			return _FakeDBIndex("tabSomething", "idx")
+		if "docstatus" in query:
+			return _FakeDBIndex("tabSomething", "docstatus")
 		return _FakeDBIndex("tabSomething", "owner")
 
 	_install_fake_recorder_module(monkeypatch, fake_optimize)
@@ -1051,71 +1059,111 @@ def test_creation_and_owner_still_analyzed_normally(monkeypatch, empty_context):
 		indexed_columns_by_table={"tabSomething": {"name"}},
 		column_types_by_table={
 			"tabSomething": {
-				"name": "varchar",
-				"creation": "datetime",
-				"owner": "varchar",
+				"name": "varchar", "creation": "datetime", "owner": "varchar",
+				"idx": "int", "docstatus": "int",
 			},
 		},
 	)
 
+	def _calls(nq):
+		return [{"query": nq, "normalized_query": nq, "duration": 50.0, "stack": []}] * 10
+
 	recording = {
-		"uuid": "ix_creation_owner",
+		"uuid": "ix_metadata_cols",
 		"path": "/", "cmd": None, "method": "GET",
 		"event_type": "HTTP Request", "duration": 500,
-		"calls": [
-			{
-				"query": "SELECT * FROM tabSomething WHERE creation > '2024-01-01'",
-				"normalized_query": "SELECT * FROM tabSomething WHERE creation > ?",
-				"duration": 50.0,
-				"stack": [],
-			}
-		] * 10 + [
-			{
-				"query": "SELECT * FROM tabSomething WHERE owner = 'x'",
-				"normalized_query": "SELECT * FROM tabSomething WHERE owner = ?",
-				"duration": 50.0,
-				"stack": [],
-			}
-		] * 10,
+		"calls": (
+			_calls("SELECT * FROM tabSomething WHERE creation > ?")
+			+ _calls("SELECT * FROM tabSomething WHERE owner = ?")
+			+ _calls("SELECT * FROM tabSomething ORDER BY idx ASC")
+			+ _calls("SELECT * FROM tabSomething WHERE docstatus = ?")
+		),
 	}
 	result = index_suggestions.analyze([recording], empty_context)
 	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
-	# Both creation and owner go through normal path and are emitted
-	# as actionable suggestions — not the blacklist warning.
-	titles = [f["title"] for f in missing]
-	assert any("creation" in t for t in titles), (
-		f"creation should NOT be blacklisted; got findings: {titles}"
+	assert missing == [], (
+		f"Suggestions on Frappe metadata columns must be suppressed; got: {missing}"
 	)
-	assert any("owner" in t for t in titles), (
-		f"owner should NOT be blacklisted; got findings: {titles}"
-	)
+	# One "metadata columns" warning naming the suppressed columns.
+	meta_warnings = [w for w in result.warnings if "metadata column" in w]
+	assert len(meta_warnings) == 1, f"Expected a metadata-columns warning; got {result.warnings}"
+	for col in ("creation", "owner", "idx", "docstatus"):
+		assert f"tabSomething.{col}" in meta_warnings[0]
+
+
+def test_frappe_meta_tables_are_never_suggested(monkeypatch, empty_context):
+	"""v0.6.0: no index suggestion is emitted on a Frappe framework "meta"
+	table (tabDocType / tabCustom Field / tabSingles / …) — `bench migrate`
+	owns those tables' schema, so a hand-added index is pointless. The
+	suggestion is dropped before it's even bucketed (no schema lookup), and
+	a single warning names the tables."""
+
+	def fake_optimize(query):
+		if "tabDocType" in query:
+			return _FakeDBIndex("tabDocType", "module")
+		if "tabCustom Field" in query:
+			return _FakeDBIndex("tabCustom Field", "dt")
+		return _FakeDBIndex("tabSingles", "doctype")
+
+	_install_fake_recorder_module(monkeypatch, fake_optimize)
+	# A fake DB so a stray classify lookup would be visible (it must NOT
+	# happen — the meta-table check runs before classify).
+	import frappe
+	sql_calls: list[str] = []
+
+	class FakeDB:
+		def sql(self, query, params=None, as_dict=False):
+			sql_calls.append(query)
+			return []
+
+	monkeypatch.setattr(frappe, "db", FakeDB(), raising=False)
+	monkeypatch.setattr(frappe, "log_error", lambda *a, **k: None, raising=False)
+
+	def _calls(nq):
+		return [{"query": nq, "normalized_query": nq, "duration": 50.0, "stack": []}] * 10
+
+	recording = {
+		"uuid": "ix_meta_tables",
+		"path": "/", "cmd": None, "method": "GET",
+		"event_type": "HTTP Request", "duration": 500,
+		"calls": (
+			_calls("SELECT * FROM `tabDocType` WHERE module = ?")
+			+ _calls("SELECT * FROM `tabCustom Field` WHERE dt = ?")
+			+ _calls("SELECT value FROM `tabSingles` WHERE doctype = ?")
+		),
+	}
+	result = index_suggestions.analyze([recording], empty_context)
+	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
+	assert missing == [], f"Suggestions on Frappe meta tables must be suppressed; got: {missing}"
+	# No schema lookup should have run for the dropped (meta-table) suggestions.
+	for s in sql_calls:
+		assert "SHOW INDEX" not in s and "information_schema" not in s
+	# One "framework meta tables" warning naming the tables.
+	mt_warnings = [w for w in result.warnings if "framework meta table" in w]
+	assert len(mt_warnings) == 1, f"Expected a meta-tables warning; got {result.warnings}"
+	for tbl in ("tabDocType", "tabCustom Field", "tabSingles"):
+		assert tbl in mt_warnings[0]
 
 
 def test_low_per_query_savings_suggestion_is_suppressed(monkeypatch, empty_context):
-	"""Exact production payload: tabDocType.modified flagged with
-	892ms cumulative across 1526 queries = 0.58ms per query, below
-	the 2ms per-query floor. Must suppress the finding entirely and
-	surface a soft warning explaining why."""
+	"""A business-column suggestion with 892ms cumulative across 1526
+	queries = 0.58ms/query, below the 2ms per-query floor. Must suppress
+	the finding entirely and surface a soft warning explaining why.
+	(Non-meta table + non-metadata column so it's the per-query *floor*
+	being exercised, not the meta-table or column blacklists.)"""
 
 	def fake_optimize(query: str):
-		return _FakeDBIndex("tabDocType", "modified")
+		return _FakeDBIndex("tabSales Invoice", "customer")
 
 	_install_fake_recorder_module(monkeypatch, fake_optimize)
 
-	# Build 1526 identical queries averaging 892/1526 = 0.585ms each.
-	# Use a single recording to keep the test fast; the analyzer
-	# aggregates by normalized_query which is unique per call here
-	# (we need distinct normalized_queries to count as 1526 separate
-	# optimizer invocations). Actually the analyzer deduplicates by
-	# normalized_query at the input layer, so use ONE normalized
-	# query and set its `duration` high and `count` high directly.
-	# Easier: feed 1526 raw calls with the same normalized_query;
-	# the analyzer folds them into one bucket with count=1526 and
-	# duration=892ms before running the optimizer.
+	# Feed 1526 raw calls with the same normalized_query; the analyzer
+	# folds them into one bucket (count=1526, duration=892ms) before
+	# running the optimizer once.
 	calls = [
 		{
-			"query": f"SELECT * FROM `tabDocType` ORDER BY modified DESC LIMIT {i}",
-			"normalized_query": "SELECT * FROM `tabDocType` ORDER BY modified DESC LIMIT ?",
+			"query": f"SELECT * FROM `tabSales Invoice` WHERE customer = 'c{i}'",
+			"normalized_query": "SELECT * FROM `tabSales Invoice` WHERE customer = ?",
 			"duration": 892.0 / 1526,  # ~0.585ms per query
 			"stack": [],
 		}
@@ -1130,7 +1178,8 @@ def test_low_per_query_savings_suggestion_is_suppressed(monkeypatch, empty_conte
 
 	result = index_suggestions.analyze([recording], empty_context)
 
-	# No Missing Index finding for tabDocType.modified despite 892ms cumulative.
+	# No Missing Index finding despite 892ms cumulative — per-query savings
+	# are below the floor.
 	missing = [f for f in result.findings if f["finding_type"] == "Missing Index"]
 	assert missing == [], (
 		"A suggestion with 0.58ms average savings per query must be "
@@ -1151,7 +1200,7 @@ def test_low_per_query_skips_classify_lookup(monkeypatch, empty_context):
 	suggestions we're going to drop anyway."""
 
 	def fake_optimize(query):
-		return _FakeDBIndex("tabDocType", "modified")
+		return _FakeDBIndex("tabSales Invoice", "customer")
 
 	_install_fake_recorder_module(monkeypatch, fake_optimize)
 
@@ -1169,7 +1218,7 @@ def test_low_per_query_skips_classify_lookup(monkeypatch, empty_context):
 	calls = [
 		{
 			"query": f"SELECT ... {i}",
-			"normalized_query": "SELECT ? FROM `tabDocType`",
+			"normalized_query": "SELECT ? FROM `tabSales Invoice`",
 			"duration": 0.5,  # way below 2ms floor
 			"stack": [],
 		}
@@ -1295,3 +1344,22 @@ def test_get_query_type_helper_direct():
 	assert _get_query_type(None) == ""
 	assert _get_query_type("   ") == ""
 	assert _get_query_type("/* only comment */") == ""
+
+
+def test_classify_column_blacklists_every_frappe_metadata_column():
+	"""v0.6.0: `_classify_column` returns `never_suggest` for every column in
+	the Frappe standard-metadata set — checked before any DB lookup, so it
+	works in a no-site test env."""
+	from frappe_profiler.analyzers.base import FRAPPE_METADATA_COLUMNS
+	from frappe_profiler.analyzers.index_suggestions import _classify_column
+
+	for col in FRAPPE_METADATA_COLUMNS:
+		status, reason = _classify_column("tabFoo", col, {}, {})
+		assert status == "never_suggest", f"{col!r} should be never_suggest, got {status}"
+		assert "framework column" in reason
+	# Case-insensitive.
+	assert _classify_column("tabFoo", "Creation", {}, {})[0] == "never_suggest"
+	assert _classify_column("tabFoo", "  MODIFIED ", {}, {})[0] == "never_suggest"
+	# A business column is NOT blacklisted — in a no-DB env it falls through
+	# to the legacy "unknown" path (plain DDL kept, not suppressed).
+	assert _classify_column("tabFoo", "customer", {}, {})[0] == "unknown"
