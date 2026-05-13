@@ -63,7 +63,7 @@ def test_should_skip_frappe_profiler_status_poll():
 def test_should_skip_all_frappe_profiler_api_methods():
 	"""Any `frappe_profiler.api.*` whitelisted method is instrumentation
 	noise. Covers start, stop, status, submit_frontend_metrics,
-	retry_analyze, analyze_fetch, pin_baseline, download_pdf — all of
+	retry_analyze, analyze_fetch, regenerate_reports, download_pdf — all of
 	them match the prefix."""
 	from frappe_profiler.hooks_callbacks import _should_skip_request
 
@@ -74,7 +74,7 @@ def test_should_skip_all_frappe_profiler_api_methods():
 		"frappe_profiler.api.submit_frontend_metrics",
 		"frappe_profiler.api.retry_analyze",
 		"frappe_profiler.api.analyze_fetch",
-		"frappe_profiler.api.pin_baseline",
+		"frappe_profiler.api.regenerate_reports",
 		"frappe_profiler.api.download_pdf",
 	):
 		_set_fake_local(cmd=cmd)

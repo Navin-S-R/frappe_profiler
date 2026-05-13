@@ -21,7 +21,12 @@ import json
 import re
 from collections import Counter, defaultdict
 
-from frappe_profiler.analyzers.base import SEVERITY_ORDER, AnalyzerResult
+from frappe_profiler.analyzers.base import (
+	FRAPPE_METADATA_COLUMNS,
+	SEVERITY_ORDER,
+	AnalyzerResult,
+	is_frappe_meta_table,
+)
 
 
 def _scrub_literals(text: str) -> str:
@@ -152,34 +157,29 @@ _PREFIX_REQUIRED_TYPES = frozenset({
 	"blob", "tinyblob", "mediumblob", "longblob",
 })
 
-# v0.5.1: Frappe lifecycle columns that must NEVER be suggested for
-# indexing, even when the DBOptimizer heuristic thinks they'd help a
-# query. These columns are updated on EVERY save — so every INSERT
-# and UPDATE has to also maintain the index. On any non-trivially-
-# written table the write amplification dwarfs the read-side gain,
-# and the standard advice from Frappe maintainers is: don't index them.
+# v0.5.1 → v0.6.0: never suggest indexing any of Frappe's standard
+# metadata columns, even when the DBOptimizer heuristic thinks one would
+# help a query. The optimizer only sees read patterns (``ORDER BY modified
+# DESC`` looks like it wants an index) — it can't see the write cost.
 #
-# The optimizer only sees read patterns (``ORDER BY modified DESC``
-# looks like it wants an index). It can't see the write cost. We
-# encode that knowledge here.
+# These columns are updated on every save (`modified`, `modified_by`,
+# `idx`), on insert (`creation`, `owner`), on submit/cancel (`docstatus`),
+# or are already auto-indexed (`name` is the PK; `parent` is auto-indexed
+# on child tables). On any non-trivially-written table the maintenance cost
+# of an index there dwarfs the read-side gain — and even where the per-
+# insert cost would equal any other index, surfacing these nudges the
+# developer toward a class of change they should make deliberately, not on
+# a tool's say-so. The query's EXPLAIN row is still in the report if
+# someone wants to make that call themselves.
 #
-# A real production report (v0.5.1) surfaced
-# ``Add index on tabDocType(modified)`` as a suggestion, and the user
-# corrected with the rule: "Modified fields can't be indexed as it
-# would affect the system performance."
+# (Origin: a production report surfaced ``Add index on tabDocType(modified)``
+# and the user corrected with "Modified fields can't be indexed as it would
+# affect the system performance" — then later asked us to extend the rule to
+# `idx`, `parent`, `parentfield`, `parenttype`, `creation`, etc.)
 #
-# Not included:
-#   - ``creation`` / ``owner``: set on INSERT, immutable thereafter.
-#     Indexing these is fine — no write amplification. If the optimizer
-#     suggests them they're usually still low-leverage and the per-
-#     query savings floor filters them out.
-#   - ``docstatus``: updated on submit/cancel (not every save), but
-#     low cardinality (0/1/2) — indexing standalone is pointless for
-#     different reasons, not write amplification.
-_NEVER_SUGGEST_COLUMNS = frozenset({
-	"modified",
-	"modified_by",
-})
+# Mirrors ``frappe_profiler.analyzers.base.FRAPPE_METADATA_COLUMNS``
+# (which mirrors ``frappe.model.default_fields`` + ``optional_fields``).
+_NEVER_SUGGEST_COLUMNS = FRAPPE_METADATA_COLUMNS
 
 
 def _get_indexed_columns(table: str) -> set[str]:
@@ -261,26 +261,28 @@ def _classify_column(
 	  - ``"unindexable"``  — column is JSON / geometry or doesn't exist
 	                         on the table; drop the suggestion, second
 	                         element explains
-	  - ``"never_suggest"`` — column is a Frappe lifecycle column
-	                         (``modified``, ``modified_by``) updated on
-	                         every save; indexing causes write
-	                         amplification that outweighs read gains
+	  - ``"never_suggest"`` — column is one of Frappe's standard metadata
+	                         columns (``modified``, ``idx``, ``parent``,
+	                         ``creation``, ``docstatus``, …) — written on
+	                         every save / submit, or already auto-indexed;
+	                         drop the suggestion, second element explains
 	  - ``"unknown"``      — information_schema lookup failed (likely
 	                         no real DB, dev environment); KEEP the
 	                         suggestion with a plain DDL (legacy
 	                         behavior) so we don't silently suppress
 	                         the old pipeline
 	"""
-	# v0.5.1: hard blacklist — lifecycle columns should never be
-	# suggested regardless of read-side heuristics. Checked BEFORE
-	# the information_schema lookups so we don't waste DB roundtrips
-	# on a suggestion we already know to drop.
-	if column in _NEVER_SUGGEST_COLUMNS:
+	# v0.5.1 → v0.6.0: hard blacklist — Frappe's standard metadata columns
+	# should never be suggested, regardless of read-side heuristics. Checked
+	# BEFORE the information_schema lookups so we don't waste DB roundtrips
+	# on a suggestion we already know to drop. Case-insensitive defensively
+	# (the optimizer normally hands us lowercase column names).
+	if (column or "").strip().lower() in _NEVER_SUGGEST_COLUMNS:
 		return "never_suggest", (
-			f"column `{column}` on `{table}` is a Frappe lifecycle "
-			f"column updated on every save. Indexing it would cost "
-			f"more at write time than it saves at read time — the "
-			f"standard guidance is not to index these columns."
+			f"column `{column}` on `{table}` is a Frappe framework column "
+			f"(written on every save or submit, or already auto-indexed) — "
+			f"not a safe index target. The query's EXPLAIN row is in the "
+			f"report if you want to make this call deliberately."
 		)
 
 	# Memoize per-table lookups so a suggestion with N columns on
@@ -391,6 +393,11 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 	)
 	parser_limit_failures: Counter = Counter()
 	real_failures: Counter = Counter()
+	# Frappe framework "meta" tables (tabDocType, tabCustom Field, tabSingles,
+	# tab__global_search, …) — `bench migrate` owns their schema (indexes
+	# included) and they're tiny / write-on-every-customization, so we never
+	# suggest an index on them. Skip before we even bucket the suggestion.
+	dropped_meta_table_tables: set[str] = set()
 	logged_real = 0
 	for normalized, info in unique_queries.items():
 		try:
@@ -424,6 +431,9 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 				logged_real += 1
 			continue
 		if not index or not index.table or not index.column:
+			continue
+		if is_frappe_meta_table(index.table):
+			dropped_meta_table_tables.add(str(index.table).strip().strip("`"))
 			continue
 		key = (index.table, index.column)
 		bucket = suggestion_buckets[key]
@@ -594,9 +604,19 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 		more = f" (+{overflow} more)" if overflow else ""
 		warnings.append(
 			f"Suppressed {drop_never_suggest} index suggestion(s) on "
-			f"Frappe lifecycle columns ({sample}{more}). These columns "
-			"are updated on every save — indexing them would cost more "
-			"at write time than it saves at read time."
+			f"Frappe metadata columns ({sample}{more}). These columns are "
+			"written on every save or submit (or are already auto-indexed), "
+			"so an index there is a write-cost trap — not suggested."
+		)
+	if dropped_meta_table_tables:
+		sample = ", ".join(sorted(dropped_meta_table_tables)[:5])
+		overflow = max(0, len(dropped_meta_table_tables) - 5)
+		more = f" (+{overflow} more)" if overflow else ""
+		warnings.append(
+			f"Skipped index suggestion(s) on Frappe framework meta tables "
+			f"({sample}{more}). `bench migrate` owns those tables' schema "
+			"(indexes included) — a hand-added index there is pointless and "
+			"would be clobbered on the next migrate."
 		)
 	if drop_already_indexed:
 		warnings.append(

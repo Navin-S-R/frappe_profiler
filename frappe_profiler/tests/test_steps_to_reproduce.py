@@ -531,3 +531,87 @@ def test_start_dialog_no_longer_asks_for_notes():
 		"dialog no longer collects it, values.notes is always undefined "
 		"— drop the arg from the frappe.call."
 	)
+
+
+# --------------------------------------------------------------------------
+# v0.6.0: LLM-humanized "Steps to Reproduce"
+# --------------------------------------------------------------------------
+
+def test_actions_for_humanizer_compacts_recordings():
+	"""_actions_for_humanizer should drop noise, cap, and emit the
+	compact {label, cmd, path, method, doctype, duration_ms} dicts the
+	humanizer prompt expects."""
+	from frappe_profiler.analyze import _actions_for_humanizer
+
+	recordings = [
+		{"cmd": "frappe.realtime.has_permission", "duration": 3, "calls": []},  # noise
+		{"cmd": "frappe.desk.form.save.savedocs", "duration": 780, "calls": [],
+		 "form_dict": {"doc": json.dumps({"doctype": "Sales Invoice", "__islocal": 1}),
+		               "action": "Save"}},
+		{"method": "GET", "path": "/api/method/foo.bar", "cmd": None, "duration": 12, "calls": []},
+	]
+	out = _actions_for_humanizer(recordings)
+	assert len(out) == 2  # the realtime one is filtered
+	first = out[0]
+	assert first["cmd"] == "frappe.desk.form.save.savedocs"
+	assert first["doctype"] == "Sales Invoice"
+	assert "Sales Invoice" in first["label"]
+	assert out[1]["path"] == "/api/method/foo.bar"
+	# All the expected keys present.
+	for k in ("label", "cmd", "path", "method", "doctype", "duration_ms"):
+		assert k in first
+
+
+def test_assemble_humanized_notes_is_just_the_friendly_steps():
+	"""Only the preamble + the rendered Markdown steps — no raw
+	"Captured actions" appendix (the per-action breakdown in the report
+	already lists every action with its technical label)."""
+	from frappe_profiler.analyze import _assemble_humanized_notes
+
+	html_out = _assemble_humanized_notes("1. Submit a Delivery Note.\n\n**Summary:** submitting a DN.")
+	assert "drafted by AI" in html_out
+	assert "Submit a Delivery Note" in html_out
+	assert "Captured actions" not in html_out
+	assert "what actually hit the server" not in html_out
+
+
+def test_build_humanized_notes_html_returns_empty_when_ai_disabled():
+	"""When AI is off (or unconfigured), _build_humanized_notes_html must
+	return "" so _persist falls back to the plain auto-notes list."""
+	from types import SimpleNamespace
+	from unittest.mock import patch
+	from frappe_profiler import analyze
+
+	recordings = [{"cmd": "frappe.client.save", "duration": 50, "calls": [],
+	               "form_dict": {"doctype": "Item"}}]
+	with patch("frappe_profiler.settings.get_config",
+	           return_value=SimpleNamespace(ai_enabled=False, ai_humanize_steps=True)):
+		assert analyze._build_humanized_notes_html(recordings) == ""
+
+
+def test_build_humanized_notes_html_returns_empty_on_llm_failure():
+	"""If the LLM call raises, the helper swallows it and returns "" — the
+	caller then uses _build_auto_notes_html. analyze must never fail just
+	because the humanizer did."""
+	from types import SimpleNamespace
+	from unittest.mock import patch
+	from frappe_profiler import analyze, ai_fix
+
+	recordings = [{"cmd": "frappe.client.save", "duration": 50, "calls": [],
+	               "form_dict": {"doctype": "Item"}}]
+	with patch("frappe_profiler.settings.get_config",
+	           return_value=SimpleNamespace(ai_enabled=True, ai_humanize_steps=True)), \
+	     patch.object(ai_fix, "is_available", return_value=True), \
+	     patch.object(ai_fix, "humanize_steps", side_effect=ai_fix.AiFixError("boom")):
+		assert analyze._build_humanized_notes_html(recordings) == ""
+
+
+def test_persist_prefers_humanized_then_falls_back():
+	"""Source guard: _persist must try _build_humanized_notes_html first
+	and fall back to _build_auto_notes_html."""
+	import inspect
+	from frappe_profiler import analyze
+
+	src = inspect.getsource(analyze._persist)
+	assert "_build_humanized_notes_html" in src
+	assert "_build_auto_notes_html" in src

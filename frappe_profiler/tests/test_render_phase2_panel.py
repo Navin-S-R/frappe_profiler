@@ -9,7 +9,6 @@ object directly to the helper.
 import json
 import re
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from frappe_profiler import renderer
 
@@ -49,11 +48,11 @@ def _function(dotted_path, lines):
 class TestRenderPhase2PanelEmpty:
 	def test_no_phase2_runs_returns_empty_string(self):
 		session = SimpleNamespace(phase_2_runs=[])
-		assert renderer._render_phase2_panel(session, "safe") == ""
+		assert renderer._render_phase2_panel(session) == ""
 
 	def test_phase_2_runs_attribute_missing_returns_empty(self):
 		session = SimpleNamespace()
-		assert renderer._render_phase2_panel(session, "safe") == ""
+		assert renderer._render_phase2_panel(session) == ""
 
 
 class TestRenderPhase2PanelSingleRun:
@@ -65,42 +64,26 @@ class TestRenderPhase2PanelSingleRun:
 			_function("my_app.x.compute", [_line(1, "x = 1", 5, 10.0)]),
 		])
 
-		with patch.object(renderer, "_phase2_safe_show_source", return_value=True):
-			html = renderer._render_phase2_panel(session, "safe")
+		html = renderer._render_phase2_panel(session)
 
 		assert "my_app.x.compute" in html
 		assert "Phase 2: Line-Level Drilldown" in html
 
-	def test_safe_mode_omits_source_when_setting_off(self):
+	def test_source_always_rendered(self):
+		# v0.6.0 Round 7: safe-mode source toggle removed. Source is
+		# always rendered now.
 		session = self._session([
-			_function("my_app.x", [_line(1, "secret = 'PASSWORD123'", 1, 5.0)]),
+			_function("my_app.x", [_line(1, "literal_value = 'foo'", 1, 5.0)]),
 		])
 
-		with patch.object(renderer, "_phase2_safe_show_source", return_value=False):
-			html = renderer._render_phase2_panel(session, "safe")
+		html = renderer._render_phase2_panel(session)
 
-		assert "PASSWORD123" not in html
-		assert "&lt;source omitted&gt;" in html
-		# lineno + ms still present — that's the timing telemetry the
-		# admin chose to share even with source hidden.
-		assert "5.00" in html
-
-	def test_raw_mode_always_shows_source(self):
-		session = self._session([
-			_function("my_app.x", [_line(1, "secret = 'PASSWORD123'", 1, 5.0)]),
-		])
-
-		# Raw mode bypasses the toggle.
-		with patch.object(renderer, "_phase2_safe_show_source", return_value=False):
-			html = renderer._render_phase2_panel(session, "raw")
-
-		assert "PASSWORD123" in html
+		assert "literal_value" in html
 
 	def test_zero_invocation_function_shows_warning(self):
 		session = self._session([_function("my_app.never_runs", [])])
 
-		with patch.object(renderer, "_phase2_safe_show_source", return_value=True):
-			html = renderer._render_phase2_panel(session, "safe")
+		html = renderer._render_phase2_panel(session)
 
 		assert "never invoked" in html.lower()
 
@@ -115,8 +98,7 @@ class TestRenderPhase2PanelDiff:
 			_run("r2", "Ready", [fn_run2], total_ms=200),
 		])
 
-		with patch.object(renderer, "_phase2_safe_show_source", return_value=True):
-			html = renderer._render_phase2_panel(session, "safe")
+		html = renderer._render_phase2_panel(session)
 
 		assert "Cross-Run Comparison" in html
 		# Delta should be -600 (faster after fix); shown on a row
@@ -126,8 +108,7 @@ class TestRenderPhase2PanelDiff:
 		fn = _function("my_app.x", [_line(11, "compute()", 100, 100.0)])
 		session = SimpleNamespace(phase_2_runs=[_run("r1", "Ready", [fn])])
 
-		with patch.object(renderer, "_phase2_safe_show_source", return_value=True):
-			html = renderer._render_phase2_panel(session, "safe")
+		html = renderer._render_phase2_panel(session)
 
 		assert "Cross-Run Comparison" not in html
 
@@ -163,8 +144,7 @@ class TestRenderPhase2PanelAutoExpandChain:
 			self._run_with_chain("my_app.x.root_fn", "my_app.x.descendant"),
 		])
 
-		with patch.object(renderer, "_phase2_safe_show_source", return_value=True):
-			html = renderer._render_phase2_panel(session, "safe")
+		html = renderer._render_phase2_panel(session)
 
 		# rfind targets the function-table header (the descendant appears
 		# earlier in the run's "Picks:" summary line as well).
@@ -179,8 +159,7 @@ class TestRenderPhase2PanelAutoExpandChain:
 			self._run_with_chain("my_app.x.root_fn", "my_app.x.descendant"),
 		])
 
-		with patch.object(renderer, "_phase2_safe_show_source", return_value=True):
-			html = renderer._render_phase2_panel(session, "safe")
+		html = renderer._render_phase2_panel(session)
 
 		desc_idx = html.rfind("my_app.x.descendant")
 		assert desc_idx > -1
@@ -203,8 +182,7 @@ class TestRenderPhase2PanelAutoExpandChain:
 		)
 		session = SimpleNamespace(phase_2_runs=[run])
 
-		with patch.object(renderer, "_phase2_safe_show_source", return_value=True):
-			html = renderer._render_phase2_panel(session, "safe")
+		html = renderer._render_phase2_panel(session)
 
 		fn_idx = html.rfind("my_app.x.fn")
 		assert fn_idx > -1
@@ -221,8 +199,7 @@ class TestRenderPhase2PanelSelfContainment:
 		fn = _function("my_app.x", [_line(11, "compute()", 100, 100.0)])
 		session = SimpleNamespace(phase_2_runs=[_run("r1", "Ready", [fn])])
 
-		with patch.object(renderer, "_phase2_safe_show_source", return_value=True):
-			html = renderer._render_phase2_panel(session, "safe")
+		html = renderer._render_phase2_panel(session)
 
 		# No protocol-prefixed URLs (excluding xmlns-style namespaces, none
 		# of which we use in this panel).

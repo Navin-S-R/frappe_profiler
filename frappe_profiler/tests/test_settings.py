@@ -48,6 +48,8 @@ class TestDefaults:
 		assert cfg.enabled is True
 		assert cfg.session_retention_days == 30
 		assert cfg.tracked_apps == ()
+		assert cfg.ignored_apps == ()  # v0.6.x: defaults empty (nothing dropped).
+		assert cfg.hide_framework_tables is True  # v0.6.x: default on.
 		assert cfg.redundant_doc_threshold == 5
 		# v0.5.2 round 4: bumped from 10 → 50 to cut 0ms "cache
 		# looked up 20× from same callsite" noise that we can't
@@ -152,3 +154,59 @@ class TestTrackedApps:
 		cfg = settings._resolve()
 		assert isinstance(cfg.tracked_apps, tuple)
 		assert cfg.tracked_apps == ("myapp", "another")
+
+
+class TestIgnoredApps:
+	"""v0.6.x: 'Ignored Apps' — exclusion list whose findings are dropped from
+	the report. Mirrors the tracked_apps wiring."""
+
+	def test_default_is_empty_tuple(self):
+		assert settings.ProfilerConfig().ignored_apps == ()
+		assert settings._DEFAULTS["ignored_apps"] == ()
+
+	def test_resolves_from_row(self, monkeypatch):
+		monkeypatch.setattr(
+			settings, "_read_doctype_row",
+			lambda: {"ignored_apps": ("frappe", "frappe_profiler")},
+		)
+		monkeypatch.setattr(settings, "_site_conf_fallback", lambda k: None)
+		cfg = settings._resolve()
+		assert isinstance(cfg.ignored_apps, tuple)
+		assert cfg.ignored_apps == ("frappe", "frappe_profiler")
+
+	def test_resolves_to_empty_when_absent_in_row(self, monkeypatch):
+		# Pre-v0.6.x Single (field doesn't exist yet) → defaults to ().
+		monkeypatch.setattr(settings, "_read_doctype_row", lambda: {"enabled": True})
+		monkeypatch.setattr(settings, "_site_conf_fallback", lambda k: None)
+		assert settings._resolve().ignored_apps == ()
+
+	def test_get_ignored_apps_returns_empty_on_error(self, monkeypatch):
+		def _boom():
+			raise RuntimeError("no config")
+		monkeypatch.setattr(settings, "get_config", _boom)
+		assert settings.get_ignored_apps() == ()
+
+
+class TestHideFrameworkTables:
+	"""v0.6.x: 'Hide framework / internal database tables' Check (default
+	True). When on, the renderer drops framework/internal tables from the
+	'Time spent per database table' section. Default-True Check pattern
+	mirrors ai_humanize_steps."""
+
+	def test_default_is_true(self):
+		assert settings.ProfilerConfig().hide_framework_tables is True
+		assert settings._DEFAULTS["hide_framework_tables"] is True
+
+	def test_resolves_explicit_false(self, monkeypatch):
+		monkeypatch.setattr(
+			settings, "_read_doctype_row",
+			lambda: {"hide_framework_tables": False},
+		)
+		monkeypatch.setattr(settings, "_site_conf_fallback", lambda k: None)
+		assert settings._resolve().hide_framework_tables is False
+
+	def test_resolves_to_default_when_absent_in_row(self, monkeypatch):
+		# Pre-v0.6.x Single (field doesn't exist yet) → defaults to True.
+		monkeypatch.setattr(settings, "_read_doctype_row", lambda: {"enabled": True})
+		monkeypatch.setattr(settings, "_site_conf_fallback", lambda k: None)
+		assert settings._resolve().hide_framework_tables is True

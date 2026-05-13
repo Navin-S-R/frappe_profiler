@@ -20,6 +20,9 @@ clears the active flag and marks the DocType as `Stopping` — a future
 phase will hook the analyze step in.
 """
 
+import json
+import time
+
 import frappe
 from frappe.utils import now_datetime
 
@@ -108,13 +111,6 @@ def start(
 	now = now_datetime()
 	title = (label or "").strip() or f"Profiling session @ {now.strftime('%Y-%m-%d %H:%M:%S')}"
 
-	# v0.4.0: auto-inherit baseline if one is pinned for this label
-	auto_baseline = None
-	try:
-		auto_baseline = frappe.cache.get_value(_baseline_key(title))
-	except Exception:
-		pass
-
 	# Create the DocType row in Recording state.
 	doc_fields = {
 		"doctype": "Profiler Session",
@@ -124,8 +120,6 @@ def start(
 		"status": "Recording",
 		"started_at": now,
 	}
-	if auto_baseline:
-		doc_fields["compared_to_session"] = auto_baseline
 	# v0.5.0: persist steps-to-reproduce / notes captured at start time.
 	notes_clean = (notes or "").strip()
 	if notes_clean:
@@ -246,6 +240,22 @@ def _stop_session(user: str, session_uuid: str) -> tuple[str | None, bool]:
 		docname=docname,
 		user=user,
 	)
+
+	# v0.6.0: if the flow enqueued background jobs, keep the session
+	# accepting their recordings for a bounded window after Stop (the
+	# active pointer was just cleared). analyze.run waits for these jobs
+	# to finish before gathering recordings, so they aren't lost. The
+	# draining deadline is the analyze wait + a grace margin covering the
+	# analyze run itself. No-op when the wait is disabled (=0) or nothing
+	# was enqueued.
+	try:
+		from frappe_profiler.settings import get_config
+
+		wait_seconds = int(getattr(get_config(), "background_job_wait_seconds", 0) or 0)
+		if wait_seconds > 0 and session.get_pending_jobs(session_uuid):
+			session.set_draining(session_uuid, time.time() + wait_seconds + 60)
+	except Exception:
+		frappe.log_error(title="frappe_profiler set draining window")
 
 	# v0.5.0: inline safety cap + scheduler fallback are both inside
 	# _enqueue_analyze now, so every inline-path caller (stop,
@@ -739,155 +749,9 @@ def mark_onboarding_seen() -> dict:
 	return {"seen": True}
 
 
-# v0.4.0: baseline-pinning cache key prefix.
-BASELINE_CACHE_PREFIX = "profiler:baseline:"
-
-
-def _baseline_key(label: str) -> str:
-	return f"{BASELINE_CACHE_PREFIX}{label}"
-
-
-def _require_session_owner_or_sysmanager(session_uuid: str) -> dict:
-	"""Permission gate shared by all v0.4.0 baseline / pdf endpoints.
-
-	Returns the session row dict on success; throws on failure.
-	"""
-	user = _require_profiler_user()
-	if not session_uuid:
-		frappe.throw("session_uuid is required")
-	row = frappe.db.get_value(
-		"Profiler Session",
-		{"session_uuid": session_uuid},
-		["name", "user", "status", "title"],
-		as_dict=True,
-	)
-	if not row:
-		frappe.throw(f"No Profiler Session found for uuid {session_uuid}")
-	roles = set(frappe.get_roles(user))
-	if (
-		row["user"] != user
-		and "System Manager" not in roles
-		and user != "Administrator"
-	):
-		frappe.throw(
-			"You can only modify your own sessions.", frappe.PermissionError
-		)
-	return row
-
-
-@frappe.whitelist()
-def pin_baseline(session_uuid: str) -> dict:
-	"""Pin this session as the baseline for its label.
-
-	Writes the docname to a site-level cache key
-	`profiler:baseline:<label>`. Clears the is_baseline flag on any
-	previously-pinned session for the same label. Sets is_baseline=1 on
-	the target.
-	"""
-	row = _require_session_owner_or_sysmanager(session_uuid)
-	if row["status"] != "Ready":
-		frappe.throw(f"Cannot pin session in '{row['status']}' state")
-
-	label = row["title"] or ""
-	key = _baseline_key(label)
-
-	# Clear flag on any previously-pinned session for the same label
-	previous = frappe.cache.get_value(key)
-	if previous and previous != row["name"]:
-		try:
-			frappe.db.set_value("Profiler Session", previous, "is_baseline", 0)
-		except Exception:
-			pass
-
-	# Set the new baseline
-	frappe.cache.set_value(key, row["name"])
-	frappe.db.set_value("Profiler Session", row["name"], "is_baseline", 1)
-	frappe.db.commit()
-
-	# Re-render any dependent sessions in the background (best-effort)
-	try:
-		frappe.enqueue(
-			"frappe_profiler.api._rerender_dependents",
-			queue="short",
-			label=label,
-			baseline_docname=row["name"],
-		)
-	except Exception:
-		pass
-
-	return {"pinned": True, "session_uuid": session_uuid, "docname": row["name"]}
-
-
-@frappe.whitelist()
-def unpin_baseline(session_uuid: str) -> dict:
-	"""Clear the baseline flag for this session and remove cache entry if active."""
-	row = _require_session_owner_or_sysmanager(session_uuid)
-
-	label = row["title"] or ""
-	key = _baseline_key(label)
-
-	current = frappe.cache.get_value(key)
-	if current == row["name"]:
-		frappe.cache.delete_value(key)
-	frappe.db.set_value("Profiler Session", row["name"], "is_baseline", 0)
-	frappe.db.commit()
-
-	return {"unpinned": True, "session_uuid": session_uuid}
-
-
-def _rerender_dependents(label: str, baseline_docname: str) -> None:
-	"""Re-render reports for any Ready sessions whose label matches AND whose
-	compared_to_session is NULL or matches the new baseline.
-
-	Background job triggered by pin_baseline. Best-effort.
-	"""
-	try:
-		dependent_names = frappe.get_all(
-			"Profiler Session",
-			filters={"title": label, "status": "Ready"},
-			pluck="name",
-		)
-	except Exception:
-		return
-
-	for name in dependent_names:
-		if name == baseline_docname:
-			continue
-		try:
-			doc = frappe.get_doc("Profiler Session", name)
-			if not doc.compared_to_session:
-				doc.db_set("compared_to_session", baseline_docname, update_modified=False)
-			from frappe_profiler.analyze import _render_and_attach_reports
-
-			_render_and_attach_reports(name, recordings=[])
-		except Exception:
-			frappe.log_error(title=f"frappe_profiler rerender {name}")
-
-
-@frappe.whitelist()
-def set_comparison(session_uuid: str, compared_to: str) -> dict:
-	"""Set compared_to_session on a single session for a one-off comparison.
-
-	The current session must be Ready; the compared_to session is looked up
-	by docname.
-	"""
-	row = _require_session_owner_or_sysmanager(session_uuid)
-	if not compared_to:
-		frappe.throw("compared_to is required")
-	target_status = frappe.db.get_value("Profiler Session", compared_to, "status")
-	if not target_status:
-		frappe.throw(f"No Profiler Session found with name {compared_to}")
-	if target_status != "Ready":
-		frappe.throw(f"Compared-to session must be Ready, got '{target_status}'")
-
-	frappe.db.set_value("Profiler Session", row["name"], "compared_to_session", compared_to)
-	frappe.db.commit()
-	return {"set": True, "session_uuid": session_uuid, "compared_to": compared_to}
-
-
 @frappe.whitelist()
 def download_pdf(session_uuid: str) -> dict:
-	"""Return the URL of the safe-report PDF, generating it on first call.
+	"""Return the URL of the report PDF, generating it on first call.
 
 	Permission: recording user, System Manager, or Administrator.
 	Mirrors retry_analyze / export_session permission gating.
@@ -931,12 +795,12 @@ def export_session(session_uuid: str) -> dict:
 	Lets dev shops (or automation) consume the profiler's output
 	programmatically without parsing the HTML report. Returns the full
 	session including all child rows, top queries, table breakdown, and
-	finding technical details — effectively everything from the safe
-	report in a machine-friendly shape.
+	finding technical details — everything in the report, in a
+	machine-friendly shape.
 
-	Permission model: mirrors the "raw report" gate — only the recording
-	user or a System Manager can export. Other Profiler Users get a
-	permission error even if they somehow guessed the uuid.
+	Permission model: mirrors the report download gate — only the
+	recording user or a System Manager can export. Other Profiler Users
+	get a permission error even if they somehow guessed the uuid.
 	"""
 	import json
 
@@ -1114,22 +978,22 @@ def retry_analyze(session_uuid: str) -> dict:
 
 @frappe.whitelist()
 def regenerate_reports(session_uuid: str) -> dict:
-	"""Re-render the safe + raw HTML reports from stored session data.
+	"""Re-render the HTML report from stored session data.
 
 	Unlike ``retry_analyze``, this does NOT re-run any analyzer. It
-	only invokes ``renderer.render_safe/render_raw`` on the existing
-	Profiler Session row. Typical use: the report template or
-	renderer code changed (e.g. upgrading frappe_profiler to a new
-	version with an improved layout) and you want the new UI applied
-	to an already-analyzed session without the cost of re-running
-	the entire analysis pipeline.
+	only invokes ``renderer.render_raw`` on the existing Profiler
+	Session row. Typical use: the report template or renderer code
+	changed (e.g. upgrading frappe_profiler to a new version with an
+	improved layout) and you want the new UI applied to an already-
+	analyzed session without the cost of re-running the entire
+	analysis pipeline.
 
 	Characteristics:
 
 	  - **Fast** — milliseconds vs. minutes. No DB-heavy analyzer
 	    passes, no EXPLAIN calls. Just template rendering.
 	  - **Safe to run repeatedly** — idempotent. Each invocation
-	    replaces the existing safe/raw File attachments and clears
+	    replaces the existing report File attachment and clears
 	    the cached PDF.
 	  - **Best-effort recordings** — fetches the original recordings
 	    from Redis by UUID. If they've expired (TTL exceeded),
@@ -1168,7 +1032,7 @@ def regenerate_reports(session_uuid: str) -> dict:
 			frappe.PermissionError,
 		)
 
-	# Best-effort recording fetch. Safe renderer uses DocType fields for
+	# Best-effort recording fetch. The renderer uses DocType fields for
 	# everything important; recordings only power the per-query drill-
 	# down + Full recordings sections. If Redis dropped them, render
 	# with an empty list and the rest of the report is still fine.
@@ -1186,8 +1050,19 @@ def regenerate_reports(session_uuid: str) -> dict:
 		frappe.log_error(title="frappe_profiler regenerate_reports fetch")
 		recordings = []
 
+	# v0.6.0: if "Suggest AI fixes in the report by default" is on, backfill
+	# AI suggestions onto the top eligible findings that don't have one yet,
+	# so a session analyzed before the switch was flipped picks them up on a
+	# Regenerate. Best-effort + tightly time-budgeted (it runs synchronously
+	# in this web request). The persisted llm_fix_json is what the renderer
+	# below reads to draw the "Suggested fix (AI)" block under each finding.
+	try:
+		_analyze_mod._backfill_ai_suggestions(doc)
+	except Exception:
+		frappe.log_error(title="frappe_profiler regenerate ai backfill")
+
 	# Invalidate the cached PDF — next /api/method/download_pdf call
-	# will regenerate it from the freshly-rendered safe HTML.
+	# will regenerate it from the freshly-rendered HTML.
 	try:
 		from frappe_profiler import pdf_export
 
@@ -1203,6 +1078,419 @@ def regenerate_reports(session_uuid: str) -> dict:
 		"docname": row["name"],
 		"recordings_available": len(recordings),
 		"actions_total": len(doc.actions or []),
+	}
+
+
+@frappe.whitelist()
+def suggest_fix(session_uuid: str, finding_ref: str, regenerate=0) -> dict:
+	"""Generate (or return the cached) AI-suggested fix for one finding.
+
+	On-demand only — never called during analyze. The finding's context
+	(type, callsite, a window of surrounding source, normalized SQL +
+	EXPLAIN, the static fix hint) is sent to the LLM configured in
+	Profiler Settings ▸ AI Fix Suggestions; the result is stored on the
+	Profiler Finding row (``llm_fix_json``) so re-opening returns it
+	without another API call, and so the regenerated HTML report carries
+	it.
+
+	Args:
+	    session_uuid: the Profiler Session.
+	    finding_ref:  the child-row ``name`` of the finding (the form's
+	        ``frm.doc.findings[i].name``). A bare integer is accepted as a
+	        0-based index fallback.
+	    regenerate:   truthy → ignore any cached suggestion and re-call.
+
+	Permission: recording user / System Manager / Administrator (mirrors
+	``download_pdf``). The AI must be enabled and configured.
+	"""
+	user = _require_profiler_user()
+	if not session_uuid:
+		frappe.throw("session_uuid is required")
+	if not finding_ref:
+		frappe.throw("finding_ref is required")
+	regenerate = bool(frappe.utils.cint(regenerate))
+
+	row = frappe.db.get_value(
+		"Profiler Session",
+		{"session_uuid": session_uuid},
+		["name", "user", "status"],
+		as_dict=True,
+	)
+	if not row:
+		frappe.throw(f"No Profiler Session found for uuid {session_uuid}")
+	if row["status"] != "Ready":
+		frappe.throw(
+			f"AI fix suggestions are only available for Ready sessions "
+			f"(this one is '{row['status']}')."
+		)
+
+	roles = set(frappe.get_roles(user))
+	if (
+		row["user"] != user
+		and "System Manager" not in roles
+		and user != "Administrator"
+	):
+		frappe.throw(
+			"You can only request AI fixes for your own sessions.",
+			frappe.PermissionError,
+		)
+
+	from frappe_profiler import ai_fix
+
+	if not ai_fix.is_available():
+		frappe.throw(
+			"AI fix suggestions aren't configured — enable them in Profiler "
+			"Settings ▸ AI Fix Suggestions and set a provider, model, and API key."
+		)
+	from frappe_profiler.settings import get_config
+	if not get_config().ai_suggest_findings:
+		frappe.throw(
+			'AI fix suggestions on findings are turned off — enable '
+			'"Fix suggestions on findings" under Profiler Settings ▸ AI.'
+		)
+
+	doc = frappe.get_doc("Profiler Session", row["name"])
+	findings = doc.findings or []
+	child = next((f for f in findings if f.name == finding_ref), None)
+	if child is None and str(finding_ref).strip().lstrip("-").isdigit():
+		idx = int(finding_ref)
+		if 0 <= idx < len(findings):
+			child = findings[idx]
+	if child is None:
+		frappe.throw(f"Finding {finding_ref!r} not found on this session.")
+
+	if (child.finding_type or "") not in ai_fix.AI_ELIGIBLE_FINDING_TYPES:
+		frappe.throw(
+			f"AI fix suggestions aren't offered for '{child.finding_type}' "
+			"findings — they don't carry enough code/SQL context."
+		)
+
+	# Return the cached suggestion unless the caller asked to regenerate.
+	if not regenerate and (child.llm_fix_json or "").strip():
+		try:
+			cached = json.loads(child.llm_fix_json)
+		except Exception:
+			cached = None
+		if isinstance(cached, dict) and (cached.get("suggestion") or "").strip():
+			return {"ok": True, "finding": child.name, "cached": True, **cached}
+
+	# Build the LLM context: the finding dict + a wide source window + (when a
+	# Phase-2 line-profile pass instrumented this finding's function) its
+	# hottest line — shared with the analyze-time auto-suggest path.
+	from frappe_profiler import analyze as _analyze_mod
+
+	finding_dict = _analyze_mod._ai_payload_for_finding(
+		child, {}, phase2_index=_analyze_mod._phase2_index_for(doc),
+	)
+
+	try:
+		result = ai_fix.suggest_fix(finding_dict)
+	except ai_fix.AiFixError as e:
+		frappe.throw(str(e))
+
+	try:
+		frappe.db.set_value(
+			"Profiler Finding", child.name, "llm_fix_json", json.dumps(result),
+		)
+		frappe.db.commit()
+	except Exception:
+		# Failing to persist isn't fatal — the operator still gets the
+		# suggestion in the dialog, just not cached / in the report.
+		frappe.log_error(title="frappe_profiler suggest_fix persist")
+
+	return {"ok": True, "finding": child.name, "cached": False, **result}
+
+
+@frappe.whitelist()
+def test_ai_connection() -> dict:
+	"""Probe the configured AI provider. System-Manager-only (config-
+	adjacent — Profiler Settings itself is SysMgr-only). Returns
+	``{"ok": bool, "message": str, "model": str}``; never raises on a
+	provider failure (the detail is in ``message``)."""
+	user = _require_profiler_user()
+	roles = set(frappe.get_roles(user))
+	if "System Manager" not in roles and user != "Administrator":
+		frappe.throw(
+			"Only a System Manager can test the AI connection.",
+			frappe.PermissionError,
+		)
+	from frappe_profiler import ai_fix
+
+	return ai_fix.test_connection()
+
+
+@frappe.whitelist()
+def ai_capabilities() -> dict:
+	"""The per-section LLM toggles, for the Profiler Session form to decide
+	which AI buttons to show. Any logged-in profiler user — no Profiler
+	Settings read permission needed (the server still enforces the toggles).
+	Returns ``{enabled, findings, indexes, humanize}`` (all bools)."""
+	_require_profiler_user()
+	from frappe_profiler.settings import get_config
+	cfg = get_config()
+	return {
+		"enabled": bool(getattr(cfg, "ai_enabled", False)),
+		"findings": bool(getattr(cfg, "ai_suggest_findings", True)),
+		"indexes": bool(getattr(cfg, "ai_suggest_indexes", True)),
+		"humanize": bool(getattr(cfg, "ai_humanize_steps", True)),
+	}
+
+
+@frappe.whitelist()
+def backfill_ai_fixes(session_uuid: str, regenerate_all=0) -> dict:
+	"""Generate AI fix suggestions for eligible findings on the session, then
+	re-render the report so they show up.
+
+	- ``regenerate_all`` falsy (default) — "Generate AI fixes": fill only the
+	  eligible findings that don't have a suggestion yet. Use this after the
+	  LLM was unavailable during analyze (with "Suggest AI fixes by default"
+	  on, the analyze still completes — the AI part is just skipped), or to
+	  populate suggestions on demand without turning auto-suggest on.
+	- ``regenerate_all`` truthy — "Re-evaluate AI fixes": (re)generate the
+	  suggestion for EVERY eligible finding, overwriting the existing ones.
+	  Use this after changing the AI model or prompt. A failure mid-re-eval
+	  leaves the old suggestion in place (only successful runs overwrite).
+
+	Either way it bypasses the ``ai_auto_suggest`` toggle (you're asking for
+	it explicitly) but still requires the provider to be configured, and is
+	bounded by the same per-call time budget — if it reports findings skipped
+	for time, just run it again.
+
+	Permission: recording user / System Manager / Administrator (mirrors
+	``regenerate_reports`` / ``download_pdf``).
+	"""
+	user = _require_profiler_user()
+	if not session_uuid:
+		frappe.throw("session_uuid is required")
+	regenerate_all = bool(frappe.utils.cint(regenerate_all))
+
+	row = frappe.db.get_value(
+		"Profiler Session",
+		{"session_uuid": session_uuid},
+		["name", "user", "status"],
+		as_dict=True,
+	)
+	if not row:
+		frappe.throw(f"No Profiler Session found for uuid {session_uuid}")
+	if row["status"] != "Ready":
+		frappe.throw(
+			f"AI fixes can only be generated for Ready sessions "
+			f"(this one is '{row['status']}')."
+		)
+
+	roles = set(frappe.get_roles(user))
+	if (
+		row["user"] != user
+		and "System Manager" not in roles
+		and user != "Administrator"
+	):
+		frappe.throw(
+			"You can only generate AI fixes for your own sessions.",
+			frappe.PermissionError,
+		)
+
+	from frappe_profiler import ai_fix
+
+	if not ai_fix.is_available():
+		frappe.throw(
+			"AI fix suggestions aren't configured — enable them in Profiler "
+			"Settings ▸ AI Fix Suggestions and set a provider, model, and API key."
+		)
+	from frappe_profiler.settings import get_config
+	if not get_config().ai_suggest_findings:
+		frappe.throw(
+			'AI fix suggestions on findings are turned off — enable '
+			'"Fix suggestions on findings" under Profiler Settings ▸ AI.'
+		)
+
+	from frappe_profiler import analyze as _analyze_mod
+
+	doc = frappe.get_doc("Profiler Session", row["name"])
+	# cap=0 → do as many target findings as fit in the time budget, ignoring
+	# the auto-suggest cap (the operator asked for them explicitly).
+	counts = _analyze_mod._run_ai_backfill(doc, cap=0, regenerate_all=regenerate_all)
+
+	# Re-render so the new/updated suggestions land in the HTML report.
+	# regenerate_reports re-fetches the doc (seeing the just-committed
+	# llm_fix_json), clears the cached PDF, and re-renders; its own
+	# auto-suggest-gated backfill is then a no-op.
+	regen = regenerate_reports(session_uuid)
+
+	return {
+		"ok": True,
+		"session_uuid": session_uuid,
+		"regenerate_all": regenerate_all,
+		"added": counts["added"],
+		"failed": counts["failed"],
+		"skipped_time": counts["skipped_time"],
+		"total_pending": counts["total_pending"],
+		"regenerated": bool(regen.get("regenerated")),
+	}
+
+
+@frappe.whitelist()
+def humanize_steps(session_uuid: str) -> dict:
+	"""(Re)generate the "Steps to Reproduce" note on a Ready session using the
+	configured LLM, overwriting whatever is there, then re-render the report.
+
+	Use this on a session whose steps read as a raw list of HTTP calls (e.g.
+	one analyzed before AI was enabled, or with humanizing turned off), or to
+	redo it after editing/clearing the note. Permission: recording user /
+	System Manager / Administrator (mirrors ``download_pdf``).
+	"""
+	user = _require_profiler_user()
+	if not session_uuid:
+		frappe.throw("session_uuid is required")
+
+	row = frappe.db.get_value(
+		"Profiler Session",
+		{"session_uuid": session_uuid},
+		["name", "user", "status", "title"],
+		as_dict=True,
+	)
+	if not row:
+		frappe.throw(f"No Profiler Session found for uuid {session_uuid}")
+	if row["status"] != "Ready":
+		frappe.throw(
+			f"Steps can only be (re)generated for Ready sessions "
+			f"(this one is '{row['status']}')."
+		)
+
+	roles = set(frappe.get_roles(user))
+	if (
+		row["user"] != user
+		and "System Manager" not in roles
+		and user != "Administrator"
+	):
+		frappe.throw(
+			"You can only do this for your own sessions.",
+			frappe.PermissionError,
+		)
+
+	from frappe_profiler import ai_fix
+
+	if not ai_fix.is_available():
+		frappe.throw(
+			"AI isn't configured — enable it under Profiler Settings ▸ "
+			"AI Fix Suggestions and set a provider, model, and API key."
+		)
+	from frappe_profiler.settings import get_config
+	if not get_config().ai_humanize_steps:
+		frappe.throw(
+			'AI-humanized "Steps to Reproduce" is turned off — enable it '
+			'under Profiler Settings ▸ AI.'
+		)
+
+	from frappe_profiler import analyze as _analyze_mod
+
+	doc = frappe.get_doc("Profiler Session", row["name"])
+	recording_uuids = [
+		a.recording_uuid for a in (doc.actions or [])
+		if getattr(a, "recording_uuid", None)
+	]
+	try:
+		recordings = list(_analyze_mod._fetch_recordings(recording_uuids))
+	except Exception:
+		frappe.log_error(title="frappe_profiler humanize_steps fetch")
+		recordings = []
+
+	actions = _analyze_mod._actions_for_humanizer(recordings)
+	if not actions:
+		frappe.throw(
+			"This session has no user actions to summarise — it was all "
+			"background / polling traffic (or the recordings have expired)."
+		)
+	try:
+		steps_md = ai_fix.humanize_steps(actions, session_title=row.get("title") or None)
+	except ai_fix.AiFixError as e:
+		frappe.throw(str(e))
+
+	frappe.db.set_value(
+		"Profiler Session", row["name"], "notes",
+		_analyze_mod._assemble_humanized_notes(steps_md),
+	)
+	frappe.db.commit()
+
+	regen = regenerate_reports(session_uuid)
+	return {
+		"ok": True,
+		"session_uuid": session_uuid,
+		"regenerated": bool(regen.get("regenerated")),
+	}
+
+
+@frappe.whitelist()
+def suggest_index(session_uuid: str, table_name: str) -> dict:
+	"""Generate (or regenerate) the LLM-vetted index recommendation for one
+	table in the session's "Time spent per database table" breakdown, then
+	re-render the report so it shows up there.
+
+	The deterministic "index candidate" (most-used filter combination +
+	`frappe.db.add_index` patch) is always in the report; this adds the AI's
+	take on top — which composite, whether your existing indexes already
+	cover it, and the write-cost call. Requires AI to be configured.
+	Permission: recording user / System Manager / Administrator (mirrors
+	``download_pdf``).
+	"""
+	user = _require_profiler_user()
+	if not session_uuid or not table_name:
+		frappe.throw("session_uuid and table_name are required")
+
+	row = frappe.db.get_value(
+		"Profiler Session",
+		{"session_uuid": session_uuid},
+		["name", "user", "status"],
+		as_dict=True,
+	)
+	if not row:
+		frappe.throw(f"No Profiler Session found for uuid {session_uuid}")
+	if row["status"] != "Ready":
+		frappe.throw(
+			f"Index suggestions are only available for Ready sessions "
+			f"(this one is '{row['status']}')."
+		)
+
+	roles = set(frappe.get_roles(user))
+	if (
+		row["user"] != user
+		and "System Manager" not in roles
+		and user != "Administrator"
+	):
+		frappe.throw(
+			"You can only request index suggestions for your own sessions.",
+			frappe.PermissionError,
+		)
+
+	from frappe_profiler import ai_fix
+
+	if not ai_fix.is_available():
+		frappe.throw(
+			"AI isn't configured — enable it under Profiler Settings ▸ "
+			"AI Fix Suggestions and set a provider, model, and API key."
+		)
+	from frappe_profiler.settings import get_config
+	if not get_config().ai_suggest_indexes:
+		frappe.throw(
+			'AI index recommendations are turned off — enable '
+			'"Index recommendations (DB-tables breakdown)" under Profiler Settings ▸ AI.'
+		)
+
+	from frappe_profiler import analyze as _analyze_mod
+
+	doc = frappe.get_doc("Profiler Session", row["name"])
+	try:
+		out = _analyze_mod._run_table_index_ai_backfill(doc, table_name=table_name)
+	except ai_fix.AiFixError as e:
+		frappe.throw(str(e))
+	if not out.get("ok"):
+		frappe.throw(out.get("reason") or "Couldn't generate an index suggestion for that table.")
+
+	regen = regenerate_reports(session_uuid)
+	return {
+		"ok": True,
+		"session_uuid": session_uuid,
+		"table": out.get("table"),
+		"regenerated": bool(regen.get("regenerated")),
 	}
 
 
@@ -1282,12 +1570,21 @@ def get_phase2_candidates(session_uuid: str) -> dict:
 
 	candidates = _lp_picker._build_candidates_from_trees(trees, doc.findings or [])
 
+	# v0.6.0 Round 6: surface the configured auto-expand default so the
+	# picker dialog ticks/un-ticks its checkbox per Profiler Settings.
+	try:
+		from frappe_profiler.settings import get_config
+		default_auto_expand = bool(get_config().phase2_default_auto_expand)
+	except Exception:
+		default_auto_expand = True
+
 	return {
 		"session_uuid": session_uuid,
 		"docname": parent_docname,
 		"candidates": [c for c in candidates if not c["is_framework"]],
 		"observations": [c for c in candidates if c["is_framework"]],
 		"line_profiler_available": _lp_capture.is_line_profiler_available(),
+		"default_auto_expand": default_auto_expand,
 	}
 
 
@@ -1380,6 +1677,17 @@ def start_line_profile_pass(session_uuid: str, picks, auto_expand=True) -> dict:
 			trees.append(tree)
 
 		seen: set[str] = set()
+		# v0.6.0 Round 6: auto-expand depth + min-ms thresholds now read
+		# from Profiler Settings (cached) rather than baked into the
+		# helper's defaults. Resolved once outside the loop.
+		from frappe_profiler.settings import get_config as _get_config
+		try:
+			_cfg = _get_config()
+			_max_depth = int(_cfg.auto_expand_max_depth or 10)
+			_min_ms = float(_cfg.auto_expand_min_ms or 50.0)
+		except Exception:
+			_max_depth, _min_ms = 10, 50.0
+
 		expanded_picks: list[dict] = []
 		for entry in picks_list:
 			dotted = entry.get("dotted_path") or ""
@@ -1391,7 +1699,9 @@ def start_line_profile_pass(session_uuid: str, picks, auto_expand=True) -> dict:
 					seen.add(dotted)
 					expanded_picks.append(entry)
 				continue
-			chain = _lp_picker.expand_hot_chain(trees, dotted)
+			chain = _lp_picker.expand_hot_chain(
+				trees, dotted, max_depth=_max_depth, min_ms=_min_ms,
+			)
 			if not chain:
 				# Picked function wasn't in any phase-1 call tree (rare —
 				# the picker UI sources from those same trees). Pass it

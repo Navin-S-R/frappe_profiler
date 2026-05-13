@@ -131,10 +131,13 @@ class TestEndToEndRender:
 		from frappe_profiler import renderer
 
 		# A deeply-nested callsite path that would previously dominate
-		# the column. 90+ chars is typical for a Frappe app.
+		# the column. 90+ chars is typical for a real app. (Must be a
+		# custom-app path, not frappe/* — the Top Queries leaderboard is
+		# user-app-only now, so a framework callsite would be filtered
+		# out and the table wouldn't render at all.)
 		long_callsite = (
-			"apps/frappe/frappe/model/db_query.py:255 "
-			"(get_item_details_from_custom_fields)"
+			"apps/acme_reports/acme_reports/report/aged_payable_summary/"
+			"aged_payable_summary.py:255 (get_item_details_from_custom_fields)"
 		)
 
 		doc = types.SimpleNamespace()
@@ -167,13 +170,11 @@ class TestEndToEndRender:
 		doc.total_python_ms = 0
 		doc.total_sql_ms = 0
 		doc.analyzer_warnings = None
-		doc.compared_to_session = None
-		doc.is_baseline = 0
 		doc.v5_aggregate_json = "{}"
 		doc.actions = []
 		doc.findings = []
 
-		html = renderer.render(doc, recordings=[], mode="safe")
+		html = renderer.render(doc, recordings=[])
 
 		# Table renders with the fixed-layout class.
 		assert 'class="query-table"' in html
@@ -183,4 +184,4 @@ class TestEndToEndRender:
 		assert 'class="col-callsite"' in html
 		assert 'class="col-query"' in html
 		# Callsite itself is visible.
-		assert "db_query.py:255" in html
+		assert "aged_payable_summary.py:255" in html

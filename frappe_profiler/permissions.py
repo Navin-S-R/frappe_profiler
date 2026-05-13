@@ -4,25 +4,30 @@
 """Server-side permission gates for profiler artifacts.
 
 Currently exposes one gate: a `has_permission` for the File DocType that
-double-checks downloads of the raw profiler report. The UI hides the
-"Download Raw Report" button from non-admin users, but a malicious user
-who guessed the file URL could try to fetch it directly — this gate
-makes that fail.
+double-checks downloads of the profiler report. The UI hides the
+"Download Report" button from non-admin/non-owner users, but a malicious
+user who guessed the file URL could try to fetch it directly — this
+gate makes that fail.
+
+v0.6.0 Round 7: safe-mode reports were removed. The single remaining
+report (raw_report_file + raw_report_pdf_file) is admin-scoped via
+this gate.
 """
 
 import frappe
 
 PROFILER_SESSION_DOCTYPE = "Profiler Session"
+_GATED_FIELDS = frozenset({"raw_report_file", "raw_report_pdf_file"})
 
 
 def file_has_permission(doc, ptype=None, user=None):
-	"""Gate downloads of the raw profiler report.
+	"""Gate downloads of the profiler report (HTML + PDF).
 
 	Allows access to:
 	  - Anyone who passes the underlying parent permission check (handled
 	    by Frappe's built-in private file logic — Profiler User with
 	    if_owner=1, System Manager always)
-	  - Plus an additional check for raw_report_file specifically: only
+	  - Plus an additional check for the report files specifically: only
 	    System Manager OR the recording user, even if some other role
 	    accidentally got read access to the parent.
 
@@ -36,9 +41,8 @@ def file_has_permission(doc, ptype=None, user=None):
 	if doc.attached_to_doctype != PROFILER_SESSION_DOCTYPE:
 		return None
 
-	# Only intercept the raw_report_file field. Safe report uses standard
-	# parent-doc permission only.
-	if doc.attached_to_field != "raw_report_file":
+	# Only intercept the report files (HTML + lazy PDF).
+	if doc.attached_to_field not in _GATED_FIELDS:
 		return None
 
 	user = user or frappe.session.user

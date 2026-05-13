@@ -13,7 +13,8 @@
   "technical_detail_json",
   "estimated_impact_ms",
   "affected_count",
-  "action_ref"
+  "action_ref",
+  "llm_fix_json"
  ],
  "fields": [
   {
@@ -71,6 +72,13 @@
    "fieldname": "action_ref",
    "fieldtype": "Data",
    "label": "Action Ref",
+   "read_only": 1
+  },
+  {
+   "description": "JSON: AI-generated fix suggestion for this finding — {suggestion (markdown), model, provider, generated_at}. Populated on demand via the 'Suggest a fix (AI)' action; empty until then.",
+   "fieldname": "llm_fix_json",
+   "fieldtype": "Long Text",
+   "label": "AI Fix Suggestion (JSON)",
    "read_only": 1
   }
  ],

@@ -153,12 +153,73 @@ def _should_skip_request() -> bool:
 	request for every user with an active profiler session.
 	"""
 	cmd = _extract_cmd_from_request()
-	if not cmd:
-		return False
-	for prefix in _IGNORED_CMD_PREFIXES:
-		if cmd.startswith(prefix):
-			return True
+	if cmd:
+		for prefix in _IGNORED_CMD_PREFIXES:
+			if cmd.startswith(prefix):
+				return True
+
+	# v0.6.0 Round 6: also honor user-configured skip patterns from
+	# Profiler Settings. Match against the FULL request path (not just
+	# the cmd), so admins can skip non-method URLs too (e.g. their
+	# health-check endpoint at /healthz).
+	try:
+		from frappe_profiler.settings import get_config
+		patterns = get_config().skip_request_paths
+		if patterns:
+			path = ""
+			try:
+				request = getattr(frappe.local, "request", None)
+				path = (getattr(request, "path", "") or "")
+			except Exception:
+				path = ""
+			if path:
+				for pat in patterns:
+					if pat and path.startswith(pat):
+						return True
+	except Exception:
+		pass
+
 	return False
+
+
+def _resolve_sampler_interval_ms() -> float:
+	"""Resolve the pyinstrument sampler interval from Profiler Settings,
+	falling back to the legacy site_config key, then to the hardcoded
+	default. Single function so before_request + before_job stay in
+	sync without duplicating the precedence rule.
+	"""
+	# Setting first (preferred path).
+	try:
+		from frappe_profiler.settings import get_config
+		v = float(get_config().pyinstrument_sampler_interval_ms or 0)
+		if v > 0:
+			return v
+	except Exception:
+		pass
+	# Legacy site_config fallback for pre-v0.6.0 deployments that tuned
+	# this knob without saving the Single doc.
+	try:
+		v = frappe.conf.get("profiler_sampler_interval_ms")
+		if v:
+			return float(v)
+	except Exception:
+		pass
+	return float(_capture.DEFAULT_SAMPLER_INTERVAL_MS)
+
+
+def _should_skip_user(user: str | None) -> bool:
+	"""Return True if the current user is on the configured skip list.
+	Used to exclude system bot users (scheduler, healthchecks) from
+	instrumentation even when they have an active session.
+	"""
+	if not user:
+		return False
+	try:
+		from frappe_profiler.settings import get_config
+		skip = get_config().skip_users
+		return user in skip
+	except Exception:
+		return False
 
 
 def before_request(*args, **kwargs):
@@ -198,6 +259,12 @@ def before_request(*args, **kwargs):
 
 		user = getattr(frappe.session, "user", None)
 		if not user or user == "Guest":
+			return
+
+		# v0.6.0 Round 6: admin-configured user skip list. Checked early
+		# so a system bot user with an active session (rare but possible
+		# via API token) doesn't get profiled.
+		if _should_skip_user(user):
 			return
 
 		session_uuid = session.get_active_session_for(user)
@@ -259,10 +326,7 @@ def before_request(*args, **kwargs):
 			frappe.local._profiler_active_session_id = session_uuid
 			_capture._start_pyi_session(
 				local_proxy=frappe.local,
-				interval_ms=int(
-					frappe.conf.get("profiler_sampler_interval_ms")
-					or _capture.DEFAULT_SAMPLER_INTERVAL_MS
-				),
+				interval_ms=_resolve_sampler_interval_ms(),
 			)
 	except Exception:
 		# Never let a profiler bug break a customer request. Log and move on.
@@ -451,12 +515,23 @@ def before_job(method=None, kwargs=None, **rest):
 		if not user or user == "Guest":
 			return
 
-		# Verify the session is still active for this user. If the user
-		# stopped the session (or started a new one) between enqueue and
-		# run, the session ID in our kwargs no longer matches the active
-		# pointer — drop the recording silently.
+		# v0.6.0 Round 6: honor the configured user skip list for jobs
+		# too. A bot user that runs scheduled jobs via API token should
+		# stay out of every capture path.
+		if _should_skip_user(user):
+			return
+
+		# Verify the session is still recordable for this user. The active
+		# pointer matches while the session is running. After Stop the
+		# pointer is cleared, but the session keeps a short "draining"
+		# window during which jobs the flow enqueued are still recorded
+		# (analyze.run waits for them) — but ONLY when the user has NO
+		# active session, so a late job never bleeds into a *different*
+		# session the user started after stopping this one. If the user
+		# started a brand-new session (active != session_uuid and not
+		# None), drop this stale job recording.
 		active = session.get_active_session_for(user)
-		if active != session_uuid:
+		if active != session_uuid and not (active is None and session.is_draining(session_uuid)):
 			return
 
 		# All checks passed — activate the recorder for this job.
@@ -486,10 +561,7 @@ def before_job(method=None, kwargs=None, **rest):
 			frappe.local._profiler_active_session_id = session_uuid
 			_capture._start_pyi_session(
 				local_proxy=frappe.local,
-				interval_ms=int(
-					frappe.conf.get("profiler_sampler_interval_ms")
-					or _capture.DEFAULT_SAMPLER_INTERVAL_MS
-				),
+				interval_ms=_resolve_sampler_interval_ms(),
 			)
 	except Exception:
 		frappe.log_error(title="frappe_profiler before_job")
@@ -542,6 +614,19 @@ def after_job(method=None, kwargs=None, result=None, **rest):
 				)
 		except Exception:
 			frappe.log_error(title="frappe_profiler infra end snapshot (job)")
+
+		# v0.6.0: this job ran — drop its RQ id from the session's
+		# pending-jobs set so analyze.run's wait can end early. Best-effort.
+		try:
+			from rq import get_current_job
+
+			_rq_job = get_current_job()
+			_rq_jid = getattr(_rq_job, "id", None) if _rq_job is not None else None
+			_su = getattr(frappe.local, "profiler_session_id", None)
+			if _rq_jid and _su:
+				session.clear_pending_job(_su, _rq_jid)
+		except Exception:
+			pass
 
 		if hasattr(frappe.local, "profiler_session_id"):
 			del frappe.local.profiler_session_id

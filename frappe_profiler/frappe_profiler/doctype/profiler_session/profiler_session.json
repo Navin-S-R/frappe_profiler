@@ -30,8 +30,8 @@
   "findings",
   "phase_2_runs",
   "reports_section",
-  "safe_report_file",
   "raw_report_file",
+  "raw_report_pdf_file",
   "internal_section",
   "top_queries_json",
   "total_python_ms",
@@ -40,10 +40,7 @@
   "session_time_breakdown_json",
   "table_breakdown_json",
   "v5_aggregate_json",
-  "analyzer_warnings",
-  "compared_to_session",
-  "is_baseline",
-  "safe_report_pdf_file"
+  "analyzer_warnings"
  ],
  "fields": [
   {
@@ -100,7 +97,7 @@
    "fieldname": "notes",
    "fieldtype": "Text Editor",
    "label": "Steps to Reproduce / Notes",
-   "description": "What did you do during this session? Describe the flow step-by-step so your dev team (or a third-party reviewer) has full reproduction context alongside the technical findings. Also a good place for related ticket links. Rendered at the top of both Safe and Raw reports. Editable even on Ready sessions."
+   "description": "What did you do during this session? Describe the flow step-by-step so your dev team (or a third-party reviewer) has full reproduction context alongside the technical findings. Also a good place for related ticket links. Rendered at the top of the report. Editable even on Ready sessions."
   },
   {
    "fieldname": "timing_section",
@@ -206,16 +203,17 @@
    "label": "Reports"
   },
   {
-   "fieldname": "safe_report_file",
+   "description": "Full data — admin-scoped via Frappe File permissions.",
+   "fieldname": "raw_report_file",
    "fieldtype": "Attach",
-   "label": "Safe Report (shareable)",
+   "label": "Report",
    "read_only": 1
   },
   {
-   "description": "Full data, gated to System Manager and the recording user only.",
-   "fieldname": "raw_report_file",
+   "description": "PDF version of the report, generated lazily on first download.",
+   "fieldname": "raw_report_pdf_file",
    "fieldtype": "Attach",
-   "label": "Raw Report (admin only)",
+   "label": "Report (PDF)",
    "read_only": 1
   },
   {
@@ -278,29 +276,6 @@
    "hidden": 1,
    "label": "Analyzer Warnings",
    "read_only": 1
-  },
-  {
-   "fieldname": "compared_to_session",
-   "fieldtype": "Link",
-   "label": "Compared To Session",
-   "options": "Profiler Session",
-   "read_only": 1,
-   "description": "v0.4.0+: baseline session for comparison rendering. When set, the safe + raw reports include comparison sections against this baseline."
-  },
-  {
-   "fieldname": "is_baseline",
-   "fieldtype": "Check",
-   "label": "Is Baseline",
-   "default": 0,
-   "read_only": 1,
-   "description": "v0.4.0+: True when this session is the currently-pinned baseline for its label."
-  },
-  {
-   "fieldname": "safe_report_pdf_file",
-   "fieldtype": "Attach",
-   "label": "Safe Report (PDF, lazy-generated)",
-   "read_only": 1,
-   "description": "v0.4.0+: lazy-generated PDF version of the safe report. Populated on first download_pdf API call and cached thereafter."
   }
  ],
  "index_web_pages_for_search": 0,

@@ -220,8 +220,6 @@ class TestRendering:
 		doc.total_python_ms = 0
 		doc.total_sql_ms = 0
 		doc.analyzer_warnings = None
-		doc.compared_to_session = None
-		doc.is_baseline = 0
 		doc.v5_aggregate_json = "{}"
 		doc.actions = []
 
@@ -249,7 +247,7 @@ class TestRendering:
 		doc.findings = [row]
 
 		from frappe_profiler import renderer
-		html = renderer.render(doc, recordings=[], mode="safe")
+		html = renderer.render(doc, recordings=[])
 
 		assert 'class="small projected-after-fix"' in html
 		assert "Projected after fix:" in html
@@ -274,8 +272,7 @@ class TestRendering:
 		doc.table_breakdown_json = "[]"; doc.hot_frames_json = "[]"
 		doc.session_time_breakdown_json = "{}"
 		doc.total_python_ms = 0; doc.total_sql_ms = 0
-		doc.analyzer_warnings = None; doc.compared_to_session = None
-		doc.is_baseline = 0; doc.v5_aggregate_json = "{}"
+		doc.analyzer_warnings = None; doc.v5_aggregate_json = "{}"
 		doc.actions = []
 
 		row = types.SimpleNamespace()
@@ -294,6 +291,6 @@ class TestRendering:
 		doc.findings = [row]
 
 		from frappe_profiler import renderer
-		html = renderer.render(doc, recordings=[], mode="safe")
+		html = renderer.render(doc, recordings=[])
 
 		assert "Projected after fix" not in html

@@ -50,14 +50,17 @@ class TestHeadlinePace:
 		)
 		assert es["pace"] == "slow"
 
-	def test_headline_includes_ms_queries_actions(self):
+	def test_headline_includes_ms_queries_operations(self):
 		es = _build_executive_summary(
 			findings=[], session_doc=_doc(total_ms=1200, queries=30, actions=3),
 			v5={},
 		)
+		# Plain-English wording for a non-developer: "operations" not "actions",
+		# "database queries" not bare "queries".
 		assert "1200ms" in es["headline"]
-		assert "30 queries" in es["headline"]
-		assert "3 action" in es["headline"]
+		assert "30 database queries" in es["headline"]
+		assert "3 operation" in es["headline"]
+		assert "action" not in es["headline"]
 
 
 class TestTopBullets:
@@ -182,8 +185,6 @@ class TestEndToEndRender:
 		doc.total_python_ms = 0
 		doc.total_sql_ms = 0
 		doc.analyzer_warnings = None
-		doc.compared_to_session = None
-		doc.is_baseline = 0
 		doc.v5_aggregate_json = json.dumps({
 			"infra_summary": {"rss_delta": 90_000_000}
 		})
@@ -202,18 +203,28 @@ class TestEndToEndRender:
 		})
 		doc.findings = [finding_row]
 
-		html = renderer.render(doc, recordings=[], mode="safe")
+		html = renderer.render(doc, recordings=[])
 
 		# Exec card class present, slow pace.
 		assert 'class="exec-summary pace-slow"' in html, (
 			"Slow-session card must have pace-slow class for red border"
 		)
-		# Headline has pace values.
+		# Headline has pace values, plain-English wording (operations, not actions).
 		assert "6000ms" in html
+		assert "operation" in html
 		# Top finding surfaced by its title.
 		assert "Same query ran 50× at myapp/foo.py:10" in html
 		# Infra note emitted.
 		assert "90MB" in html
+		# v0.6.0: stat cards are plainly labelled, and the "Issues found" card's
+		# big number is the TOTAL finding count (not the High count), with a
+		# severity breakdown that sums to it.
+		assert "Issues found" in html and "Database queries" in html
+		import re as _re
+		m = _re.search(r'Issues found</div>\s*<div class="value">(.*?)</div>\s*<div class="sub">(.*?)</div>', html, _re.S)
+		assert m, "could not locate the 'Issues found' stat card"
+		assert _re.sub(r"<[^>]+>", "", m.group(1)).strip() == "1"  # one finding total
+		assert "1 high" in _re.sub(r"<[^>]+>", "", m.group(2))
 
 	def test_clean_session_no_card(self):
 		from frappe_profiler import renderer
@@ -239,13 +250,11 @@ class TestEndToEndRender:
 		doc.total_python_ms = 0
 		doc.total_sql_ms = 0
 		doc.analyzer_warnings = None
-		doc.compared_to_session = None
-		doc.is_baseline = 0
 		doc.v5_aggregate_json = "{}"
 		doc.actions = []
 		doc.findings = []
 
-		html = renderer.render(doc, recordings=[], mode="safe")
+		html = renderer.render(doc, recordings=[])
 
 		# No exec card: zero findings + no infra signal.
 		assert 'class="exec-summary' not in html, (

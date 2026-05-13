@@ -123,24 +123,18 @@ def test_template_has_observations_subsection_inside_findings():
 	)
 
 
-def test_severity_counts_reflect_only_actionable_findings():
-	"""The session's severity summary (shown in the stats card +
-	consumed by the top_severity computation) must count only the
-	actionable findings. Mixing in observations would make 'High:
-	3' include 2 framework issues that the user can't fix —
-	misleading."""
+def test_severity_counts_cover_all_findings():
+	"""v0.6.0: `severity_counts` (the "Issues found" stat card's sub-line)
+	must count ALL findings — actionable + observational — so the card's
+	big number (total), its sub-line, and the Summary prose's count all
+	agree. (Previously it counted actionable-only, which made the big
+	number and the breakdown disagree.)"""
 	src = inspect.getsource(renderer.render)
-	# The severity_counts dict is computed from `findings`, which
-	# v0.5.2 sets to actionable_findings. The comment in the
-	# render() source explains this explicitly.
 	assert "severity_counts" in src
-	# Check that the count comprehension runs over `findings` (the
-	# actionable list after v0.5.2 rebind), not `all_findings`.
-	# Find the severity_counts block and verify it uses `findings`.
 	sc_idx = src.find('"severity_counts"')
 	assert sc_idx > 0
 	sc_block = src[sc_idx:sc_idx + 600]
-	assert "for f in findings" in sc_block, (
-		"severity_counts must iterate `findings` (the actionable "
-		"list after the v0.5.2 split), not the full pre-split list"
+	assert "for f in all_findings" in sc_block, (
+		"severity_counts must iterate `all_findings` (the full list), so "
+		"the 'Issues found' card's total and breakdown line up"
 	)

@@ -38,6 +38,7 @@ def _patch_enqueue():
 	_original_enqueue = _bg.enqueue
 
 	def _profiler_enqueue(method, *args, **kwargs):
+		active = None
 		try:
 			# Lazy import to avoid circular dependency on app init.
 			from frappe_profiler import session as _profiler_session
@@ -69,7 +70,28 @@ def _patch_enqueue():
 		except Exception:
 			# Never break enqueue. The profiler is best-effort by design.
 			pass
-		return _original_enqueue(method, *args, **kwargs)
+
+		job = _original_enqueue(method, *args, **kwargs)
+
+		# v0.6.0: register the RQ job id with the session so analyze waits
+		# for it to finish before gathering recordings — so jobs that get
+		# picked up by a worker shortly after Stop aren't lost. `job` is
+		# None for `now=True` inline jobs (nothing async to wait for). Never
+		# track our own analyze job (it would deadlock the wait on itself).
+		try:
+			if (
+				active
+				and job is not None
+				and getattr(job, "id", None)
+				and method != "frappe_profiler.analyze.run"
+			):
+				from frappe_profiler import session as _profiler_session
+
+				_profiler_session.register_pending_job(active, job.id)
+		except Exception:
+			pass
+
+		return job
 
 	_profiler_enqueue._profiler_patched = True
 	_profiler_enqueue.__wrapped__ = _original_enqueue

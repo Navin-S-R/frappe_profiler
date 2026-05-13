@@ -3,23 +3,14 @@
 
 """HTML report renderer for a Profiler Session.
 
-Two modes from a single Jinja template:
-
-    safe — Normalized SQL only (literals replaced with `?`), no headers,
-           no form data, no full stack traces. The customer can hand this
-           to a third-party dev shop without leaking PII.
-
-    raw  — Full data: raw SQL with literal values, request headers, form
-           data, and the complete stack trace for every query. Stays on
-           the customer's site only — gated to System Manager + the
-           recording user via Frappe's file permission system.
+Renders a single admin-scoped report: full data including raw SQL with
+literal values, request headers, form data, and complete stack traces.
+Gated to System Manager + the recording user via Frappe's File
+permission hook (see permissions.py:file_has_permission).
 
 The template is loaded directly from the file system (not via Frappe's
 Jinja environment) so the renderer is unit-testable in isolation and
 doesn't depend on a running site.
-
-Both modes render from the same template; the `mode` context variable
-toggles redaction-sensitive sections.
 """
 
 import functools
@@ -27,7 +18,6 @@ import json
 import os
 import re
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -36,202 +26,11 @@ from frappe_profiler.analyzers.base import SEVERITY_ORDER
 _TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 
 
-# ---------------------------------------------------------------------------
-# v0.5.0: URL redaction for Safe Report mode
-# ---------------------------------------------------------------------------
-# Mirrors how SQL normalization works in top_queries.py: full text in Raw,
-# redacted form in Safe, both derived from the same stored blob. Applied
-# to frontend XHR URLs and page paths in the Frontend panel.
-
-_DOCNAME_PATH_RE = re.compile(r"^/app/([^/]+)/([^/?#]+)")
-
-# Frappe's /app/<doctype>/<second> URL scheme uses reserved second-segment
-# keywords for list/view/new/report/calendar/etc. These aren't docnames
-# and must NOT be replaced with <name> — that would mangle list routes
-# into `/app/sales-invoice/<name>/list` which is semantically wrong.
-# v0.5.1 fix for the false-positive flagged in the architect review.
-_APP_RESERVED_SEGMENTS = frozenset({
-	"view",         # list/report view suffix
-	"new",          # new-doc form
-	"edit",         # edit form (rare)
-	"list",         # direct list route
-	"report",       # report view
-	"tree",         # tree view
-	"dashboard",    # dashboard view
-	"calendar",     # calendar view
-	"kanban",       # kanban board
-	"gantt",        # gantt chart
-	"image",        # image gallery
-	"inbox",        # inbox view
-	"print",        # print format preview
-})
-
-# Query string values are redacted by default in Safe mode (denylist
-# strategy: redact everything that isn't explicitly marked safe). This
-# is the opposite of the old allowlist approach — safer for custom
-# Frappe apps that add their own filter keys, because we never miss
-# a PII leak just because we didn't know about a new key name.
-#
-# Safe keys are schema references, pagination/sort flags, and format
-# hints — values that can't contain customer data.
-_QS_SAFE_KEYS = frozenset({
-	# Schema references (code identifiers, not PII)
-	"doctype", "fieldtype", "fieldname", "parenttype", "parentfield",
-	# Pagination
-	"limit", "offset", "limit_start", "limit_page_length", "start", "page_length",
-	# Sorting
-	"order_by", "sort_by", "sort_order", "sort",
-	# Format hints
-	"as_array", "as_list", "as_dict", "format", "json", "csv",
-	# Extension flags
-	"with_childnames", "with_comment_count", "debug", "ignore_permissions",
-	# Cache behavior
-	"cache", "refresh", "force", "cmd",
-})
-
-
-def _safe_url(url: str | None) -> str:
-	"""Redact PII from a captured URL for Safe Report mode.
-
-	Redaction rules:
-	  /app/<doctype>/<name>/...   ->  /app/<doctype>/<name>/...  (strip docname,
-	                                  unless the second segment is a Frappe
-	                                  reserved keyword like `view`, `list`,
-	                                  `new`, etc. — those are route hints,
-	                                  not docnames).
-	  ?<key>=<value>              ->  ?<key>=?  (for every key NOT in
-	                                  _QS_SAFE_KEYS — denylist strategy).
-
-	Method URLs (/api/method/frappe.client.save) pass through because
-	method names are code identifiers, not PII — same status as SQL
-	table names after normalization.
-
-	Non-string / None inputs return "" rather than raising.
-	"""
-	if not url or not isinstance(url, str):
-		return ""
-
-	parsed = urlparse(url)
-
-	# Docname path redaction with reserved-segment guard.
-	m = _DOCNAME_PATH_RE.match(parsed.path)
-	if m and m.group(2) not in _APP_RESERVED_SEGMENTS:
-		path = _DOCNAME_PATH_RE.sub(r"/app/\1/<name>", parsed.path)
-	else:
-		path = parsed.path
-
-	# Query string denylist: redact everything not explicitly safe.
-	if parsed.query:
-		pairs = parse_qsl(parsed.query, keep_blank_values=True)
-		redacted_pairs = [
-			(key, value if key in _QS_SAFE_KEYS else "?")
-			for key, value in pairs
-		]
-		query = urlencode(redacted_pairs, doseq=True)
-	else:
-		query = ""
-
-	return urlunparse((
-		parsed.scheme,
-		parsed.netloc,
-		path,
-		parsed.params,
-		query,
-		parsed.fragment,
-	))
-
-# ---------------------------------------------------------------------------
-# Sensitive field redaction (Round 2, fix #1)
-# ---------------------------------------------------------------------------
-# Even though the raw report is permission-gated to System Manager + the
-# recording user, once downloaded to local disk it can leak to backup
-# systems, screen shares, email, etc. We redact known-sensitive field
-# names from headers and form_dict BEFORE they hit the template, keeping
-# the field NAME (useful signal for the developer) but replacing the
-# VALUE with "[REDACTED]".
-#
-# Patterns are case-insensitive, matched against the full field name.
-# Add new patterns here when you see leaks in real reports.
-
-_SENSITIVE_FIELD_PATTERNS = [
-	re.compile(p, re.IGNORECASE)
-	for p in (
-		# Auth
-		r"password",
-		r"passwd",
-		r"^pwd$",
-		r"secret",
-		r"token",
-		r"api[-_]?key",
-		r"^authorization$",
-		r"^auth$",
-		r"bearer",
-		# Session / cookies
-		r"^cookie$",
-		r"^set[-_]cookie$",
-		r"^sid$",
-		r"session[-_]?id",
-		r"csrf",
-		r"x[-_]frappe[-_]csrf",
-		# Two-factor / OTP
-		r"otp",
-		r"verification[-_]?code",
-		# Cards / payment
-		r"card[-_]?number",
-		r"cvv",
-		r"ccv",
-		# Personal identifiers (conservative — false positives are fine)
-		r"ssn",
-		r"aadhar",
-		r"aadhaar",
-		r"pan[-_]?number",
-	)
-]
-
-_REDACTED = "[REDACTED]"
-
-
-def _redact_value(key: Any, value: Any, depth: int = 0) -> Any:
-	"""Recursively redact sensitive values in a dict or list.
-
-	Rule: scalar values at sensitive keys are replaced with [REDACTED],
-	but containers (dicts and lists) are always recursed into so nested
-	non-sensitive fields are preserved. This gives the dev shop maximum
-	useful context (e.g. `auth: {username: "alice"}` stays visible even
-	though the parent key is "auth") while still scrubbing credentials.
-
-	Max depth 4 prevents runaway recursion on circular structures (Frappe
-	form_dicts are usually flat or one level deep, so 4 is plenty).
-	"""
-	if depth > 4:
-		return value
-
-	# Recurse into containers regardless of the parent key. Nested
-	# sensitive children will still be caught at their own level.
-	if isinstance(value, dict):
-		return {k: _redact_value(k, v, depth + 1) for k, v in value.items()}
-	if isinstance(value, (list, tuple)):
-		return [_redact_value(key, v, depth + 1) for v in value]
-
-	# For scalar values only: check if the key is sensitive.
-	key_str = str(key).lower()
-	for pattern in _SENSITIVE_FIELD_PATTERNS:
-		if pattern.search(key_str):
-			return _REDACTED
-	return value
-
-
-def redact_sensitive(obj: Any) -> Any:
-	"""Top-level redaction entry point — returns a copy of obj with all
-	sensitive fields blanked out. Used by the renderer to sanitize
-	recording.headers and recording.form_dict before they hit the raw
-	report template.
-	"""
-	if obj is None:
-		return None
-	if isinstance(obj, dict):
-		return {k: _redact_value(k, v) for k, v in obj.items()}
-	return obj
+# v0.6.0 Round 7: safe-mode redaction removed. _safe_url, redact_sensitive,
+# _SENSITIVE_FIELD_PATTERNS, and the URL-docname/QS denylist all lived
+# here. The product now ships one admin-scoped report, so the
+# defense-in-depth redaction layer is gone. See product_thesis_self_hosted.md
+# memory for the rationale.
 
 
 @functools.lru_cache(maxsize=1)
@@ -253,21 +52,21 @@ def render(
 	session_doc: Any,
 	recordings: list[dict] | None = None,
 	*,
-	mode: str = "safe",
 	generated_at: str | None = None,
 ) -> str:
 	"""Render a Profiler Session to standalone HTML.
+
+	v0.6.0 Round 7: collapsed from a two-mode (safe/raw) renderer to a
+	single admin-scoped report. Permission gating is the responsibility
+	of the caller (download_pdf, file permission hooks).
 
 	Args:
 	    session_doc: The Profiler Session DocType row (loaded via
 	        frappe.get_doc). Provides totals, summary_html, and the
 	        actions/findings child rows.
-	    recordings: The in-memory recordings list. Used by BOTH modes for
-	        the per-action query drill-down (safe mode shows normalized
-	        queries; raw mode shows raw SQL + headers + form_dict +
-	        stacks). Can be None in safe mode if you only want the summary
-	        view, but the per-action breakdown will be omitted.
-	    mode: "safe" or "raw". Raw mode requires recordings.
+	    recordings: The in-memory recordings list. Required — provides
+	        raw SQL, headers, form_dict, and full stack traces for the
+	        per-action drill-down.
 	    generated_at: ISO timestamp of when this report was generated;
 	        defaults to now() if not provided.
 
@@ -275,49 +74,184 @@ def render(
 	    Standalone HTML as a string. Inline CSS, no external assets, no
 	    JavaScript. Self-contained for emailing or attaching to a ticket.
 	"""
-	if mode not in ("safe", "raw"):
-		raise ValueError(f"Invalid renderer mode: {mode!r} (expected 'safe' or 'raw')")
-
-	if mode == "raw" and recordings is None:
-		raise ValueError("raw mode requires the recordings list")
+	if recordings is None:
+		raise ValueError("recordings list is required")
 
 	template = _get_jinja_env().get_template("report.html")
 
 	# Build the per-action drill-down structure. We pair each Profiler
 	# Action child row with its source recording so the template can show
 	# full SQL / headers / form_dict for that action.
-	#
-	# CRITICAL: Even though the raw report is permission-gated, we still
-	# run the sensitive-field redactor on headers and form_dict before
-	# they hit the template. This is defense-in-depth — once the HTML is
-	# downloaded, Frappe's permission system no longer protects it.
-	# See _SENSITIVE_FIELD_PATTERNS at the top of this file for what's
-	# redacted.
 	recordings_by_uuid: dict[str, dict] = {}
 	if recordings:
 		for r in recordings:
 			uid = r.get("uuid")
 			if not uid:
 				continue
-			# Shallow copy so we don't mutate the caller's recording dict.
-			# (The analyze pipeline may still use the un-redacted data
-			# after rendering completes.)
-			redacted = dict(r)
-			redacted["headers"] = redact_sensitive(r.get("headers"))
-			redacted["form_dict"] = redact_sensitive(r.get("form_dict"))
-			recordings_by_uuid[uid] = redacted
+			recordings_by_uuid[uid] = dict(r)
 
-	actions = [_action_to_dict(a) for a in (session_doc.actions or [])]
-	all_findings = [_finding_to_dict(f) for f in (session_doc.findings or [])]
+	# `idx` = the action's original position — matches a finding's `action_ref`
+	# (which is the action index as a string) so the Background-jobs section
+	# can tally findings per job even after the min-duration filter below.
+	actions = [
+		dict(_action_to_dict(a), idx=i) for i, a in enumerate(session_doc.actions or [])
+	]
+	# v0.6.0 Round 6: Profiler Settings ▸ Min Action Duration declutters
+	# the per-action breakdown by hiding sub-threshold actions from the
+	# table only. The DocType row is still persisted (queryable via
+	# API), so admins can lift the threshold without losing data.
+	try:
+		from frappe_profiler.settings import get_config as _get_config
+		_min_action_ms = float(_get_config().min_action_duration_ms or 0)
+	except Exception:
+		_min_action_ms = 0.0
+	if _min_action_ms > 0:
+		actions = [
+			a for a in actions
+			if (a.get("duration_ms") or 0) >= _min_action_ms
+		]
+	# v0.6.x: per-action entry-point source location + ±1-line snippet,
+	# shown under each row in the per-action breakdown and Background Jobs
+	# sections. One shared file-line cache so a cluster of actions in the
+	# same source file reads it once. Done before build_background_jobs so
+	# the job dicts can copy the resolved callsite off the action dict.
+	_entry_src_cache: dict[str, list[str] | None] = {}
+	for _a in actions:
+		_a["entry_callsite"] = _action_entry_callsite(_a, cache=_entry_src_cache)
+	# v0.6.0 Round 2: per-render file cache for the lazy snippet read in
+	# _finding_to_dict. A session with a dozen findings clustered in 2-3
+	# source files reads each file once instead of once per finding.
+	_finding_file_cache: dict[str, list[str] | None] = {}
+	all_findings = [
+		_finding_to_dict(f, _finding_file_cache)
+		for f in (session_doc.findings or [])
+	]
+	# v0.6.x: SQL "red flag" findings carry no callsite — derive a
+	# representative one (the hottest user-app frame that ran the offending
+	# query) from the recordings so their smoking-gun block can render too.
+	_attach_representative_callsites(all_findings, recordings or [], file_cache=_finding_file_cache)
+	# v0.6.x: which document each save/submit action touched, and which
+	# doc-event lifecycle hook each slow function fired in.
+	_attach_action_context(actions, all_findings, recordings_by_uuid)
+	# v0.6.x: "Ignored Apps" — drop findings whose blame app is in the
+	# admin's exclusion list, BEFORE anything downstream sees the list
+	# (doc-event breakdown, background-jobs tally, exec summary, severity
+	# counts, the actionable/observational split, bucketing). The "Issues
+	# found" stat card then shows the kept count + a small "(N hidden)"
+	# note from the context vars below.
+	try:
+		from frappe_profiler.settings import get_ignored_apps as _get_ignored
+		ignored_apps = tuple(sorted({a for a in (_get_ignored() or ()) if a}))
+	except Exception:
+		ignored_apps = ()
+	ignored_findings_count = 0
+	if ignored_apps:
+		_ignored_set = set(ignored_apps)
+		_kept = []
+		for _f in all_findings:
+			if _app_from_finding(_f) in _ignored_set:
+				ignored_findings_count += 1
+				continue
+			_kept.append(_f)
+		all_findings = _kept
+
+	# v0.6.x: re-group the slow lifecycle findings by DocType → event for the
+	# "Doc-event lifecycle" section (consumes the hook_events/target_doc that
+	# _attach_action_context just attached).
+	doc_event_breakdown = _build_doc_event_breakdown(all_findings)
+
+	# v0.6.0: the "Background jobs" section — the captured background-job
+	# recordings, surfaced on their own (they also stay in the per-action
+	# table). Derived from the persisted action rows; uses all findings
+	# (actionable + observational) for the per-job findings tally.
+	background_jobs = build_background_jobs(actions, recordings_by_uuid, all_findings)
 
 	try:
 		top_queries = json.loads(session_doc.top_queries_json or "[]")
 	except Exception:
 		top_queries = []
+	# The slowest-queries leaderboard is user-app-only and skips
+	# trivially-fast queries. New sessions are already filtered by the
+	# top_queries analyzer; re-applying it here means sessions captured
+	# before that change also get scoped down when regenerated.
+	top_queries = _filter_top_queries_for_display(top_queries)
 	try:
 		table_breakdown = json.loads(session_doc.table_breakdown_json or "[]")
 	except Exception:
 		table_breakdown = []
+	# v0.6.0: an LLM-vetted index recommendation may be stashed on a table
+	# entry (by analyze.py's auto step or the "Suggest an index (AI)" button)
+	# as ``ai_index = {"suggestion": <markdown>, "model": ..., ...}``. Render
+	# the markdown → sanitized HTML here so the template can `| safe` it
+	# (same path as the finding AI-fix blocks).
+	for _t in table_breakdown:
+		if isinstance(_t, dict) and isinstance(_t.get("ai_index"), dict):
+			raw = (_t["ai_index"].get("suggestion") or "").strip()
+			if raw:
+				_t["ai_index"]["suggestion_html"] = _markdown_to_safe_html(raw)
+
+	# v0.6.x: a per-section LLM toggle being off is a hard disable — drop any
+	# previously-generated AI output for that section so re-rendering an older
+	# session (analyzed while it was on) doesn't show the block. (Humanized
+	# notes live in Profiler Session.notes — a plain HTML field — so they're
+	# not stripped here; turning that section off stops new generation, but an
+	# already-humanized note stays until the session is re-analyzed.)
+	try:
+		from frappe_profiler.settings import get_config as _get_cfg
+		_cfg = _get_cfg()
+		_ai_findings_on = getattr(_cfg, "ai_suggest_findings", True)
+		_ai_indexes_on = getattr(_cfg, "ai_suggest_indexes", True)
+		_hide_framework_tables = getattr(_cfg, "hide_framework_tables", True)
+		# v0.6.x: snapshot the render-affecting settings so the footer can
+		# stamp THIS file with the values that were in effect. Saved HTML
+		# only re-renders on Regenerate Reports / Retry Analyze — the stamp
+		# means a user opening an old file can immediately tell whether the
+		# settings they expect are actually baked in.
+		render_config = {
+			"hide_framework_tables": _hide_framework_tables,
+			"tracked_apps": tuple(getattr(_cfg, "tracked_apps", ()) or ()),
+			"ignored_apps": tuple(getattr(_cfg, "ignored_apps", ()) or ()),
+			"ai_suggest_findings": _ai_findings_on,
+			"ai_suggest_indexes": _ai_indexes_on,
+			"min_action_duration_ms": float(
+				getattr(_cfg, "min_action_duration_ms", 0.0) or 0.0
+			),
+		}
+	except Exception:
+		_ai_findings_on = _ai_indexes_on = True
+		_hide_framework_tables = True
+		render_config = {
+			"hide_framework_tables": True,
+			"tracked_apps": (),
+			"ignored_apps": (),
+			"ai_suggest_findings": True,
+			"ai_suggest_indexes": True,
+			"min_action_duration_ms": 0.0,
+		}
+	if not _ai_findings_on:
+		for _f in all_findings:
+			_f["llm_fix"] = None
+	if not _ai_indexes_on:
+		for _t in table_breakdown:
+			if isinstance(_t, dict):
+				_t.pop("ai_index", None)
+
+	# v0.6.x: drop framework/internal db tables from the "Time spent per
+	# database table" section — schema/meta (DocType/DocField/…), user-
+	# session bookkeeping (User/Has Role/DefaultValue/…), and information_
+	# schema.*. The note under the section's intro reports the count so the
+	# total stays honest. Scope is intentional: top-queries leaderboard /
+	# per-action drill-down / full recordings keep their raw data.
+	hidden_db_tables_count = 0
+	if _hide_framework_tables:
+		from frappe_profiler.analyzers.base import is_framework_db_table
+		_kept_tb = []
+		for _t in table_breakdown:
+			if isinstance(_t, dict) and is_framework_db_table(_t.get("table")):
+				hidden_db_tables_count += 1
+				continue
+			_kept_tb.append(_t)
+		table_breakdown = _kept_tb
 
 	# Sort all findings: highest severity first, then highest impact.
 	all_findings.sort(
@@ -355,16 +289,6 @@ def render(
 
 	# v0.3.0: load donut + hot frames data from the new fields. Each
 	# helper degrades to empty/None if the field is missing (old session).
-	allowed_prefixes = ()
-	try:
-		import frappe
-
-		allowed_prefixes = tuple(
-			frappe.conf.get("profiler_safe_extra_allowed_apps") or ()
-		)
-	except Exception:
-		pass
-
 	try:
 		_breakdown = json.loads(getattr(session_doc, "session_time_breakdown_json", None) or "{}")
 	except Exception:
@@ -374,45 +298,19 @@ def render(
 	except Exception:
 		_hot_frames_raw = []
 
-	donut_slices = build_donut_data(_breakdown, mode=mode, allowed_prefixes=allowed_prefixes)
+	donut_slices = build_donut_data(_breakdown)
 	donut_svg = build_donut_svg(donut_slices)  # v0.4.0: PDF fallback
-	hot_frames_rows = build_hot_frames_table(
-		_hot_frames_raw, mode=mode, allowed_prefixes=allowed_prefixes,
-	)
+	# (hot_frames_rows is built below after tracked_apps is read so the
+	# raw rows can be split by framework-app first.)
 
 	def _redact_for_template(node):
-		return redact_frame_name(node, mode=mode, allowed_prefixes=allowed_prefixes)
+		return redact_frame_name(node)
 
 	def _from_json(s):
 		try:
 			return json.loads(s) if s else {}
 		except Exception:
 			return {}
-
-	# v0.4.0: compute comparison data if a baseline is set
-	comparison_data = None
-	baseline_uuid = getattr(session_doc, "compared_to_session", None)
-	if baseline_uuid:
-		try:
-			import frappe
-
-			baseline = frappe.get_doc("Profiler Session", baseline_uuid)
-			if getattr(baseline, "status", None) == "Ready":
-				from frappe_profiler import comparison as _cmp
-
-				comparison_data = _cmp.compute_comparison(
-					new_session=session_doc, baseline_session=baseline,
-				)
-		except Exception:
-			# Baseline deleted, in Failed state, or comparison computation
-			# failed — log and render without comparison sections.
-			try:
-				import frappe
-
-				frappe.log_error(title="frappe_profiler comparison render")
-			except Exception:
-				pass
-			comparison_data = None
 
 	# v0.5.0: infra_pressure + frontend_timings aggregates. One JSON field
 	# holds both. Empty fallbacks let sessions captured before v0.5.0
@@ -488,6 +386,43 @@ def render(
 		observational_findings, tracked_apps
 	)
 
+	# v0.6.x: prioritise custom-app rows in each of the 4 main listing
+	# sections (per-action, top-queries, background-jobs, hot-frames).
+	# Each list is split into a custom-app primary + a framework-app
+	# secondary; the template renders the primary in the main <table>
+	# and the framework list inside a collapsed <details class="subsection">.
+	# Sort order WITHIN each bucket is preserved (existing duration sort).
+	actions, actions_framework = _split_by_framework_app(
+		actions,
+		lambda a: (a.get("entry_callsite") or {}).get("_abs") or _action_dotted_entry(a),
+		tracked_apps,
+	)
+	top_queries, top_queries_framework = _split_by_framework_app(
+		top_queries,
+		lambda q: q.get("callsite"),
+		tracked_apps,
+	)
+	_bg_jobs_custom, _bg_jobs_framework = _split_by_framework_app(
+		background_jobs.get("jobs") or [],
+		lambda j: (j.get("entry_callsite") or {}).get("_abs")
+		or (j.get("method") or "").split(".", 1)[0],
+		tracked_apps,
+	)
+	background_jobs["jobs"] = _bg_jobs_custom
+	background_jobs["jobs_framework"] = _bg_jobs_framework
+	background_jobs["framework_count"] = len(_bg_jobs_framework)
+	# Hot-frames classification reads the analyzer's `function` key
+	# (shape: ``"<short_path>::<func>"`` from _redacted_module_key), which
+	# `build_hot_frames_table` strips on the way to `display_name`. So split
+	# the raw rows first, then build each table separately.
+	_hf_raw_custom, _hf_raw_framework = _split_by_framework_app(
+		_hot_frames_raw,
+		lambda r: (r.get("function") or "").split("::", 1)[0],
+		tracked_apps,
+	)
+	hot_frames_rows = build_hot_frames_table(_hf_raw_custom)
+	hot_frames_rows_framework = build_hot_frames_table(_hf_raw_framework)
+
 	# v0.5.2 round 3: executive summary — top 3 most-impactful findings
 	# stated in plain English, rendered in a card at the top of the
 	# report. A non-developer (e.g. a project manager) reading this
@@ -502,38 +437,66 @@ def render(
 	context = {
 		"session": session_doc,
 		"actions": actions,
+		# v0.6.x: framework-app actions, rendered in a collapsed sub-block
+		# below the primary per-action table. Empty → no sub-block.
+		"actions_framework": actions_framework,
+		# v0.6.0: background jobs the profiled flow enqueued (focused view;
+		# they also appear in `actions`). Falsy `.count` → the template omits
+		# the section. Note: ``background_jobs.jobs`` now holds only custom-app
+		# jobs; framework-app jobs live in ``background_jobs.jobs_framework``.
+		"background_jobs": background_jobs,
+		# v0.6.x: slow lifecycle findings re-grouped by DocType → event. Falsy
+		# `.count` → the template omits the section.
+		"doc_event_breakdown": doc_event_breakdown,
 		"analyzer_warnings": analyzer_warnings,
 		"truncation_banner": truncation_banner,
 		"findings_by_app": findings_by_app,
 		"observational_findings_by_app": observational_findings_by_app,
 		"executive_summary": executive_summary,
 		# v0.5.2: "findings" holds actionable items only (shown in
-		# "Findings — what to fix"). The severity counts and the
-		# summary reflect ACTIONABLE findings — not the observations
-		# — so the session status shows what the user needs to ship,
-		# not infra noise.
+		# "Findings — what to fix"); "observational_findings" the rest.
+		# "all_findings" is the full list — the "Issues found" stat card
+		# shows that total and a severity breakdown of it, so its big
+		# number, its sub-line, and the Summary prose all agree.
 		"findings": findings,
 		"observational_findings": observational_findings,
+		"all_findings": all_findings,
 		"top_queries": top_queries,
+		# v0.6.x: framework-callsite top queries (typically empty because
+		# top_queries is already filtered at analyze time AND render time;
+		# the split is wired for consistency with the other 3 sections).
+		"top_queries_framework": top_queries_framework,
 		"table_breakdown": table_breakdown,
 		"recordings_by_uuid": recordings_by_uuid,
-		"mode": mode,
 		"generated_at": generated_at or _now_iso(),
 		"server_tz": _get_server_timezone(),
-		# Severity counts for the summary — actionable only, so the
-		# session badge reflects fixable items.
+		# Format datetimes per the site's System Settings (drops microseconds).
+		"fmt_dt": _format_datetime_display,
+		# Severity breakdown of ALL findings — feeds the "Issues found" stat
+		# card's sub-line (which sums to the card's total).
 		"severity_counts": {
-			"High": sum(1 for f in findings if f["severity"] == "High"),
-			"Medium": sum(1 for f in findings if f["severity"] == "Medium"),
-			"Low": sum(1 for f in findings if f["severity"] == "Low"),
+			"High": sum(1 for f in all_findings if f["severity"] == "High"),
+			"Medium": sum(1 for f in all_findings if f["severity"] == "Medium"),
+			"Low": sum(1 for f in all_findings if f["severity"] == "Low"),
 		},
+		# v0.6.x: the "Ignored Apps" exclusion list, plus how many findings
+		# this render dropped — surfaced as a small note next to the stat
+		# card so the missing-bucket count is honest. Empty/zero → no note.
+		"ignored_apps": ignored_apps,
+		"ignored_findings_count": ignored_findings_count,
+		# v0.6.x: how many framework/internal db tables the "Time spent per
+		# database table" section dropped — surfaced as a small note in that
+		# section. Zero → no note.
+		"hidden_db_tables_count": hidden_db_tables_count,
 		# v0.3.0 additions
 		"donut_slices": donut_slices,
 		"hot_frames_rows": hot_frames_rows,
+		# v0.6.x: framework-app hot frames, rendered in a collapsed sub-block
+		# below the primary hot-frames table. Empty → no sub-block.
+		"hot_frames_rows_framework": hot_frames_rows_framework,
 		"redact_frame_name": _redact_for_template,
 		"from_json": _from_json,
 		# v0.4.0 additions
-		"comparison": comparison_data,
 		"donut_svg": donut_svg,
 		# v0.5.0 additions
 		"infra_timeline": v5.get("infra_timeline") or [],
@@ -542,35 +505,27 @@ def render(
 		"frontend_vitals_by_page": v5.get("frontend_vitals_by_page") or {},
 		"frontend_orphans": v5.get("frontend_orphans") or [],
 		"frontend_summary": v5.get("frontend_summary") or {},
-		"safe_url": _safe_url,
 		"notes_html": notes_html,  # sanitized, safe to pass through |safe
 		# v0.6.0 phase-2 line profiler — pre-rendered HTML so the existing
 		# report.html template only needs a single {{ phase2_html | safe }}
 		# include instead of growing by 100+ lines of new markup.
-		"phase2_html": _render_phase2_panel(session_doc, mode),
+		"phase2_html": _render_phase2_panel(session_doc),
+		# v0.6.0 finding-card smoking gun: cross-link a finding's callsite
+		# to its hottest phase-2 line when the same function was
+		# instrumented. Helper rather than raw dict because Jinja can't
+		# build tuple keys for the basename + function lookup.
+		"phase2_for_callsite": _make_phase2_lookup(
+			_build_phase2_callsite_index(session_doc)
+		),
+		# v0.6.x: snapshot of the render-affecting settings, stamped in the
+		# report footer so a user opening a saved HTML file can immediately
+		# tell which toggles were in effect when it was rendered. (Saved
+		# files are static; Profiler Settings changes only affect future
+		# renders.)
+		"render_config": render_config,
 	}
 
 	return template.render(**context)
-
-
-def _phase2_safe_show_source() -> bool:
-	"""Read the per-instance ``safe_report_include_source_lines`` setting.
-	Defaults to True (show source). Decoupled from get_config() to keep
-	this helper testable without a full settings load.
-	"""
-	try:
-		import frappe
-
-		val = frappe.db.get_single_value(
-			"Profiler Settings", "safe_report_include_source_lines"
-		)
-	except Exception:
-		return True
-	# Frappe Check returns 1/0 (or None for unset); default to True on
-	# missing so the feature is on by default per the design.
-	if val is None:
-		return True
-	return bool(int(val))
 
 
 def _e(text: object) -> str:
@@ -579,15 +534,85 @@ def _e(text: object) -> str:
 	return _html.escape("" if text is None else str(text))
 
 
-def _render_phase2_function_table(
-	fn: dict,
-	show_source: bool,
-	mode: str,
-) -> str:
+def _build_phase2_callsite_index(session_doc: Any) -> dict:
+	"""Build a (basename, function_name) → hottest-line lookup from the
+	session's phase-2 runs. Used by ``finding_card`` to inject a "Phase 2
+	hot line: …" callout whenever a finding's callsite resolves to a
+	function that was line-profiled.
+
+	Keyed by file basename (not absolute path) so the lookup survives
+	dev-vs-deploy path differences. When the same function appears in
+	multiple runs, the entry with the largest single-line ``total_ms``
+	wins — that's the most informative callout for the developer.
+
+	Returns an empty dict when the session has no phase-2 runs or the
+	results blobs are empty / malformed; the macro then renders no
+	callout.
+	"""
+	import os
+
+	runs = list(getattr(session_doc, "phase_2_runs", None) or [])
+	index: dict[tuple, dict] = {}
+	for child in runs:
+		try:
+			results = json.loads(getattr(child, "results_json", None) or "[]")
+		except Exception:
+			continue
+		run_uuid = getattr(child, "run_uuid", "") or ""
+		for fn in results:
+			file_path = fn.get("file") or ""
+			dotted = fn.get("dotted_path") or ""
+			qualname = fn.get("qualname") or (
+				dotted.rsplit(".", 1)[-1] if dotted else ""
+			)
+			lines = fn.get("lines") or []
+			if not file_path or not qualname or not lines:
+				continue
+			hot_line = max(
+				lines,
+				key=lambda ln: ln.get("total_ms", 0) or 0,
+				default=None,
+			)
+			if not hot_line or not hot_line.get("total_ms"):
+				continue
+			key = (os.path.basename(file_path), qualname)
+			existing = index.get(key)
+			candidate_ms = hot_line.get("total_ms", 0) or 0
+			if existing is None or candidate_ms > (existing.get("total_ms") or 0):
+				index[key] = {
+					"lineno": hot_line.get("lineno"),
+					"content": hot_line.get("content") or "",
+					"total_ms": candidate_ms,
+					"hits": hot_line.get("hits") or 0,
+					"run_uuid": run_uuid,
+					"dotted_path": dotted,
+				}
+	return index
+
+
+def _make_phase2_lookup(index: dict):
+	"""Wrap the phase-2 callsite index in a small lookup callable so
+	Jinja can call ``phase2_for_callsite(filename, function_name)`` —
+	Jinja cannot index dicts by tuple keys directly.
+	"""
+	import os
+
+	def lookup(filename, function_name):
+		if not filename or not function_name:
+			return None
+		return index.get((os.path.basename(filename), function_name))
+
+	return lookup
+
+
+def _render_phase2_function_table(fn: dict) -> str:
 	"""Per-function line table inside one phase-2 run.
 
-	Columns: line number, hit count, total ms, per-hit µs, source. In safe
-	mode with the toggle off, the source column shows ``<source omitted>``.
+	Columns: line number, hit count, total ms, per-hit µs, source.
+
+	v0.6.0 Round 7: previously took ``show_source`` + ``mode`` to gate
+	the source-line column. With safe mode removed, source is always
+	rendered.
 
 	When ``fn`` carries a ``source == "auto_expand"`` marker (set by the
 	renderer from the run's picks_json), the function header is indented
@@ -657,12 +682,9 @@ def _render_phase2_function_table(
 		row_style = (
 			'background: #fef3c7;' if highlight and ms > 0 else 'background: transparent;'
 		)
-		if mode == "safe" and not show_source:
-			source_cell = '<em style="color: #6b7280;">&lt;source omitted&gt;</em>'
-		else:
-			source_cell = (
-				f'<code style="white-space: pre;">{_e(line.get("content", ""))}</code>'
-			)
+		source_cell = (
+			f'<code style="white-space: pre;">{_e(line.get("content", ""))}</code>'
+		)
 		html.append(
 			f'<tr style="{row_style}">'
 			f'<td style="text-align: right; padding: 2px 8px; color: #6b7280;">{line.get("lineno", "")}</td>'
@@ -677,9 +699,13 @@ def _render_phase2_function_table(
 	return "".join(html)
 
 
-def _render_phase2_diff_table(diff_rows: list[dict], show_source: bool, mode: str) -> str:
+def _render_phase2_diff_table(diff_rows: list[dict]) -> str:
 	"""Render the cross-run delta table for one function profiled in 2+
-	runs — the verify-the-fix view."""
+	runs — the verify-the-fix view.
+
+	v0.6.0 Round 7: source column always shows full code (was previously
+	gated by ``mode == "safe"`` + the safe-source toggle).
+	"""
 	if not diff_rows:
 		return ""
 
@@ -717,12 +743,9 @@ def _render_phase2_diff_table(diff_rows: list[dict], show_source: bool, mode: st
 		def _fmt(v):
 			return "—" if v is None else (f"{v:.2f}" if isinstance(v, float) else str(v))
 
-		if mode == "safe" and not show_source:
-			source_cell = '<em style="color: #6b7280;">&lt;source omitted&gt;</em>'
-		else:
-			source_cell = (
-				f'<code style="white-space: pre;">{_e(row.get("content", ""))}</code>'
-			)
+		source_cell = (
+			f'<code style="white-space: pre;">{_e(row.get("content", ""))}</code>'
+		)
 
 		html.append(
 			f'<tr style="background: {bg};">'
@@ -739,24 +762,21 @@ def _render_phase2_diff_table(diff_rows: list[dict], show_source: bool, mode: st
 	return "".join(html)
 
 
-def _render_phase2_panel(session_doc: Any, mode: str) -> str:
+def _render_phase2_panel(session_doc: Any) -> str:
 	"""Build the phase-2 section HTML. Returns an empty string when the
 	session has no phase-2 runs (the template's ``{% if phase2_html %}``
 	guard then skips the section entirely).
 
-	HTML is fully self-contained: inline styles only, no external scripts
-	or stylesheets, system fonts. Honors
-	``Profiler Settings.safe_report_include_source_lines`` in safe mode.
+	v0.6.0 Round 7: source-line text is always rendered (was previously
+	gated by the ``safe_report_include_source_lines`` setting in safe
+	mode). With safe mode removed the toggle is gone and the report
+	always shows full code.
 	"""
 	from frappe_profiler.line_profile import diff as _lp_diff
 
 	runs = list(getattr(session_doc, "phase_2_runs", None) or [])
 	if not runs:
 		return ""
-
-	show_source = True
-	if mode == "safe":
-		show_source = _phase2_safe_show_source()
 
 	# Parse each run's stored JSON into the shape we render against.
 	# Annotate each function entry with its pick ``source`` (curated vs
@@ -851,7 +871,7 @@ def _render_phase2_panel(session_doc: Any, mode: str) -> str:
 		)
 
 		for fn in run.get("functions", []):
-			html.append(_render_phase2_function_table(fn, show_source, mode))
+			html.append(_render_phase2_function_table(fn))
 		html.append('</div>')
 
 	if diffs:
@@ -873,25 +893,22 @@ def _render_phase2_panel(session_doc: Any, mode: str) -> str:
 				f'<div style="font-family: ui-monospace, Menlo, monospace; '
 				f'font-weight: 600; margin-bottom: 4px;">{_e(label)}</div>'
 			)
-			html.append(_render_phase2_diff_table(diff_meta["rows"], show_source, mode))
+			html.append(_render_phase2_diff_table(diff_meta["rows"]))
 			html.append('</div>')
 
 	html.append('</section>')
 	return "".join(html)
 
 
-def render_safe(session_doc: Any, recordings: list[dict] | None = None) -> str:
-	"""Render the safe (shareable) version of the report."""
-	return render(session_doc, recordings, mode="safe")
-
-
 def render_raw(session_doc: Any, recordings: list[dict]) -> str:
-	"""Render the raw (internal) version of the report.
+	"""Render the admin-scoped report.
 
-	Requires the in-memory recordings list — raw SQL, headers, form_dict,
-	and full stack traces are NOT stored on the DocType.
+	v0.6.0 Round 7: name kept as ``render_raw`` for back-compat but
+	there's no longer a ``render_safe`` counterpart — single rendering
+	path. Requires the in-memory recordings list (raw SQL, headers,
+	form_dict, and full stack traces are NOT stored on the DocType).
 	"""
-	return render(session_doc, recordings, mode="raw")
+	return render(session_doc, recordings)
 
 
 # ---------------------------------------------------------------------------
@@ -911,6 +928,106 @@ def _action_to_dict(child: Any) -> dict:
 		"queries_count": child.queries_count or 0,
 		"query_time_ms": child.query_time_ms or 0,
 		"slowest_query_ms": child.slowest_query_ms or 0,
+	}
+
+
+# ---------------------------------------------------------------------------
+# v0.6.0: "Background jobs" report section — render-time only (the pipeline is
+# frozen). Derived purely from the persisted Profiler Action rows that have
+# event_type == "Background Job" (one per captured job recording), enriched
+# with the live recording's SQL when it's still in Redis.
+# ---------------------------------------------------------------------------
+
+_BG_JOB_TOP_QUERIES = 5
+
+
+def _clean_job_method(action_label, path, recording) -> str:
+	"""The most human-readable name for a background-job action.
+
+	``per_action._label`` writes job labels as ``"Job: <method>"`` — strip
+	that prefix. Fall back to the job method path, then the recording's
+	``cmd``, then a generic placeholder."""
+	label = (action_label or "").strip()
+	if label:
+		prefix = "Job: "
+		return (label[len(prefix):].strip() or label) if label.startswith(prefix) else label
+	p = (path or "").strip()
+	if p:
+		return p
+	if recording:
+		return (recording.get("cmd") or recording.get("path") or "").strip() or "Background Job"
+	return "Background Job"
+
+
+def build_background_jobs(actions, recordings_by_uuid, findings=None) -> dict:
+	"""Build the "Background jobs" section payload from the (already
+	min-duration-filtered) action dicts.
+
+	``actions`` items are ``_action_to_dict`` output plus an ``idx`` key
+	holding the action's original position (so findings — whose ``action_ref``
+	is that index as a string — can be tallied per job). ``recordings_by_uuid``
+	enriches each job with its slowest queries when the recording is still in
+	Redis (TTL ~10 min; a re-render long after analyze has none → the section
+	still renders from the persisted action rows alone). Pure — no I/O (the
+	``entry_callsite`` on each job is pre-computed by ``render()`` and copied
+	through here).
+
+	Returns ``{jobs, count, total_ms, total_queries, any_findings_counted}``.
+	"""
+	findings_by_idx: dict[str, int] = {}
+	for f in (findings or []):
+		ref = (f.get("action_ref") or "").strip()
+		if ref:
+			findings_by_idx[ref] = findings_by_idx.get(ref, 0) + 1
+	any_findings_counted = bool(findings_by_idx)
+
+	jobs: list[dict] = []
+	for a in (actions or []):
+		if a.get("event_type") != "Background Job":
+			continue
+		uuid = a.get("recording_uuid") or ""
+		rec = recordings_by_uuid.get(uuid) if recordings_by_uuid else None
+		idx = a.get("idx")
+		if any_findings_counted and idx is not None:
+			findings_count = findings_by_idx.get(str(idx), 0)
+		else:
+			findings_count = None
+
+		top_queries = None
+		if rec:
+			calls = rec.get("calls") or []
+			ranked = sorted(calls, key=lambda c: (c.get("duration") or 0), reverse=True)
+			top_queries = [
+				{
+					"index": c.get("index"),
+					"duration": c.get("duration") or 0,
+					"query": c.get("query") or "",
+					"exact_copies": c.get("exact_copies") or 0,
+					"normalized_copies": c.get("normalized_copies") or 0,
+				}
+				for c in ranked[:_BG_JOB_TOP_QUERIES]
+			]
+
+		jobs.append({
+			"method": _clean_job_method(a.get("action_label"), a.get("path"), rec),
+			"recording_uuid": uuid,
+			"duration_ms": a.get("duration_ms") or 0,
+			"queries_count": a.get("queries_count") or 0,
+			"query_time_ms": a.get("query_time_ms") or 0,
+			"slowest_query_ms": a.get("slowest_query_ms") or 0,
+			"findings_count": findings_count,
+			"top_queries": top_queries,
+			"recording_available": rec is not None,
+			"entry_callsite": a.get("entry_callsite"),  # pre-computed in render()
+		})
+
+	jobs.sort(key=lambda j: -(j.get("duration_ms") or 0))
+	return {
+		"jobs": jobs,
+		"count": len(jobs),
+		"total_ms": sum(j.get("duration_ms") or 0 for j in jobs),
+		"total_queries": sum(j.get("queries_count") or 0 for j in jobs),
+		"any_findings_counted": any_findings_counted,
 	}
 
 
@@ -956,16 +1073,122 @@ def _normalize_callsite(callsite) -> dict | None:
 	return None
 
 
-def _finding_to_dict(child: Any) -> dict:
-	"""Flatten a Profiler Finding child row, parsing the JSON detail blob."""
+def _finding_to_dict(child: Any, file_cache: dict | None = None) -> dict:
+	"""Flatten a Profiler Finding child row, parsing the JSON detail blob.
+
+	v0.6.0 Round 2: synthesize a unified ``callsite`` shape for findings
+	that store their location at the top level (call_tree's Slow Hot Path
+	/ Hook Bottleneck / Repeated Hot Frame use top-level
+	``filename``/``lineno``; line_profile's Hot Line / Function Not
+	Invoked use top-level ``file``/``lineno``). Without this, the
+	smoking-gun block in finding_card never renders for those types.
+
+	Also lazily attach a ±1 source snippet to the callsite when one isn't
+	already persisted — covers (a) sessions analyzed before the
+	analyze-time enrichment shipped, (b) the synthesized callsites above.
+	The optional ``file_cache`` is shared across all findings in the same
+	render so a cluster of findings in one source file reads the file
+	once.
+	"""
 	try:
 		detail = json.loads(child.technical_detail_json or "{}")
 	except Exception:
 		detail = {}
+
+	# v0.6.0 Round 2: synthesize callsite from legacy top-level shape
+	# when the analyzer didn't wrap it. ``filename`` is the canonical
+	# key; ``file`` is the line-profile alias. Both are accepted.
+	if not detail.get("callsite"):
+		fname = detail.get("filename") or detail.get("file")
+		lineno = detail.get("lineno")
+		if fname and lineno is not None:
+			detail["callsite"] = {
+				"filename": fname,
+				"lineno": lineno,
+				"function": detail.get("function") or "",
+			}
+
 	# v0.5.3: normalize callsite shape so downstream code (app
 	# bucketing, template) can assume dict.
 	if "callsite" in detail:
 		detail["callsite"] = _normalize_callsite(detail.get("callsite"))
+
+	# v0.6.x: findings that name a function but carry no file:line — resolve
+	# them so the smoking-gun block can render. Repeated Hot Frame stores a
+	# redacted ``"path::func"`` key in ``function``; Function Not Invoked
+	# (phase 2) stores a ``dotted_path``. Best-effort, render-time.
+	if not (detail.get("callsite") or {}).get("lineno"):
+		_ftype = child.finding_type or ""
+		if _ftype == "Repeated Hot Frame" and detail.get("function"):
+			_cs = _resolve_frame_key_to_callsite(detail["function"], cache=file_cache)
+			if _cs:
+				detail["callsite"] = _cs
+		elif _ftype == "Function Not Invoked" and detail.get("dotted_path"):
+			_resolved = _resolve_dotted_to_code(detail["dotted_path"])
+			if _resolved:
+				_abs, _ln, _name = _resolved
+				detail["callsite"] = {
+					"filename": _bench_relative_display(_abs),
+					"_abs": _abs,
+					"lineno": _ln,
+					"function": _name or str(detail["dotted_path"]).rsplit(".", 1)[-1],
+					"source_snippet": _read_source_snippet(_abs, _ln, cache=file_cache),
+				}
+
+	# v0.6.0 Round 2: fold a Hot Line finding's persisted ``line_content``
+	# directly into a single-row source_snippet. The text is already in
+	# the finding's technical_detail; no file read needed.
+	callsite = detail.get("callsite") or {}
+	if (
+		callsite
+		and not callsite.get("source_snippet")
+		and detail.get("line_content")
+		and callsite.get("lineno") is not None
+	):
+		callsite["source_snippet"] = [{
+			"lineno": callsite["lineno"],
+			"content": detail["line_content"],
+		}]
+		detail["callsite"] = callsite
+
+	# v0.6.0 Round 2: lazy snippet read at render time when nothing has
+	# been attached yet (covers older sessions + synthesized callsites
+	# without a line_content shortcut).
+	if (
+		callsite
+		and callsite.get("filename")
+		and callsite.get("lineno") is not None
+		and not callsite.get("source_snippet")
+	):
+		snippet = _read_source_snippet(
+			callsite["filename"], callsite["lineno"], cache=file_cache,
+		)
+		if snippet:
+			callsite["source_snippet"] = snippet
+			detail["callsite"] = callsite
+
+	# v0.6.0: AI-suggested fix (on-demand; empty until generated). Stored as
+	# JSON on the child row by api.suggest_fix. Convert the Markdown body to
+	# sanitized HTML here so the template can `| safe` it (mirrors the
+	# notes_html pattern). A parse/convert failure falls back to an escaped
+	# <pre> so raw text is never rendered verbatim.
+	llm_fix = None
+	try:
+		raw_llm = json.loads(getattr(child, "llm_fix_json", None) or "{}")
+	except Exception:
+		raw_llm = {}
+	if isinstance(raw_llm, dict) and (raw_llm.get("suggestion") or "").strip():
+		llm_fix = {
+			"suggestion_html": _markdown_to_safe_html(raw_llm.get("suggestion")),
+			"model": raw_llm.get("model") or "",
+			"provider": raw_llm.get("provider") or "",
+			"generated_at": raw_llm.get("generated_at") or "",
+			# Older rows (pre this field) → assume the AI had context, so we
+			# don't slap a "directional only" caveat on suggestions that were
+			# in fact grounded in source.
+			"source_available": raw_llm.get("source_available", True),
+		}
+
 	return {
 		"finding_type": child.finding_type or "",
 		"severity": child.severity or "Low",
@@ -975,7 +1198,824 @@ def _finding_to_dict(child: Any) -> dict:
 		"affected_count": child.affected_count or 0,
 		"action_ref": child.action_ref or "",
 		"technical_detail": detail,
+		"llm_fix": llm_fix,
 	}
+
+
+# v0.6.x: SQL "red flag" findings (Missing Index, Full Table Scan, Filesort,
+# Temporary Table, Low Filter Ratio) are keyed by (finding_type, table) and
+# carry no callsite — the offending query is issued from many places. At
+# render time we still have the recordings, so we pick a *representative*
+# callsite: the hottest user-app frame among the calls whose normalized query
+# matches the finding's. Best-effort — surfaced as "Most-called from:" with a
+# "representative callsite" note in the template.
+_SQL_REDFLAG_FINDING_TYPES = frozenset({
+	"Missing Index", "Full Table Scan", "Filesort", "Temporary Table",
+	"Low Filter Ratio",
+})
+
+
+def _attach_representative_callsites(findings, recordings, *, file_cache: dict | None = None) -> None:
+	"""Attach a representative ``callsite`` (+ ``is_representative``) to SQL
+	red-flag findings by matching their normalized query against the recording
+	calls and picking the hottest user-app frame. Mutates ``findings`` (the
+	``_finding_to_dict`` output dicts) in place. No-op when there are no such
+	findings, no recordings, or nothing matches — those cards just render
+	without the block.
+	"""
+	if not findings or not recordings:
+		return
+	wanted: list[dict] = []
+	for f in findings:
+		if (f.get("finding_type") or "") not in _SQL_REDFLAG_FINDING_TYPES:
+			continue
+		detail = f.get("technical_detail") or {}
+		if (detail.get("callsite") or {}).get("lineno"):
+			continue  # already has one
+		nq = (detail.get("normalized_query") or "").strip()
+		if not nq:
+			continue
+		wanted.append({
+			"finding": f,
+			"nq": nq,
+			"table": (detail.get("table") or "").strip(),
+			"tally": {},  # (filename, lineno, function) → weight
+		})
+	if not wanted:
+		return
+
+	try:
+		from frappe_profiler.analyzers.base import walk_callsite
+	except Exception:
+		return
+
+	for rec in recordings:
+		if not isinstance(rec, dict):
+			continue
+		for call in rec.get("calls") or []:
+			if not isinstance(call, dict):
+				continue
+			cnq = (call.get("normalized_query") or "").strip()
+			if not cnq:
+				continue
+			cquery = call.get("query") or ""
+			for w in wanted:
+				# Equality or prefix either way (survives truncation), plus
+				# the table name must appear in the raw query.
+				if not (cnq == w["nq"] or cnq.startswith(w["nq"]) or w["nq"].startswith(cnq)):
+					continue
+				if w["table"] and w["table"] not in cquery:
+					continue
+				frame = walk_callsite(call.get("stack"))
+				if not frame or not frame.get("filename") or frame.get("lineno") is None:
+					continue
+				k = (frame.get("filename"), frame.get("lineno"), frame.get("function") or "")
+				w["tally"][k] = w["tally"].get(k, 0) + (call.get("duration") or 0) + 1
+
+	for w in wanted:
+		if not w["tally"]:
+			continue
+		(filename, lineno, function), _weight = max(w["tally"].items(), key=lambda kv: kv[1])
+		abs_path = _resolve_source_path(filename)
+		w["finding"]["technical_detail"]["callsite"] = {
+			"filename": _bench_relative_display(abs_path) if abs_path else filename,
+			"_abs": abs_path,
+			"lineno": lineno,
+			"function": function,
+			"source_snippet": _read_source_snippet(abs_path or filename, lineno, cache=file_cache),
+			"is_representative": True,
+		}
+
+
+# ---------------------------------------------------------------------------
+# v0.6.x: action / finding context — which document a save/submit action
+# touched, and which doc-event lifecycle hook a slow function fired in. All
+# derived at render time from the in-memory recordings + frappe.get_hooks.
+# ---------------------------------------------------------------------------
+
+
+def _module_from_filename(filename) -> str:
+	"""``ugly_code/python/common.py`` → ``ugly_code.python.common`` (pyinstrument's
+	short app-relative filename → its module dotted path). Empty on bad input."""
+	if not filename:
+		return ""
+	name = str(filename).replace("\\", "/")
+	if name.endswith(".py"):
+		name = name[:-3]
+	return ".".join(p for p in name.split("/") if p)
+
+
+def _extract_target_doc(form_dict) -> dict | None:
+	"""Best-effort: pull ``{"doctype", "name"}`` out of a request's form_dict
+	for doc-mutating endpoints — ``savedocs`` / ``frappe.client.save|insert|submit``
+	(a ``doc`` JSON string or dict), ``run_doc_method`` (``dt``/``dn`` or a
+	``docs`` JSON), ``apply_workflow`` (``doc``), or bare ``doctype``/``name``
+	fields. ``name`` may be a temp name ("new-…") or ``None`` for an unsaved
+	doc. Returns ``None`` when nothing doc-shaped is present. Never raises."""
+	if not isinstance(form_dict, dict) or not form_dict:
+		return None
+	try:
+		dt = form_dict.get("dt") or form_dict.get("doctype")
+		dn = form_dict.get("dn") or form_dict.get("name") or form_dict.get("docname")
+		if isinstance(dt, str) and dt.strip():
+			return {"doctype": dt.strip(), "name": (dn.strip() if isinstance(dn, str) and dn.strip() else None)}
+		for key in ("doc", "docs"):
+			raw = form_dict.get(key)
+			if raw is None:
+				continue
+			parsed = raw
+			if isinstance(raw, str):
+				try:
+					parsed = json.loads(raw)
+				except Exception:
+					continue
+			if isinstance(parsed, list):
+				parsed = next((d for d in parsed if isinstance(d, dict) and d.get("doctype")), None)
+			if isinstance(parsed, dict) and parsed.get("doctype"):
+				nm = parsed.get("name")
+				return {"doctype": str(parsed["doctype"]), "name": (str(nm) if nm else None)}
+	except Exception:
+		return None
+	return None
+
+
+def _build_doc_event_hook_index(doc_events) -> dict:
+	"""Flatten Frappe's ``doc_events`` map — ``{doctype: {event: [paths]}}``
+	(``doctype`` may be ``"*"``) — into ``{dotted_path: [(doctype, event), …]}``.
+	Pure. Empty on bad input."""
+	index: dict[str, list[tuple[str, str]]] = {}
+	if not isinstance(doc_events, dict):
+		return index
+	for doctype, events in doc_events.items():
+		if not isinstance(events, dict):
+			continue
+		for event, methods in events.items():
+			if isinstance(methods, str):
+				methods = [methods]
+			if not isinstance(methods, (list, tuple)):
+				continue
+			for m in methods:
+				if isinstance(m, str) and m:
+					index.setdefault(m, []).append((str(doctype), str(event)))
+	return index
+
+
+def _doc_event_hook_index() -> dict:
+	"""``_build_doc_event_hook_index(frappe.get_hooks("doc_events"))`` — or ``{}``
+	when frappe isn't available (e.g. unit tests with no running site)."""
+	try:
+		import frappe
+		return _build_doc_event_hook_index(frappe.get_hooks("doc_events"))
+	except Exception:
+		return {}
+
+
+def _finding_hook_events(detail, hook_index, *, action_doctype: str | None = None) -> list[dict]:
+	"""For a call-tree finding's ``technical_detail`` (``function`` + ``filename``),
+	return the doc-event lifecycle hook(s) the function is registered for, as
+	``[{"doctype", "event"}, …]``. A ``"*"`` (all-doctypes) hook is reported
+	against ``action_doctype`` when known, else ``"*"``. Empty when the function
+	isn't a registered doc-event hook (or its dotted path can't be rebuilt)."""
+	if not isinstance(detail, dict) or not hook_index:
+		return []
+	func = str(detail.get("function") or "").strip()
+	filename = detail.get("filename") or ""
+	if not func or not filename:
+		return []
+	bare = func.rsplit(".", 1)[-1].rsplit(":", 1)[-1].strip()
+	module = _module_from_filename(filename)
+	if not module or not bare:
+		return []
+	pairs = hook_index.get(f"{module}.{bare}")
+	if not pairs:
+		return []
+	out: list[dict] = []
+	seen = set()
+	for hd, ev in pairs:
+		shown_dt = action_doctype if (hd == "*" and action_doctype) else hd
+		if (shown_dt, ev) in seen:
+			continue
+		seen.add((shown_dt, ev))
+		out.append({"doctype": shown_dt, "event": ev})
+	return out
+
+
+def _attach_action_context(actions, findings, recordings_by_uuid) -> None:
+	"""Enrich ``actions`` and ``findings`` (in place):
+
+	  * ``action["target_doc"]`` — the document a save/submit-style action
+	    touched (from the recording's form_dict), or ``None``.
+	  * ``finding["technical_detail"]["target_doc"]`` — same, via the finding's
+	    ``action_ref`` → action (key omitted when there's no doc).
+	  * ``finding["technical_detail"]["hook_events"]`` — the doc-event lifecycle
+	    hook(s) the finding's hot function fired in (``[{doctype,event}, …]``);
+	    key omitted when the function isn't a registered ``doc_events`` hook.
+	"""
+	recordings_by_uuid = recordings_by_uuid or {}
+	for a in (actions or []):
+		if not isinstance(a, dict):
+			continue
+		rec = recordings_by_uuid.get(a.get("recording_uuid") or "")
+		a["target_doc"] = _extract_target_doc(rec.get("form_dict") if isinstance(rec, dict) else None)
+	by_idx = {a.get("idx"): a for a in (actions or []) if isinstance(a, dict)}
+	hook_index = _doc_event_hook_index()
+	for f in (findings or []):
+		if not isinstance(f, dict):
+			continue
+		detail = f.get("technical_detail")
+		if not isinstance(detail, dict):
+			continue
+		ref = (f.get("action_ref") or "").strip()
+		td = None
+		if ref.isdigit():
+			act = by_idx.get(int(ref))
+			td = act.get("target_doc") if isinstance(act, dict) else None
+		if td:
+			detail["target_doc"] = td
+		hevs = _finding_hook_events(detail, hook_index, action_doctype=(td or {}).get("doctype"))
+		if hevs:
+			detail["hook_events"] = hevs
+
+
+# ---------------------------------------------------------------------------
+# v0.6.x: "Doc-event lifecycle" section — re-group the slow call-tree findings
+# by DocType → lifecycle event (validate / on_submit / …), tagging each as a
+# registered ``doc_events`` hook vs a controller method override, and surfacing
+# cascaded DocTypes (e.g. GL Entry touched during a Sales Invoice submit). Pure,
+# render-time, derived from the findings already enriched by _attach_action_context.
+# ---------------------------------------------------------------------------
+
+# Frappe's doc-event lifecycle method names — a function whose bare name is one
+# of these AND whose file is a controller (``.../doctype/<scrub>/<scrub>.py``)
+# is a lifecycle override.
+_LIFECYCLE_EVENTS = frozenset({
+	"before_naming", "autoname", "before_insert", "after_insert",
+	"before_validate", "validate", "before_save", "after_save", "on_update",
+	"before_submit", "on_submit", "before_update_after_submit", "on_update_after_submit",
+	"before_cancel", "on_cancel", "before_change", "on_change",
+	"on_trash", "after_delete", "before_rename", "after_rename", "before_print",
+})
+
+# Doc-event "kinds" surfaced in the breakdown.
+_KIND_DOC_EVENTS_HOOK = "doc_events hook"
+_KIND_CONTROLLER_OVERRIDE = "controller override"
+
+_SEVERITY_RANK = {"High": 3, "Medium": 2, "Low": 1}
+
+
+def _doctype_from_controller_path(filename) -> str | None:
+	"""``erpnext/accounts/doctype/sales_invoice/sales_invoice.py`` → ``"Sales Invoice"``
+	(the segment right after ``doctype/``, un-scrubbed). Works on app-relative,
+	bench-relative, and absolute paths. ``None`` for non-controller paths. NB:
+	``.title()`` mangles multi-cap names ("gl_entry" → "Gl Entry") — same as
+	``frappe.unscrub``; accepted."""
+	if not filename:
+		return None
+	parts = [p for p in str(filename).replace("\\", "/").strip("/").split("/") if p]
+	try:
+		i = parts.index("doctype")
+	except ValueError:
+		return None
+	if i + 1 >= len(parts):
+		return None
+	slug = parts[i + 1].strip()
+	if not slug:
+		return None
+	return slug.replace("_", " ").replace("-", " ").title()
+
+
+def _finding_lifecycle_bindings(finding) -> list[tuple[str, str, str]]:
+	"""Return ``[(doctype, event, kind), …]`` — the doc-event lifecycle slots a
+	finding belongs to (usually 0 or 1). ``kind`` is ``_KIND_DOC_EVENTS_HOOK``
+	(from the finding's already-resolved ``technical_detail.hook_events``) or
+	``_KIND_CONTROLLER_OVERRIDE`` (function name is a lifecycle event AND its
+	file is a controller). Deduped by ``(doctype, event)`` — hook bindings first.
+	Empty when the finding isn't a lifecycle method (a generic Slow Hot Path on
+	a helper, an N+1 with no controller callsite, …)."""
+	if not isinstance(finding, dict):
+		return []
+	detail = finding.get("technical_detail") or {}
+	if not isinstance(detail, dict):
+		return []
+	cs = detail.get("callsite") or {}
+	out: list[tuple[str, str, str]] = []
+	seen: set[tuple[str, str]] = set()
+
+	for he in (detail.get("hook_events") or []):
+		if not isinstance(he, dict):
+			continue
+		dt = (he.get("doctype") or "").strip()
+		ev = (he.get("event") or "").strip()
+		if dt and ev and (dt, ev) not in seen:
+			seen.add((dt, ev))
+			out.append((dt, ev, _KIND_DOC_EVENTS_HOOK))
+
+	fn = (cs.get("function") if isinstance(cs, dict) else None) or detail.get("function") or ""
+	ev = str(fn).rsplit(".", 1)[-1].rsplit(":", 1)[-1].strip()
+	if ev in _LIFECYCLE_EVENTS:
+		fname = (cs.get("filename") if isinstance(cs, dict) else None) or detail.get("filename") or ""
+		dt = _doctype_from_controller_path(fname)
+		if dt and (dt, ev) not in seen:
+			seen.add((dt, ev))
+			out.append((dt, ev, _KIND_CONTROLLER_OVERRIDE))
+	return out
+
+
+def _build_doc_event_breakdown(findings) -> dict:
+	"""Group the slow call-tree findings by DocType → lifecycle event. Pure.
+
+	Returns ``{"doctypes": [ {doctype, is_save_target, touched_during,
+	total_ms, method_count, events: [{event, total_ms, methods:
+	[{function, filename, _abs, lineno, ms, count, kind, severity,
+	finding_type}]}]} … ], "count": int, "method_count": int}``. Empty
+	``{"doctypes": [], "count": 0, "method_count": 0}`` when nothing binds."""
+	groups: dict[str, dict] = {}
+	for f in (findings or []):
+		bindings = _finding_lifecycle_bindings(f)
+		if not bindings:
+			continue
+		detail = f.get("technical_detail") or {}
+		cs = detail.get("callsite") or {}
+		if not isinstance(cs, dict):
+			cs = {}
+		fn_name = cs.get("function") or detail.get("function") or "?"
+		fname = cs.get("filename") or detail.get("filename") or ""
+		abs_path = cs.get("_abs")
+		lineno = cs.get("lineno") or detail.get("lineno")
+		try:
+			ms = float(detail.get("cumulative_ms") or f.get("estimated_impact_ms") or 0)
+		except (TypeError, ValueError):
+			ms = 0.0
+		severity = f.get("severity") or "Low"
+		ftype = f.get("finding_type") or ""
+		action_dt = (detail.get("target_doc") or {}).get("doctype") if isinstance(detail.get("target_doc"), dict) else None
+
+		for dt, ev, kind in bindings:
+			g = groups.setdefault(dt, {"doctype": dt, "is_save_target": False, "touched_during": set(), "events": {}})
+			if action_dt:
+				if action_dt == dt:
+					g["is_save_target"] = True
+				else:
+					g["touched_during"].add(action_dt)
+			ev_bucket = g["events"].setdefault(ev, {})
+			key = (fn_name, fname)
+			rec = ev_bucket.get(key)
+			if rec is None:
+				ev_bucket[key] = {
+					"function": fn_name, "filename": fname, "_abs": abs_path,
+					"lineno": lineno, "ms": ms, "count": 1, "kind": kind,
+					"severity": severity, "finding_type": ftype,
+				}
+			else:
+				rec["ms"] += ms
+				rec["count"] += 1
+				if _SEVERITY_RANK.get(severity, 0) > _SEVERITY_RANK.get(rec["severity"], 0):
+					rec["severity"] = severity
+				# A controller override is the more specific label — prefer it.
+				if kind == _KIND_CONTROLLER_OVERRIDE:
+					rec["kind"] = kind
+
+	out_doctypes: list[dict] = []
+	for g in groups.values():
+		events_out: list[dict] = []
+		for ev, bucket in g["events"].items():
+			methods = sorted(bucket.values(), key=lambda m: -(m["ms"] or 0))
+			events_out.append({"event": ev, "total_ms": sum(m["ms"] or 0 for m in methods), "methods": methods})
+		events_out.sort(key=lambda e: -(e["total_ms"] or 0))
+		out_doctypes.append({
+			"doctype": g["doctype"],
+			"is_save_target": g["is_save_target"],
+			"touched_during": sorted(g["touched_during"]),
+			"total_ms": sum(e["total_ms"] or 0 for e in events_out),
+			"method_count": sum(len(e["methods"]) for e in events_out),
+			"events": events_out,
+		})
+	# Sort: save-targets first, then by total time.
+	out_doctypes.sort(key=lambda d: (0 if d["is_save_target"] else 1, -(d["total_ms"] or 0)))
+	return {
+		"doctypes": out_doctypes,
+		"count": len(out_doctypes),
+		"method_count": sum(d["method_count"] for d in out_doctypes),
+	}
+
+
+def _markdown_to_safe_html(text) -> str:
+	"""Render Markdown → sanitized HTML for embedding in the report.
+
+	Mirrors the notes sanitization path (``frappe.utils.markdown`` +
+	``sanitize_html(..., always_sanitize=True)``). On ANY failure — Frappe
+	not importable, markdown/bleach hiccup — falls back to an HTML-escaped
+	``<pre>`` block so the report NEVER renders un-sanitized model output.
+
+	After sanitizing, fenced ``diff`` code blocks (which the AI-fix prompt
+	asks the model to use for before/after) get per-line ``dh-add`` /
+	``dh-del`` / ``dh-meta`` span wrappers so the report CSS can colour them
+	like a real diff. We only add ``<span>`` wrappers around already-escaped
+	text — nothing that could re-introduce unsafe markup.
+	"""
+	raw = "" if text is None else str(text)
+	try:
+		from frappe.utils import markdown as _md
+		from frappe.utils.html_utils import sanitize_html
+		return _highlight_diff_html(sanitize_html(_md(raw), always_sanitize=True))
+	except Exception:
+		import html as _html
+		return _highlight_diff_html(
+			'<pre style="white-space:pre-wrap;">' + _html.escape(raw) + "</pre>"
+		)
+
+
+# <pre> block, optionally wrapping a <code>...</code> (with or without a class).
+_PRE_BLOCK_RE = re.compile(
+	r'<pre[^>]*>(?:\s*<code([^>]*)>)?(.*?)(?:</code>\s*)?</pre>', re.S
+)
+
+
+def _looks_like_diff(code_attrs: str, lines: list[str]) -> bool:
+	if "diff" in (code_attrs or ""):
+		return True
+	if any(ln.startswith("@@") for ln in lines):
+		return True
+	has_add = any(ln.startswith("+") for ln in lines)
+	has_del = any(ln.startswith("-") for ln in lines)
+	return has_add and has_del
+
+
+def _diff_line_class(line: str) -> str | None:
+	if line.startswith("@@") or line.startswith("+++") or line.startswith("---"):
+		return "dh-meta"
+	if line.startswith("+"):
+		return "dh-add"
+	if line.startswith("-"):
+		return "dh-del"
+	return None
+
+
+def _highlight_diff_html(html: str) -> str:
+	"""Wrap +/-/@@ lines inside diff-looking ``<pre>`` blocks in classed
+	spans. Pure string transform over already-sanitized HTML — only adds
+	``<span class="dh-…">`` wrappers around existing escaped text."""
+
+	def _wrap(match: re.Match) -> str:
+		code_attrs = match.group(1) or ""
+		inner = match.group(2) or ""
+		lines = inner.split("\n")
+		# A trailing "" from the markdown renderer's final newline — drop it
+		# so we don't emit an empty trailing block-span.
+		if lines and lines[-1] == "":
+			lines = lines[:-1]
+		if not lines or not _looks_like_diff(code_attrs, lines):
+			return match.group(0)
+		out: list[str] = []
+		for ln in lines:
+			cls = _diff_line_class(ln)
+			label = f"dh-line {cls}" if cls else "dh-line dh-ctx"
+			out.append(f'<span class="{label}">{ln or "&#8203;"}</span>')
+		code_open = f"<code{code_attrs}>" if code_attrs else "<code>"
+		return f'<pre class="dh">{code_open}' + "".join(out) + "</code></pre>"
+
+	return _PRE_BLOCK_RE.sub(_wrap, html)
+
+
+# Per-line truncation for source snippets/windows — keeps a single
+# multi-kilobyte minified line out of technical_detail_json / the LLM prompt.
+# (Kept here, with the readers, rather than imported from analyze.py — so the
+# readers don't pull in analyze.py, which imports frappe.recorder.)
+_SNIPPET_TRUNCATE_CHARS = 200
+
+
+def _resolve_source_path(filename) -> str | None:
+	"""Map a finding's callsite ``filename`` to a real file on disk.
+
+	Call-tree / pyinstrument callsites are stored in app-relative form
+	(``<app>/<module-path-within-the-app-dir>`` — e.g. ``ugly_code/python/
+	common.py`` for ``<bench>/apps/ugly_code/ugly_code/python/common.py``,
+	or ``frappe/handler.py``). A bare ``open()`` fails because the Frappe
+	process cwd is ``<bench>/sites``. Resolve via ``frappe.get_app_path``
+	(``frappe.get_app_path("ugly_code", "python", "common.py")`` →
+	``<bench>/apps/ugly_code/ugly_code/python/common.py``), with fallbacks
+	for absolute / cwd-relative / ``apps/…``-prefixed forms. Returns ``None``
+	for synthetic names (``<string>``, ``<frozen …>``), unresolvable paths,
+	or when ``frappe`` isn't importable (unit tests)."""
+	if not filename:
+		return None
+	name = str(filename).strip()
+	if not name or name.startswith("<"):
+		return None
+	try:
+		if os.path.isabs(name):
+			return name if os.path.exists(name) else None
+		if os.path.exists(name):
+			return name
+		parts = [p for p in name.replace("\\", "/").split("/") if p]
+		if not parts:
+			return None
+		import frappe
+
+		candidates = []
+		try:
+			candidates.append(frappe.get_app_path(parts[0], *parts[1:]))
+		except Exception:
+			pass
+		try:
+			bench = frappe.get_bench_path()
+			candidates.append(os.path.join(bench, name))
+			candidates.append(os.path.join(bench, "apps", name))
+		except Exception:
+			pass
+		for cand in candidates:
+			if cand and os.path.exists(cand):
+				return cand
+	except Exception:
+		return None
+	return None
+
+
+def _read_source_snippet(
+	filename: str,
+	lineno,
+	*,
+	cache: dict | None = None,
+) -> list[dict] | None:
+	"""Return a ±1-line source snippet for ``(filename, lineno)``, or
+	``None`` when the file isn't readable / lineno is out of range. The
+	(possibly app-relative) ``filename`` is resolved via
+	``_resolve_source_path`` before opening."""
+	try:
+		ln = int(lineno)
+	except (TypeError, ValueError):
+		return None
+	if ln <= 0 or not filename:
+		return None
+
+	if cache is not None and filename in cache:
+		lines = cache[filename]
+	else:
+		resolved = _resolve_source_path(filename)
+		try:
+			with open(resolved, "r", encoding="utf-8") as fh:
+				lines = fh.read().splitlines()
+		except Exception:
+			lines = None
+		if cache is not None:
+			cache[filename] = lines
+
+	if not lines:
+		return None
+
+	limit = _SNIPPET_TRUNCATE_CHARS
+	snippet: list[dict] = []
+	for n in (ln - 1, ln, ln + 1):
+		if 1 <= n <= len(lines):
+			content = lines[n - 1]
+			if len(content) > limit:
+				content = content[:limit] + "..."
+			snippet.append({"lineno": n, "content": content})
+	return snippet or None
+
+
+def _action_dotted_entry(action) -> str | None:
+	"""Derive an action's dotted entry-point path, or ``None``.
+
+	- Background Job: ``action["path"]`` is already the job method (Frappe's
+	  recorder stores ``frappe.job.method`` there — e.g.
+	  ``ugly_code.python.common.bg_recheck_users``).
+	- HTTP Request whose path is ``/api/method/<dotted>``: the ``<dotted>``
+	  segment, with any ``?query`` and trailing ``/...`` stripped.
+	- anything else (non-``/api/method`` HTTP, empty/missing path, non-dict
+	  input): ``None``.
+	"""
+	if not isinstance(action, dict):
+		return None
+	event_type = (action.get("event_type") or "").strip()
+	path = (action.get("path") or "").strip()
+	if not path:
+		return None
+	if event_type == "Background Job":
+		return path.split("?", 1)[0].strip() or None
+	if event_type == "HTTP Request" and path.startswith("/api/method/"):
+		rest = path[len("/api/method/"):]
+		rest = rest.split("?", 1)[0].split("/", 1)[0].strip().strip(".")
+		return rest or None
+	return None
+
+
+def _resolve_dotted_to_code(dotted) -> tuple[str, int, str] | None:
+	"""Resolve a dotted module path to ``(abs_filename, lineno, func_name)``.
+
+	Uses ``importlib`` directly — NOT ``frappe.get_attr`` — because the
+	latter needs a running site (it touches ``frappe.local``), which the unit
+	tests don't have. Mirrors ``line_profile.picker.resolve_freeform``'s
+	import strategy (longest importable leading prefix, then ``getattr`` the
+	rest), minus its eligibility checks. ``inspect.unwrap`` sees through
+	``functools.wraps`` decorators (e.g. ``@frappe.whitelist``). Returns
+	``None`` on any failure — never raises.
+	"""
+	if not dotted or "." not in str(dotted):
+		return None
+	try:
+		import importlib
+		import inspect
+
+		parts = str(dotted).split(".")
+		module = None
+		mod_parts = 0
+		for i in range(len(parts), 0, -1):
+			try:
+				module = importlib.import_module(".".join(parts[:i]))
+				mod_parts = i
+				break
+			except Exception:
+				continue
+		if module is None or mod_parts == len(parts):
+			return None  # nothing imported, or it's a module not a callable
+		obj = module
+		for attr in parts[mod_parts:]:
+			obj = getattr(obj, attr)
+		obj = inspect.unwrap(obj)
+		code = getattr(obj, "__code__", None)
+		if code is None:
+			return None  # builtin / C func / not a plain Python function
+		filename = code.co_filename or ""
+		lineno = code.co_firstlineno or 0
+		if not filename or filename.startswith("<") or lineno <= 0:
+			return None  # Server Script / eval'd code / bogus
+		return (
+			os.path.abspath(filename),
+			int(lineno),
+			getattr(obj, "__name__", "") or "",
+		)
+	except Exception:
+		return None
+
+
+def _bench_relative_display(abs_path: str) -> str:
+	"""Display form of an absolute source path: ``apps/<app>/.../file.py``
+	(relative to the bench root). Falls back to the absolute path when the
+	file is outside the bench or the bench path can't be determined."""
+	try:
+		from frappe.utils import get_bench_path
+
+		rel = os.path.relpath(abs_path, get_bench_path())
+		if rel and not rel.startswith(".."):
+			return rel.replace("\\", "/")
+	except Exception:
+		pass
+	return abs_path
+
+
+def _action_entry_callsite(action, *, cache: dict | None = None) -> dict | None:
+	"""Resolve an action's entry-point source location + a ±1-line snippet.
+
+	Returns ``{"filename": <bench-relative display path>, "_abs": <absolute>,
+	"lineno": <def line>, "function": <name>, "source_snippet": [...] | None}``
+	— or ``None`` when there's no clean dotted entry point / it can't be
+	resolved / the callable has no real source. ``source_snippet`` may itself
+	be ``None`` if the file can't be read (the template guards on it).
+
+	``cache`` (shared across all actions in one render) is forwarded to
+	``_read_source_snippet`` so a cluster of actions in one source file reads
+	it once. Resolution itself isn't memoized — it's cheap (``importlib`` on
+	already-imported modules) and reports have only tens of actions.
+	"""
+	dotted = _action_dotted_entry(action)
+	if not dotted:
+		return None
+	resolved = _resolve_dotted_to_code(dotted)
+	if not resolved:
+		return None
+	abs_path, lineno, name = resolved
+	return {
+		"filename": _bench_relative_display(abs_path),
+		"_abs": abs_path,
+		"lineno": lineno,
+		"function": name,
+		"source_snippet": _read_source_snippet(abs_path, lineno, cache=cache),
+	}
+
+
+def _resolve_frame_key_to_callsite(function_key, *, cache: dict | None = None) -> dict | None:
+	"""Resolve a Repeated Hot Frame's ``function`` value to a callsite + a
+	±1-line snippet, or ``None``.
+
+	The key is ``call_tree._redacted_module_key``'s output:
+	``f"{short_path}::{func}"`` where ``short_path`` is the last ≤2 path
+	segments of the original file (e.g. ``ugly_code/python/common.py``) and
+	``func`` is the bare frame name (occasionally ``Class.method``); or just
+	``func`` when there was no filename. Best-effort, render-time:
+
+	  1. ``short_path`` → dotted module + ``.func`` → ``_resolve_dotted_to_code``
+	     (works for shallow user-app paths; deep paths where 2 segments can't
+	     rebuild the real module just fall through).
+	  2. fallback: resolve ``short_path`` to a real file and grep for the first
+	     ``def <func>`` line.
+
+	A bare ``func`` (no ``::``) can't be resolved without a module → ``None``.
+	Returns ``{"filename","_abs","lineno","function","source_snippet"}`` or
+	``None``. Wrapped in try/except — never raises.
+	"""
+	if not function_key:
+		return None
+	try:
+		key = str(function_key)
+		if "::" not in key:
+			return None
+		short_path, _, func = key.partition("::")
+		short_path = short_path.strip()
+		func = func.strip()
+		if not short_path or not func:
+			return None
+
+		# (1) "ugly_code/python/common.py" + "looped_validate"
+		#     → "ugly_code.python.common.looped_validate"
+		norm = short_path.replace("\\", "/")
+		if norm.endswith(".py"):
+			norm = norm[:-3]
+		dotted = norm.replace("/", ".").strip(".")
+		if dotted:
+			resolved = _resolve_dotted_to_code(f"{dotted}.{func}")
+			if resolved:
+				abs_path, lineno, name = resolved
+				return {
+					"filename": _bench_relative_display(abs_path),
+					"_abs": abs_path,
+					"lineno": lineno,
+					"function": name or func,
+					"source_snippet": _read_source_snippet(abs_path, lineno, cache=cache),
+				}
+
+		# (2) grep the resolved file for "def <last component of func>"
+		abs_path = _resolve_source_path(short_path)
+		if abs_path:
+			bare = func.rsplit(".", 1)[-1]
+			pat = re.compile(r"^[ \t]*(?:async[ \t]+)?def[ \t]+" + re.escape(bare) + r"\b")
+			try:
+				with open(abs_path, "r", encoding="utf-8") as fh:
+					for i, line in enumerate(fh, start=1):
+						if pat.match(line):
+							return {
+								"filename": _bench_relative_display(abs_path),
+								"_abs": abs_path,
+								"lineno": i,
+								"function": func,
+								"source_snippet": _read_source_snippet(abs_path, i, cache=cache),
+							}
+			except Exception:
+				pass
+	except Exception:
+		return None
+	return None
+
+
+def _read_source_window(
+	filename: str,
+	lineno,
+	*,
+	before: int = 12,
+	after: int = 12,
+	cache: dict | None = None,
+	max_line_chars: int | None = None,
+) -> list[dict] | None:
+	"""Return a wider source window around ``(filename, lineno)`` for the
+	AI-fix prompt: a list of ``{lineno, content, is_target}`` covering
+	``lineno - before`` … ``lineno + after`` (clamped to the file). Same
+	per-line truncation as ``_read_source_snippet`` unless ``max_line_chars``
+	overrides it. Returns ``None`` when the file isn't readable / the lineno
+	is out of range. The (possibly app-relative) ``filename`` is resolved via
+	``_resolve_source_path`` before opening.
+	"""
+	try:
+		ln = int(lineno)
+	except (TypeError, ValueError):
+		return None
+	if ln <= 0 or not filename:
+		return None
+
+	if cache is not None and filename in cache:
+		lines = cache[filename]
+	else:
+		resolved = _resolve_source_path(filename)
+		try:
+			with open(resolved, "r", encoding="utf-8") as fh:
+				lines = fh.read().splitlines()
+		except Exception:
+			lines = None
+		if cache is not None:
+			cache[filename] = lines
+
+	if not lines:
+		return None
+
+	limit = max_line_chars or _SNIPPET_TRUNCATE_CHARS
+	start = max(1, ln - max(0, before))
+	end = min(len(lines), ln + max(0, after))
+	window: list[dict] = []
+	for n in range(start, end + 1):
+		content = lines[n - 1]
+		if len(content) > limit:
+			content = content[:limit] + "..."
+		window.append({"lineno": n, "content": content, "is_target": n == ln})
+	return window or None
 
 
 # ---------------------------------------------------------------------------
@@ -1019,8 +2059,8 @@ def _build_executive_summary(
 	)
 	headline = (
 		f"This session took {int(total_ms)}ms across {total_actions} "
-		f"action{'s' if total_actions != 1 else ''} "
-		f"({int(total_queries)} queries, ~{queries_per_action} per action)."
+		f"operation{'s' if total_actions != 1 else ''} "
+		f"— {int(total_queries)} database queries, ~{queries_per_action} per operation."
 	)
 
 	# Pull the top 3 findings by estimated_impact_ms (already sorted
@@ -1036,7 +2076,16 @@ def _build_executive_summary(
 	for f in top_findings:
 		impact = f.get("estimated_impact_ms") or 0
 		title = f.get("title") or "Finding"
-		# Strip the count suffix since the title often repeats it.
+		# v0.6.x: append the target document and the doc-event lifecycle hook
+		# when known, so the bullet says e.g. "… — Sales Invoice SINV-1
+		# (during the validate hook)" instead of just the action name.
+		_detail = f.get("technical_detail") or {}
+		_td = _detail.get("target_doc") or {}
+		_hevs = _detail.get("hook_events") or []
+		if _td.get("doctype"):
+			title += " — " + _td["doctype"] + (" " + _td["name"] if _td.get("name") else "")
+		if _hevs:
+			title += " (during the " + str(_hevs[0].get("event") or "") + " hook)"
 		bullets.append({
 			"text": title,
 			"impact_ms": round(impact, 0),
@@ -1099,6 +2148,80 @@ _HOTPATH_FINDING_TYPES: frozenset[str] = frozenset({
 })
 
 _HOTPATH_BUCKET_LABEL = "Request hotspots"
+
+
+def _filter_top_queries_for_display(queries: list) -> list:
+	"""Trim the slowest-queries leaderboard to what's worth showing:
+	user-app callsites only, and only queries that cleared the
+	"actually did some work" floor (``TOP_QUERY_FLOOR_MS``).
+
+	Mirrors what ``analyzers.top_queries`` does at analyze time so that
+	re-rendering a session captured before this filter shipped (via
+	``regenerate_reports``, which re-renders but doesn't re-analyze)
+	gets the same scoping. The per-action breakdown still shows every
+	query, fast and framework ones included.
+	"""
+	from frappe_profiler.analyzers.base import is_framework_callsite_str
+	from frappe_profiler.analyzers.top_queries import TOP_QUERY_FLOOR_MS
+
+	try:
+		from frappe_profiler.settings import get_tracked_apps
+		tracked = tuple(get_tracked_apps() or ())
+	except Exception:
+		tracked = ()
+
+	out: list = []
+	for q in queries or []:
+		if not isinstance(q, dict):
+			continue
+		if (q.get("duration_ms") or 0) < TOP_QUERY_FLOOR_MS:
+			continue
+		if not is_framework_callsite_str(q.get("callsite"), tracked):
+			out.append(q)
+	return out
+
+
+def _is_framework_app(filename_or_app, tracked_apps: tuple[str, ...] = ()) -> bool:
+	"""Tiny adapter around ``analyzers.base.is_framework_callsite`` that accepts
+	any of: (a) a callsite filename (passed through), (b) a bare app name like
+	``"frappe"``, or (c) a dotted Python module/method like
+	``"frappe.desk.form.save.savedocs"`` — both (b) and (c) are normalised to
+	``"<app>/x.py"`` so the boundary-sensitive substring checks in
+	``is_framework_callsite`` fire. Falsy/missing input → ``False`` (treat as
+	user code so unattributable rows aren't penalised).
+
+	Used by the four "Split: custom apps prominent, framework collapsed"
+	sections (per-action, top-queries, background-jobs, hot-frames) to route
+	rows. ``tracked_apps`` flips the classifier to inclusion mode (framework
+	= anything NOT in the allowlist) when populated."""
+	if not filename_or_app:
+		return False
+	val = str(filename_or_app).strip()
+	if not val:
+		return False
+	norm = val.replace("\\", "/")
+	if "/" not in norm:
+		# Bare app name OR dotted module path — take the first dotted
+		# segment (the top-level package) and synthesise a path so the
+		# substring checks against ``<app>/`` fire.
+		first = norm.split(".", 1)[0]
+		val = f"{first}/x.py"
+	from frappe_profiler.analyzers.base import is_framework_callsite
+	return is_framework_callsite(val, tracked_apps=tracked_apps or None)
+
+
+def _split_by_framework_app(rows, app_key, tracked_apps: tuple[str, ...] = ()):
+	"""Split a list into ``(custom, framework)`` preserving order within each.
+	``app_key`` is a callable ``row → str | None`` that returns either a
+	filename or a bare app name; ``_is_framework_app`` classifies."""
+	custom, framework = [], []
+	for r in (rows or []):
+		try:
+			val = app_key(r)
+		except Exception:
+			val = None
+		(framework if _is_framework_app(val, tracked_apps) else custom).append(r)
+	return custom, framework
 
 
 def _app_from_finding(finding: dict) -> str:
@@ -1211,6 +2334,21 @@ def _now_iso() -> str:
 	return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _format_datetime_display(value) -> str:
+	"""Format a datetime (or datetime-string) for display in the report using
+	the site's System Settings (Date Format + Time Format) — which also drops
+	the microseconds. Falls back to the value with any trailing microseconds
+	stripped when Frappe isn't available (standalone / tests)."""
+	if not value:
+		return ""
+	try:
+		from frappe.utils import format_datetime
+
+		return format_datetime(value)
+	except Exception:
+		return re.sub(r"\.\d+", "", str(value))
+
+
 def _get_server_timezone() -> str:
 	"""Return a human-readable server timezone label.
 
@@ -1284,16 +2422,10 @@ _ACTIONABLE_FINDING_TYPES = frozenset({
 #   Network Overhead         — client/proxy territory, not user code
 
 
-def redact_frame_name(node: dict, mode: str, allowed_prefixes: tuple) -> str:
-	"""Apply R2 redaction to a tree node's display name.
-
-	Safe mode:
-	  - Frames in frappe./erpnext./payments./hrms. → full name kept
-	  - Frames in any allowed_prefixes prefix → full name kept
-	  - All other frames → collapsed to "<app>:<top-level-module>"
-
-	Raw mode:
-	  - Full function name + filename + line number, no redaction.
+def redact_frame_name(node: dict) -> str:
+	"""Build a tree node's display name. Always emits the full function
+	name plus its short filename and line number — single admin-scoped
+	report has no need for the safe-mode app collapse this used to do.
 	"""
 	if not isinstance(node, dict):
 		return "<unknown>"
@@ -1302,24 +2434,8 @@ def redact_frame_name(node: dict, mode: str, allowed_prefixes: tuple) -> str:
 	filename = node.get("filename") or ""
 	lineno = node.get("lineno") or 0
 
-	if mode == "raw":
-		short_file = filename.split("/")[-1] if filename else "?"
-		return f"{function} ({short_file}:{lineno})"
-
-	# Special markers — pass through unchanged
-	if function.startswith("[") or function in ("<root>", "<sql>", "<unknown>"):
-		return function
-
-	allowed = HARDCODED_ALLOWED_PREFIXES + tuple(allowed_prefixes or ())
-	for prefix in allowed:
-		if function.startswith(prefix):
-			return function
-
-	# Collapse to <app>:<top-level-module>
-	parts = function.split(".", 2)
-	if len(parts) >= 2:
-		return f"{parts[0]}:{parts[1]}"
-	return function
+	short_file = filename.split("/")[-1] if filename else "?"
+	return f"{function} ({short_file}:{lineno})"
 
 
 # Donut color palette (8 colors; rolls over for more).
@@ -1329,29 +2445,17 @@ _DONUT_COLORS = [
 ]
 
 
-def build_donut_data(breakdown: dict, mode: str, allowed_prefixes: tuple) -> list:
+def build_donut_data(breakdown: dict) -> list:
 	"""Convert session_time_breakdown_json into ordered (label, ms, color) tuples.
-
-	Safe mode collapses non-allowed app names into a single "Python (custom apps)"
-	bucket. Raw mode shows each app by name.
 
 	v0.5.1: hides slices that round to 0ms in display. A session with
 	148ms of SQL and only a handful of sub-ms Python self-times was
-	rendering seven "Python (…) — 0ms" entries, all noise. The
-	threshold catches both (a) genuinely tiny buckets and (b) buckets
-	that leaked through imperfect routing (stdlib files, third-party
-	libs that the bucketer should have caught but missed).
+	rendering seven "Python (…) — 0ms" entries, all noise.
 	"""
 	if not breakdown:
 		return []
 
-	# v0.5.1: buckets under this threshold display as "0ms" after the
-	# integer-ms display formatting, so they're worse than useless —
-	# they just add visual clutter. Hide them.
 	DONUT_DISPLAY_MIN_MS = 1.0
-
-	allowed = HARDCODED_ALLOWED_PREFIXES + tuple(allowed_prefixes or ())
-	allowed_app_names = {p.rstrip(".") for p in allowed}
 
 	slices = []
 	sql_ms = breakdown.get("sql_ms", 0)
@@ -1359,27 +2463,11 @@ def build_donut_data(breakdown: dict, mode: str, allowed_prefixes: tuple) -> lis
 		slices.append(("SQL", sql_ms, _DONUT_COLORS[0]))
 
 	by_app = breakdown.get("by_app", {})
-	if mode == "safe":
-		# Group: each allowed app gets its own slice; everything else
-		# merges into "Python (custom apps)".
-		custom_total = 0.0
-		for app, ms in by_app.items():
-			if app in allowed_app_names:
-				if ms >= DONUT_DISPLAY_MIN_MS:
-					color = _DONUT_COLORS[(len(slices)) % len(_DONUT_COLORS)]
-					slices.append((f"Python ({app})", ms, color))
-			else:
-				custom_total += ms
-		if custom_total >= DONUT_DISPLAY_MIN_MS:
-			color = _DONUT_COLORS[(len(slices)) % len(_DONUT_COLORS)]
-			slices.append(("Python (custom apps)", custom_total, color))
-	else:
-		# Raw mode: every app named, subject to the display threshold.
-		for app, ms in by_app.items():
-			if ms < DONUT_DISPLAY_MIN_MS:
-				continue
-			color = _DONUT_COLORS[(len(slices)) % len(_DONUT_COLORS)]
-			slices.append((f"Python ({app})", ms, color))
+	for app, ms in by_app.items():
+		if ms < DONUT_DISPLAY_MIN_MS:
+			continue
+		color = _DONUT_COLORS[(len(slices)) % len(_DONUT_COLORS)]
+		slices.append((f"Python ({app})", ms, color))
 
 	return slices
 
@@ -1420,18 +2508,12 @@ def build_donut_svg(slices: list) -> str:
 	return "".join(parts)
 
 
-def build_hot_frames_table(rows: list, mode: str, allowed_prefixes: tuple) -> list:
-	"""Apply redaction to the hot frames leaderboard rows.
-
-	Returns a list of dicts ready for the template (display_name, total_ms,
-	occurrences, distinct_actions, action_refs).
-	"""
+def build_hot_frames_table(rows: list) -> list:
+	"""Build the hot-frames leaderboard rows."""
 	out = []
 	for row in rows or []:
 		display = redact_frame_name(
 			{"function": row.get("function"), "filename": "", "lineno": 0},
-			mode=mode,
-			allowed_prefixes=allowed_prefixes,
 		)
 		out.append({
 			"display_name": display,

@@ -29,18 +29,39 @@ except ImportError:
 	frappe = None  # type: ignore[assignment]
 	_FRAPPE_AVAILABLE = False
 
-# Severity thresholds. A "hot line" is one that concentrates a large
-# fraction of its function's wall time on a single source line.
-HOT_LINE_HIGH_FRACTION = 0.50
-HOT_LINE_HIGH_MIN_MS = 100.0
-
-HOT_LINE_MEDIUM_FRACTION = 0.25
-HOT_LINE_MEDIUM_MIN_MS = 50.0
+# v0.6.0 Round 6: previously-hardcoded thresholds. The High pair is
+# read from Profiler Settings; the Medium pair derives from it via a
+# fixed multiplier so a single configured threshold drives both.
+HOT_LINE_HIGH_FRACTION_FALLBACK = 0.50  # used when settings unreachable
+HOT_LINE_HIGH_MIN_MS_FALLBACK = 100.0
+HOT_LINE_MEDIUM_FRACTION_MULTIPLIER = 0.5   # Medium = 50% of High pct (preserves 0.25/0.50 ratio)
+HOT_LINE_MEDIUM_MIN_MS_MULTIPLIER = 0.5     # Medium = 50% of High ms
 
 # Per-function summary keeps the top-N lines by total_ms in the aggregate
 # so the renderer can show a compact "where the time went" panel without
 # pulling the full per-line data on the form.
 HOT_LINES_IN_SUMMARY = 5
+
+
+def _resolve_hot_line_thresholds() -> tuple[float, float, float, float]:
+	"""Return (high_pct, high_ms, med_pct, med_ms) from Profiler
+	Settings (cached). Falls back to legacy constants when settings
+	can't be read (pure-test path, fresh install before migrate)."""
+	try:
+		from frappe_profiler.settings import get_config
+		cfg = get_config()
+		# Settings store percentage as 0-100 for UX; convert here.
+		high_pct = float(cfg.hot_line_high_pct or 50.0) / 100.0
+		high_ms = float(cfg.hot_line_high_min_ms or HOT_LINE_HIGH_MIN_MS_FALLBACK)
+	except Exception:
+		high_pct = HOT_LINE_HIGH_FRACTION_FALLBACK
+		high_ms = HOT_LINE_HIGH_MIN_MS_FALLBACK
+	return (
+		high_pct,
+		high_ms,
+		high_pct * HOT_LINE_MEDIUM_FRACTION_MULTIPLIER,
+		high_ms * HOT_LINE_MEDIUM_MIN_MS_MULTIPLIER,
+	)
 
 
 def _classify_hot_line(line_ms: float, total_ms: float) -> str | None:
@@ -53,9 +74,10 @@ def _classify_hot_line(line_ms: float, total_ms: float) -> str | None:
 	if total_ms <= 0:
 		return None
 	fraction = line_ms / total_ms
-	if fraction >= HOT_LINE_HIGH_FRACTION and line_ms >= HOT_LINE_HIGH_MIN_MS:
+	high_pct, high_ms, med_pct, med_ms = _resolve_hot_line_thresholds()
+	if fraction >= high_pct and line_ms >= high_ms:
 		return "High"
-	if fraction >= HOT_LINE_MEDIUM_FRACTION and line_ms >= HOT_LINE_MEDIUM_MIN_MS:
+	if fraction >= med_pct and line_ms >= med_ms:
 		return "Medium"
 	return None
 
@@ -252,9 +274,9 @@ def run_analyze(session_uuid: str, run_uuid: str) -> None:
 		# Persist to the run row + propagate findings to the parent session.
 		_persist_run(parent_docname, run_uuid, results_json, result, total_ms)
 
-		# Re-render the parent session's safe + raw reports so the new
-		# phase-2 panel appears. Reuses the existing regenerate_reports
-		# code path (which expects session_uuid, not docname).
+		# Re-render the parent session's report so the new phase-2
+		# panel appears. Reuses the existing regenerate_reports code
+		# path (which expects session_uuid, not docname).
 		_regenerate_parent_reports(session_uuid)
 
 		# Done — drop ephemeral Redis state.

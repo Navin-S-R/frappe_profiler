@@ -3,14 +3,13 @@
 
 """Tests for v0.5.2 round 4 clickable callsite → editor deep-link.
 
-In raw mode, a finding's absolute-path callsite renders as a clickable
-anchor that uses the ``vscode://file`` URL scheme — VS Code, VS Code
-Insiders, and Cursor all register this handler on install, so the
-link jumps the developer straight to the file:line in their editor
-with one click.
+A finding's absolute-path callsite renders as a clickable anchor using
+the ``vscode://file`` URL scheme — VS Code, VS Code Insiders, and
+Cursor all register this handler on install, so the link jumps the
+developer straight to the file:line in their editor with one click.
 
-Safe mode keeps the callsite as plain text — we don't leak absolute
-paths outside the org.
+Bench-relative (non-absolute) paths render as plain text since the
+``vscode://file`` URL scheme requires an absolute filesystem path.
 """
 
 import json
@@ -40,8 +39,6 @@ def _fake_session_doc(callsite_filename="/abs/path/apps/myapp/foo.py",
 	doc.total_python_ms = 0
 	doc.total_sql_ms = 0
 	doc.analyzer_warnings = None
-	doc.compared_to_session = None
-	doc.is_baseline = 0
 	doc.v5_aggregate_json = "{}"
 	doc.actions = []
 
@@ -77,7 +74,7 @@ def test_raw_mode_wraps_callsite_in_vscode_link():
 
 	doc = _fake_session_doc(callsite_filename="/abs/path/apps/myapp/foo.py",
 	                        callsite_lineno=42)
-	html = renderer.render(doc, recordings=[], mode="raw")
+	html = renderer.render(doc, recordings=[])
 
 	# The vscode:// href is present with the absolute path + line.
 	assert 'href="vscode://file/abs/path/apps/myapp/foo.py:42"' in html, (
@@ -89,26 +86,7 @@ def test_raw_mode_wraps_callsite_in_vscode_link():
 	assert "apps/myapp/foo.py:42" in html
 
 
-def test_safe_mode_does_not_emit_editor_link():
-	"""Safe mode stays plain text — no vscode:// link in markup."""
-	from frappe_profiler import renderer
-
-	doc = _fake_session_doc(callsite_filename="/abs/path/apps/myapp/foo.py",
-	                        callsite_lineno=42)
-	html = renderer.render(doc, recordings=[], mode="safe")
-
-	# Must NOT have any vscode:// href — that would leak the absolute
-	# path when the safe report is shared externally. (A CSS comment
-	# mentioning vscode:// is fine; we check only actual href="…"
-	# attributes.)
-	assert 'href="vscode://' not in html, (
-		"Safe mode must not emit editor deep-links (absolute paths "
-		"shouldn't leave the org when the report is shared externally)"
-	)
-	assert 'class="callsite-link"' not in html
-
-
-def test_raw_mode_bench_relative_path_does_not_emit_link():
+def test_bench_relative_path_does_not_emit_link():
 	"""Bench-relative (non-absolute) callsites — e.g. 'frappe/handler.py'
 	from pyinstrument's short form — can't be made into a working
 	vscode:// URL without an abs path. Render as plain code instead
@@ -117,7 +95,7 @@ def test_raw_mode_bench_relative_path_does_not_emit_link():
 
 	doc = _fake_session_doc(callsite_filename="frappe/handler.py",
 	                        callsite_lineno=10)
-	html = renderer.render(doc, recordings=[], mode="raw")
+	html = renderer.render(doc, recordings=[])
 
 	assert 'vscode://file/frappe/handler.py' not in html, (
 		"Non-absolute path must NOT be linked as vscode:// — the URL "
@@ -132,5 +110,5 @@ def test_link_points_to_correct_file_and_line():
 
 	doc = _fake_session_doc(callsite_filename="/home/frappe/bench/apps/myapp/x.py",
 	                        callsite_lineno=777)
-	html = renderer.render(doc, recordings=[], mode="raw")
+	html = renderer.render(doc, recordings=[])
 	assert 'href="vscode://file/home/frappe/bench/apps/myapp/x.py:777"' in html
