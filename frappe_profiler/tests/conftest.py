@@ -22,6 +22,126 @@ import pytest
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 
 
+# --- CI-friendly baseline frappe stub ---------------------------------------
+# On a bench host frappe is importable and we use the real module. On CI
+# (the GitHub Actions runner, or any pure pip venv) frappe is NOT installed,
+# so module-top imports like ``from frappe.utils import now_datetime`` in
+# app code (api.py, analyze.py, hooks_callbacks.py, …) fail at COLLECTION
+# time and pytest exits with code 2 before any test runs. This baseline
+# stub satisfies those imports just enough for collection to succeed; the
+# per-test ``_sys_modules_fence`` below still snapshots sys.modules per
+# test, so tests that need richer stubs install them via monkeypatch and
+# the baseline is restored at teardown.
+try:
+	import frappe  # noqa: F401
+except ImportError:
+	import datetime as _dt
+	import types as _types
+
+	class _StubValidationError(Exception):
+		pass
+
+	def _stub_throw(msg=None, exc=None, **kw):
+		raise (exc or _StubValidationError)(msg or "stub frappe.throw")
+
+	def _stub_logger():
+		return _types.SimpleNamespace(
+			warning=lambda *a, **kw: None,
+			info=lambda *a, **kw: None,
+			debug=lambda *a, **kw: None,
+			error=lambda *a, **kw: None,
+		)
+
+	def _stub_get_bench_path():
+		# Two levels above the package root, so a relpath of files inside
+		# the package against this value yields a tidy display like
+		# ``<package>/<package>/<file>.py`` — that's the shape the
+		# ``_action_entry_callsite`` tests assert on (``endswith
+		# 'frappe_profiler/renderer.py'``).
+		here = os.path.abspath(__file__)  # .../frappe_profiler/tests/conftest.py
+		for _ in range(4):
+			here = os.path.dirname(here)
+		return here
+
+	def _mk_module(name, **attrs):
+		m = _types.ModuleType(name)
+		# Mark every stub module as a package so submodule attribute access
+		# (e.g. ``frappe.utils.X`` after ``import frappe.utils.X``) works.
+		m.__path__ = []  # arbitrary — Python only needs the attribute to exist
+		for k, v in attrs.items():
+			setattr(m, k, v)
+		sys.modules[name] = m
+		# Link as an attribute on the parent module so ``frappe.utils`` style
+		# access works after ``import frappe.utils`` — Python's import machinery
+		# normally does this, but only for real packages on disk.
+		if "." in name:
+			parent_name, leaf = name.rsplit(".", 1)
+			parent = sys.modules.get(parent_name)
+			if parent is not None:
+				setattr(parent, leaf, m)
+		return m
+
+	_mk_module(
+		"frappe",
+		local=_types.SimpleNamespace(),
+		db=_types.SimpleNamespace(),
+		session=_types.SimpleNamespace(user="Administrator"),
+		flags=_types.SimpleNamespace(),
+		cache=_types.SimpleNamespace(),
+		_dict=dict,
+		whitelist=lambda *a, **kw: (lambda f: f),
+		throw=_stub_throw,
+		log_error=lambda *a, **kw: None,
+		msgprint=lambda *a, **kw: None,
+		get_doc=lambda *a, **kw: None,
+		get_roles=lambda *a, **kw: [],
+		get_all=lambda *a, **kw: [],
+		get_app_path=lambda *a, **kw: "",
+		get_hooks=lambda *a, **kw: {},
+		enqueue=lambda *a, **kw: None,
+		logger=_stub_logger,
+		PermissionError=type("PermissionError", (Exception,), {}),
+		ValidationError=_StubValidationError,
+		DoesNotExistError=type("DoesNotExistError", (Exception,), {}),
+	)
+	_mk_module(
+		"frappe.utils",
+		now_datetime=_dt.datetime.now,
+		add_to_date=lambda d, **kw: d,
+		cint=int,
+		cstr=str,
+		flt=float,
+		get_datetime=lambda *a, **kw: _dt.datetime.now(),
+		time_diff_in_seconds=lambda *a, **kw: 0,
+		get_bench_path=_stub_get_bench_path,
+	)
+	_mk_module("frappe.utils.scheduler", is_scheduler_disabled=lambda: False)
+	_mk_module("frappe.utils.background_jobs", enqueue=lambda *a, **kw: None)
+	_mk_module("frappe.utils.password", get_decrypted_password=lambda *a, **kw: "")
+	_mk_module("frappe.utils.pdf", get_pdf=lambda *a, **kw: b"")
+	_mk_module(
+		"frappe.utils.redis_wrapper",
+		RedisWrapper=type("RedisWrapper", (object,), {
+			"get_value": lambda self, *a, **kw: None,
+		}),
+	)
+	_mk_module("frappe.database")
+	_mk_module("frappe.database.utils", is_query_type=lambda *a, **kw: False)
+	_mk_module(
+		"frappe.recorder",
+		RECORDER_REQUEST_HASH="recorder:request",
+		RECORDER_REQUEST_SPARSE_HASH="recorder:sparse",
+		mark_duplicates=lambda *a, **kw: None,
+		record=lambda *a, **kw: None,
+		dump=lambda *a, **kw: None,
+	)
+	_mk_module("frappe.model")
+	_mk_module("frappe.model.document", Document=type("Document", (object,), {}))
+	_mk_module("frappe.client", get_value=lambda *a, **kw: None)
+	_mk_module("frappe.permissions", has_permission=lambda *a, **kw: True)
+# --- end baseline frappe stub -----------------------------------------------
+
+
 # v0.6.x: sys.modules auto-restore fence.
 #
 # Several tests install fake ``frappe`` / ``frappe.recorder`` /

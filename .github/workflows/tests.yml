@@ -52,16 +52,19 @@ jobs:
 
       - name: Install runtime + test dependencies
         # ``-e .`` installs the project's runtime deps declared in
-        # pyproject.toml (pyinstrument / line_profiler / requests). The
-        # second line adds pytest + the small set of test-only deps the
-        # suite imports (hypothesis-based property tests in the analyzer
-        # set, pdfplumber for the one Lens-audit PDF parsing test).
-        # Frappe itself is intentionally NOT installed — the suite is
-        # pure-Python and the conftest fence keeps frappe-stub mutations
-        # contained per-test.
+        # pyproject.toml (pyinstrument / line_profiler / requests /
+        # sqlparse / Jinja2). The second line adds pytest + the small
+        # set of test-only deps the suite imports (hypothesis-based
+        # property tests in the analyzer set, pdfplumber for the one
+        # Lens-audit PDF parsing test, sql_metadata for the table-
+        # breakdown analyzer's index-candidate logic).
+        # Frappe itself is intentionally NOT installed — the conftest
+        # baseline stub satisfies module-top frappe imports at
+        # collection time, and the per-test fence keeps stub mutations
+        # contained.
         run: |
           python -m pip install -e .
-          python -m pip install pytest hypothesis Faker pdfplumber pypdf
+          python -m pip install pytest hypothesis Faker pdfplumber pypdf sql_metadata
 
       - name: Run pytest
         run: |
@@ -89,9 +92,6 @@ jobs:
       - name: Lint (uses pyproject.toml [tool.ruff] config)
         run: ruff check frappe_profiler/
 
-      - name: Format check
-        # Non-fatal advisory step — surfaces format drift without blocking
-        # the run while the team chooses whether to enforce. Drop the
-        # ``continue-on-error`` line below to make it a hard gate.
-        run: ruff format --check frappe_profiler/
-        continue-on-error: true
+      # Format-check is deferred — the codebase predates the [tool.ruff.format]
+      # config and a large reformat is its own piece of work. Add a
+      # ``ruff format --check frappe_profiler/`` step here once that lands.
