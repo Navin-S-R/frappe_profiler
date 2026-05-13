@@ -17,7 +17,6 @@ import types
 
 from frappe_profiler import analyze, renderer
 
-
 # A real, always-present app-relative path: this very test file's package home.
 _APP_REL = "frappe_profiler/renderer.py"
 _ABS_REAL = renderer.__file__  # the resolved absolute path of the same file
@@ -139,3 +138,128 @@ class TestAiPayloadForFinding:
 		)
 		payload = analyze._ai_payload_for_finding(child, {}, phase2_index={("other.py", "other"): {"lineno": 9}})
 		assert "phase2_hotline" not in payload
+
+
+class TestAiPayloadRecordedQueries:
+	"""v0.6.x: pass actual recorded SQL queries to the AI as evidence so
+	the model has the verbatim query text to ground against, instead of
+	inferring SQL shape from the Python source — which was the leading
+	cause of bogus refactorings (e.g. inventing filters that copy a
+	variable from elsewhere in the function)."""
+
+	def _child(self, action_ref="0"):
+		return types.SimpleNamespace(
+			finding_type="Slow Hot Path", severity="High",
+			title="In Job: bg_recheck_users, 75% spent in bg_recheck_users",
+			customer_description="",
+			estimated_impact_ms=575, affected_count=0, action_ref=action_ref,
+			technical_detail_json=json.dumps({
+				"filename": _APP_REL, "lineno": 1, "function": "render",
+				"cumulative_ms": 575, "action_wall_time_ms": 770,
+			}),
+			llm_fix_json=None,
+		)
+
+	def test_top_queries_attached_from_recording(self):
+		recordings_by_uuid = {"r0": {
+			"uuid": "r0",
+			"calls": [
+				{"duration": 5.0, "query": "SELECT 1"},
+				{"duration": 320.0, "query": "SELECT name, email FROM `tabUser` LIMIT 50"},
+				{"duration": 12.0, "query": "SELECT * FROM `tabRole`"},
+				{"duration": 80.0, "query": "SELECT name FROM `tabSales Invoice`"},
+			],
+		}}
+		actions_by_idx = {0: {"idx": 0, "recording_uuid": "r0"}}
+		payload = analyze._ai_payload_for_finding(
+			self._child(action_ref="0"), {},
+			recordings_by_uuid=recordings_by_uuid,
+			actions_by_idx=actions_by_idx,
+		)
+		examples = payload["technical_detail"].get("example_queries") or []
+		# Top-3 by duration, descending: 320ms tabUser, 80ms Sales Invoice, 12ms tabRole.
+		assert examples == [
+			"SELECT name, email FROM `tabUser` LIMIT 50",
+			"SELECT name FROM `tabSales Invoice`",
+			"SELECT * FROM `tabRole`",
+		]
+
+	def test_no_attach_when_recordings_missing(self):
+		"""On-demand path with expired Redis: no recordings → no crash, no
+		example_queries key (falls back to existing context)."""
+		payload = analyze._ai_payload_for_finding(self._child(), {})
+		assert "example_queries" not in (payload["technical_detail"] or {})
+
+	def test_existing_example_queries_not_overwritten(self):
+		"""SQL red-flag findings already carry analyzer-picked example
+		queries (the offending ones). Recordings-based fallback must not
+		overwrite them."""
+		child = types.SimpleNamespace(
+			finding_type="Missing Index", severity="High",
+			title="x", customer_description="",
+			estimated_impact_ms=200, affected_count=1, action_ref="0",
+			technical_detail_json=json.dumps({
+				"callsite": {"filename": _APP_REL, "lineno": 1, "function": "f"},
+				"example_queries": ["SELECT * FROM tabFoo WHERE bar = ?"],
+			}),
+			llm_fix_json=None,
+		)
+		recordings_by_uuid = {"r0": {
+			"uuid": "r0",
+			"calls": [{"duration": 500.0, "query": "SELECT * FROM tabBaz"}],
+		}}
+		actions_by_idx = {0: {"idx": 0, "recording_uuid": "r0"}}
+		payload = analyze._ai_payload_for_finding(
+			child, {},
+			recordings_by_uuid=recordings_by_uuid,
+			actions_by_idx=actions_by_idx,
+		)
+		# Analyzer-picked queries win.
+		assert payload["technical_detail"]["example_queries"] == [
+			"SELECT * FROM tabFoo WHERE bar = ?"
+		]
+
+	def test_sub_threshold_queries_dropped(self):
+		"""Trivial sub-half-ms queries (cache hits etc.) are noise — don't
+		surface them as 'examples' the AI tries to optimise."""
+		recordings_by_uuid = {"r0": {
+			"uuid": "r0",
+			"calls": [
+				{"duration": 0.1, "query": "SELECT 1"},
+				{"duration": 0.2, "query": "SELECT 2"},
+				{"duration": 50.0, "query": "SELECT name FROM `tabUser`"},
+			],
+		}}
+		actions_by_idx = {0: {"idx": 0, "recording_uuid": "r0"}}
+		payload = analyze._ai_payload_for_finding(
+			self._child(), {},
+			recordings_by_uuid=recordings_by_uuid,
+			actions_by_idx=actions_by_idx,
+		)
+		examples = payload["technical_detail"].get("example_queries") or []
+		assert examples == ["SELECT name FROM `tabUser`"]
+
+	def test_unknown_action_ref_skipped(self):
+		"""Finding's action_ref doesn't match any action → no recordings
+		attachment, no crash."""
+		recordings_by_uuid = {"r0": {"uuid": "r0", "calls": []}}
+		actions_by_idx = {0: {"idx": 0, "recording_uuid": "r0"}}
+		payload = analyze._ai_payload_for_finding(
+			self._child(action_ref="42"), {},
+			recordings_by_uuid=recordings_by_uuid,
+			actions_by_idx=actions_by_idx,
+		)
+		assert "example_queries" not in (payload["technical_detail"] or {})
+
+	def test_non_numeric_action_ref_skipped(self):
+		"""Defensive: non-numeric / empty action_ref → no attachment."""
+		recordings_by_uuid = {"r0": {"uuid": "r0", "calls": [
+			{"duration": 100.0, "query": "SELECT 1"}
+		]}}
+		actions_by_idx = {0: {"idx": 0, "recording_uuid": "r0"}}
+		payload = analyze._ai_payload_for_finding(
+			self._child(action_ref=""), {},
+			recordings_by_uuid=recordings_by_uuid,
+			actions_by_idx=actions_by_idx,
+		)
+		assert "example_queries" not in (payload["technical_detail"] or {})

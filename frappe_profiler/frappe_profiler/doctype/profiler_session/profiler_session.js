@@ -608,8 +608,45 @@ function render_phase2_button(frm) {
 	// running without `bench start` — no RQ worker picks up the long
 	// queue. retry_phase2_analyze runs inline so the click resolves
 	// directly to Ready or Failed.
-	(frm.doc.phase_2_runs || []).forEach(function (row) {
-		if (row.status !== "Analyzing" && row.status !== "Failed") return;
+	var stuck_runs = (frm.doc.phase_2_runs || []).filter(function (row) {
+		return row.status === "Analyzing" || row.status === "Failed";
+	});
+
+	// v0.6.x: when there are 2+ stuck runs, surface a SINGLE "Retry all
+	// stuck Phase-2 runs" button that fires ONE batched server call
+	// (addresses Lens-audit "frappe.call(...) inside a loop"). The
+	// per-run buttons below stay — they let the operator retry one
+	// specific run when only one is misbehaving.
+	if (stuck_runs.length >= 2) {
+		frm.add_custom_button(
+			__("Retry all " + stuck_runs.length + " stuck Phase-2 runs"),
+			function () {
+				frappe.call({
+					method: "frappe_profiler.api.retry_phase2_analyzes_batch",
+					args: { run_uuids: stuck_runs.map(function (r) { return r.run_uuid; }) },
+					freeze: true,
+					freeze_message: __("Re-running phase-2 analyzers..."),
+					callback: function (r) {
+						var msg = (r && r.message) || {};
+						var t = msg.tallies || {};
+						frappe.show_alert({
+							message: __(
+								"Batch retry finished — " +
+								(t.Ready || 0) + " Ready · " +
+								(t.Failed || 0) + " Failed" +
+								((t.Analyzing || 0) ? " · " + t.Analyzing + " still Analyzing" : "")
+							),
+							indicator: (t.Failed || 0) === 0 ? "green" : "orange",
+						});
+						frm.reload_doc();
+					},
+				});
+			},
+			__("Phase 2")
+		);
+	}
+
+	stuck_runs.forEach(function (row) {
 		frm.add_custom_button(
 			__("Retry Phase 2 Analyze (" + row.run_uuid.slice(0, 8) + ")"),
 			function () {

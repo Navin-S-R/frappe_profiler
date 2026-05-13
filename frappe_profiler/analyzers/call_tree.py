@@ -28,7 +28,6 @@ from frappe_profiler.analyzers.base import (
 	short_filename,
 )
 
-
 # ---------------------------------------------------------------------------
 # Reconciliation primitives (Tasks 14-16)
 # ---------------------------------------------------------------------------

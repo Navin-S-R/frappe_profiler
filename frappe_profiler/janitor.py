@@ -23,7 +23,7 @@ on the next attempt — at least the row no longer pretends to be live.
 import frappe
 from frappe.utils import add_to_date, now_datetime
 
-from frappe_profiler import session
+from frappe_profiler import safe_commit, session
 
 # Sessions stuck in Recording for longer than this are force-stopped.
 # This is intentionally longer than the Redis TTL (10 minutes) to give
@@ -58,7 +58,7 @@ def sweep_stale_sessions():
 		frappe.log_error(title="frappe_profiler janitor sweep_stuck_analyzing")
 
 	# v0.6.0: phase-2 line-profile runs follow the same staleness model
-	# but live on the Profiler Phase 2 Run child rows. Reuses the same
+	# but live on the Profiler Phase Two Run child rows. Reuses the same
 	# thresholds (recording → 11min, analyzing → 30min).
 	try:
 		_sweep_stale_phase2_runs()
@@ -200,6 +200,32 @@ def _sweep_old_sessions():
 		order_by="started_at asc",
 	)
 
+	# v0.6.x: preload File names for every candidate URL in ONE bulk fetch
+	# (was a per-URL get_value inside the outer loop → O(rows × urls/row)
+	# round-trips). Map url → File doc name; missing entries simply yield
+	# None and the deletion path skips them.
+	all_urls = {
+		u for r in old
+		for u in (r.get("raw_report_file"), r.get("raw_report_pdf_file"))
+		if u
+	}
+	file_name_by_url: dict[str, str] = {}
+	if all_urls:
+		try:
+			file_name_by_url = {
+				f["file_url"]: f["name"]
+				for f in frappe.db.get_all(
+					"File",
+					filters={"file_url": ("in", list(all_urls))},
+					fields=["name", "file_url"],
+				)
+			}
+		except Exception:
+			# Defensive: if the bulk fetch fails (DB hiccup, perm), the
+			# loop below still runs — it just won't find any File docs to
+			# delete and the orphans-cleanup is a no-op for this pass.
+			file_name_by_url = {}
+
 	deleted = 0
 	for row in old:
 		try:
@@ -213,19 +239,17 @@ def _sweep_old_sessions():
 			):
 				if not file_url:
 					continue
-				try:
-					file_doc = frappe.db.get_value(
-						"File", {"file_url": file_url}, "name"
-					)
-					if file_doc:
+				file_doc = file_name_by_url.get(file_url)
+				if file_doc:
+					try:
 						frappe.delete_doc(
 							"File",
 							file_doc,
 							ignore_permissions=True,
 							delete_permanently=True,
 						)
-				except Exception:
-					pass
+					except Exception:
+						pass
 
 			frappe.delete_doc(
 				"Profiler Session",
@@ -238,7 +262,7 @@ def _sweep_old_sessions():
 			frappe.log_error(title=f"frappe_profiler retention delete {row['name']}")
 
 	if deleted:
-		frappe.db.commit()
+		safe_commit()
 		frappe.logger().info(
 			f"frappe_profiler retention janitor deleted {deleted} session(s) "
 			f"older than {retention_days} days"
@@ -253,6 +277,18 @@ def _sweep_stale_recording():
 		filters={"status": "Recording", "started_at": ["<", cutoff]},
 		fields=["name", "session_uuid", "user"],
 	)
+	if not stale:
+		return
+
+	# v0.6.x: single batched UPDATE for every stale row instead of one
+	# UPDATE+COMMIT per row (was N round-trips on a backlog).
+	frappe.db.set_value(
+		"Profiler Session",
+		{"name": ("in", [r["name"] for r in stale])},
+		{"status": "Stopping", "stopped_at": now_datetime()},
+	)
+	safe_commit()
+
 	for row in stale:
 		# The user's Redis active pointer should already be expired (TTL),
 		# but call clear to be defensive.
@@ -260,13 +296,6 @@ def _sweep_stale_recording():
 			session.clear_active_session(row["user"])
 		except Exception:
 			pass
-
-		frappe.db.set_value(
-			"Profiler Session",
-			row["name"],
-			{"status": "Stopping", "stopped_at": now_datetime()},
-		)
-		frappe.db.commit()
 
 		# Enqueue analyze for whatever recordings did get captured before
 		# the user walked away. The analyze job handles empty sessions
@@ -292,20 +321,23 @@ def _sweep_stuck_analyzing():
 		filters={"status": "Analyzing", "modified": ["<", cutoff]},
 		fields=["name"],
 	)
-	for row in stuck:
-		frappe.db.set_value(
-			"Profiler Session",
-			row["name"],
-			{
-				"status": "Failed",
-				"analyzer_warnings": "Analyze job timed out or crashed. Manually retry from a Frappe console: frappe_profiler.analyze.run('<session_uuid>')",
-			},
-		)
-		frappe.db.commit()
+	if not stuck:
+		return
+
+	# v0.6.x: single batched UPDATE.
+	frappe.db.set_value(
+		"Profiler Session",
+		{"name": ("in", [r["name"] for r in stuck])},
+		{
+			"status": "Failed",
+			"analyzer_warnings": "Analyze job timed out or crashed. Manually retry from a Frappe console: frappe_profiler.analyze.run('<session_uuid>')",
+		},
+	)
+	safe_commit()
 
 
 def _sweep_stale_phase2_runs():
-	"""Force-stop Profiler Phase 2 Run rows stuck in Recording (>11min) or
+	"""Force-stop Profiler Phase Two Run rows stuck in Recording (>11min) or
 	Analyzing (>30min). Mirrors the phase-1 sweep logic but operates on
 	the child rows.
 
@@ -321,15 +353,17 @@ def _sweep_stale_phase2_runs():
 
 	rec_cutoff = add_to_date(now_datetime(), minutes=-STALE_RECORDING_MINUTES)
 	rec_stale = frappe.db.get_all(
-		"Profiler Phase 2 Run",
+		"Profiler Phase Two Run",
 		filters={"status": "Recording", "modified": ["<", rec_cutoff]},
 		fields=["name", "parent", "run_uuid"],
 	)
-	for row in rec_stale:
+	if rec_stale:
+		# v0.6.x: single batched UPDATE; the per-row Redis cleanup stays
+		# per-row below since it touches Redis, not the DB.
 		try:
 			frappe.db.set_value(
-				"Profiler Phase 2 Run",
-				row["name"],
+				"Profiler Phase Two Run",
+				{"name": ("in", [r["name"] for r in rec_stale])},
 				{
 					"status": "Failed",
 					"warnings_json": frappe.as_json([
@@ -338,22 +372,26 @@ def _sweep_stale_phase2_runs():
 					"ended_at": now_datetime(),
 				},
 			)
-			_lp_capture.cleanup_run(row["run_uuid"])
-			frappe.db.commit()
+			safe_commit()
 		except Exception:
 			frappe.log_error(title="frappe_profiler janitor stale phase-2 recording")
+		for row in rec_stale:
+			try:
+				_lp_capture.cleanup_run(row["run_uuid"])
+			except Exception:
+				frappe.log_error(title="frappe_profiler janitor stale phase-2 recording cleanup")
 
 	ana_cutoff = add_to_date(now_datetime(), minutes=-STALE_ANALYZING_MINUTES)
 	ana_stuck = frappe.db.get_all(
-		"Profiler Phase 2 Run",
+		"Profiler Phase Two Run",
 		filters={"status": "Analyzing", "modified": ["<", ana_cutoff]},
 		fields=["name", "parent", "run_uuid"],
 	)
-	for row in ana_stuck:
+	if ana_stuck:
 		try:
 			frappe.db.set_value(
-				"Profiler Phase 2 Run",
-				row["name"],
+				"Profiler Phase Two Run",
+				{"name": ("in", [r["name"] for r in ana_stuck])},
 				{
 					"status": "Failed",
 					"warnings_json": frappe.as_json([
@@ -365,7 +403,11 @@ def _sweep_stale_phase2_runs():
 					"ended_at": now_datetime(),
 				},
 			)
-			_lp_capture.cleanup_run(row["run_uuid"])
-			frappe.db.commit()
+			safe_commit()
 		except Exception:
 			frappe.log_error(title="frappe_profiler janitor stuck phase-2 analyzing")
+		for row in ana_stuck:
+			try:
+				_lp_capture.cleanup_run(row["run_uuid"])
+			except Exception:
+				frappe.log_error(title="frappe_profiler janitor stuck phase-2 analyzing cleanup")

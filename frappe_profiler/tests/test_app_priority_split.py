@@ -14,12 +14,10 @@ behaviour for each section.
 
 import json
 import types
-
 from unittest.mock import patch
 
 from frappe_profiler import renderer
 from frappe_profiler.settings import ProfilerConfig
-
 
 # --------------------------------------------------------------------------
 # _is_framework_app — the tiny classifier adapter

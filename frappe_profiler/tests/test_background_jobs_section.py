@@ -174,7 +174,8 @@ class TestRenderedBackgroundJobsSection:
 		# the pieces rather than an exact phrase).
 		assert "1 background job" in html
 		assert "ran during this flow" in html
-		assert "1200ms total" in html
+		# 1200ms > default threshold (1000ms) → renders as 1.20s.
+		assert "1.20s total" in html
 		# caveat about jobs that ran too late / no worker
 		assert "Retry Analyze" in html
 		# its query made it into the drill-down

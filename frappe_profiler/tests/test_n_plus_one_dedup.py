@@ -29,7 +29,7 @@ def _make_recording(stack, queries_per_variant, variants, per_query_ms=2.0):
 	calls = []
 	for v_idx in range(variants):
 		query_shape = f"SELECT * FROM `tab{v_idx}` WHERE name=?"
-		for i in range(queries_per_variant):
+		for _ in range(queries_per_variant):
 			calls.append({
 				"normalized_query": query_shape,
 				"duration": per_query_ms,

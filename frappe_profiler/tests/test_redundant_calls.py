@@ -16,7 +16,6 @@ import json
 from frappe_profiler.analyzers import redundant_calls
 from frappe_profiler.analyzers.base import AnalyzeContext
 
-
 # Canonical user-code caller stack used by the default fixture. Passing
 # this through walk_callsite yields ``apps/myapp/controllers/bulk.py:42``
 # as the blame frame, so findings built from this fixture are kept.

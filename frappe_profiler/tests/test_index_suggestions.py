@@ -1363,3 +1363,87 @@ def test_classify_column_blacklists_every_frappe_metadata_column():
 	# A business column is NOT blacklisted — in a no-DB env it falls through
 	# to the legacy "unknown" path (plain DDL kept, not suppressed).
 	assert _classify_column("tabFoo", "customer", {}, {})[0] == "unknown"
+
+
+class TestIsSafeTableName:
+	"""v0.6.x: ``_is_safe_table_name`` whitelists the only two table-name
+	shapes ``_get_indexed_columns`` is allowed to interpolate into raw
+	``SHOW INDEX FROM`` SQL. Everything else routes to an empty-set
+	fallback before the DB is touched — fixes the Lens audit's SQL-
+	injection finding at index_suggestions.py:198."""
+
+	def test_accepts_tab_doctype_names(self):
+		from frappe_profiler.analyzers.index_suggestions import _is_safe_table_name
+		# Normal Frappe DocType-derived tables.
+		assert _is_safe_table_name("tabUser") is True
+		assert _is_safe_table_name("tabSales Invoice") is True
+		assert _is_safe_table_name("tabHas Role") is True
+		assert _is_safe_table_name("tabDocType Action") is True
+		assert _is_safe_table_name("tabCustom_Field") is True
+		assert _is_safe_table_name("tab__global_search") is True
+		# Hyphenated DocType names (rare but valid).
+		assert _is_safe_table_name("tabPick-List") is True
+
+	def test_accepts_information_schema_views(self):
+		from frappe_profiler.analyzers.index_suggestions import _is_safe_table_name
+		assert _is_safe_table_name("information_schema.columns") is True
+		assert _is_safe_table_name("information_schema.tables") is True
+		assert _is_safe_table_name("information_schema.statistics") is True
+
+	def test_rejects_sql_injection_payloads(self):
+		from frappe_profiler.analyzers.index_suggestions import _is_safe_table_name
+		# Classic injection shapes the audit was worried about.
+		assert _is_safe_table_name("tabUser`; DROP TABLE x; --") is False
+		assert _is_safe_table_name("tabUser` UNION SELECT 1") is False
+		assert _is_safe_table_name("tabUser'; --") is False
+		assert _is_safe_table_name('tabUser" OR "1"="1') is False
+		# Newlines / nulls / backslash escape attempts.
+		assert _is_safe_table_name("tabUser\n; DROP") is False
+		assert _is_safe_table_name("tabUser\x00 hidden") is False
+		assert _is_safe_table_name("tabUser\\") is False
+
+	def test_rejects_non_tab_table_names(self):
+		from frappe_profiler.analyzers.index_suggestions import _is_safe_table_name
+		# Anything outside the tab<…>/information_schema.<…> shapes — no
+		# legitimate caller passes these, so they must be rejected.
+		assert _is_safe_table_name("user") is False  # no tab prefix
+		assert _is_safe_table_name("mysql.user") is False  # other schema
+		assert _is_safe_table_name("performance_schema.events_statements_summary") is False
+		assert _is_safe_table_name("foo.tabUser") is False  # schema-prefixed
+		# Unicode oddities — conservative reject.
+		assert _is_safe_table_name("tabUser™") is False
+
+	def test_defensive_against_non_string_input(self):
+		from frappe_profiler.analyzers.index_suggestions import _is_safe_table_name
+		assert _is_safe_table_name(None) is False
+		assert _is_safe_table_name("") is False
+		assert _is_safe_table_name(123) is False
+		assert _is_safe_table_name(["tabUser"]) is False
+		assert _is_safe_table_name({"name": "tabUser"}) is False
+
+
+class TestGetIndexedColumnsGuard:
+	"""The SHOW INDEX FROM call routes through ``_is_safe_table_name``
+	before touching the DB. An unsafe name must not reach ``frappe.db.sql``
+	at all — proven by raising loudly from the patched stub."""
+
+	def test_unsafe_table_name_returns_empty_set_without_sql(self):
+		import sys
+		import types
+		from unittest.mock import patch
+
+		stub = types.ModuleType("frappe")
+		def _explode(*args, **kwargs):
+			raise AssertionError(
+				"SHOW INDEX FROM reached frappe.db.sql with an unsafe name — "
+				"the guard at index_suggestions._get_indexed_columns is broken"
+			)
+		stub.db = types.SimpleNamespace(sql=_explode)
+		with patch.dict(sys.modules, {"frappe": stub}):
+			from frappe_profiler.analyzers.index_suggestions import _get_indexed_columns
+			# Each of these must short-circuit to an empty set.
+			assert _get_indexed_columns("tabUser`; DROP TABLE x; --") == set()
+			assert _get_indexed_columns("") == set()
+			assert _get_indexed_columns(None) == set()
+			assert _get_indexed_columns("mysql.user") == set()
+

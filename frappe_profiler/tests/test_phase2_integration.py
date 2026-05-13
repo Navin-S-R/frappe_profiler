@@ -15,6 +15,8 @@ import sys
 import types
 from unittest.mock import patch
 
+import pytest
+
 
 class _FakeCache:
 	"""Minimal stand-in for frappe.cache. Stores dict + supports get/set/
@@ -45,16 +47,17 @@ class _FakeCache:
 		return items[start : stop + 1]
 
 
-def _install_fake_frappe():
-	"""Inject a minimal frappe stub into sys.modules. Returns the fake
-	cache object the tests can introspect."""
+def _install_fake_frappe(monkeypatch):
+	"""Inject a minimal frappe stub into sys.modules via monkeypatch.setitem
+	so the real frappe is restored at teardown. Returns the fake cache
+	object the tests can introspect."""
 	fake_frappe = types.ModuleType("frappe")
 	fake_local = types.SimpleNamespace()
 	fake_cache = _FakeCache()
 	fake_frappe.local = fake_local
 	fake_frappe.cache = fake_cache
 	fake_frappe.log_error = lambda *a, **k: None  # swallow
-	sys.modules["frappe"] = fake_frappe
+	monkeypatch.setitem(sys.modules, "frappe", fake_frappe)
 	return fake_cache
 
 
@@ -67,14 +70,17 @@ def sample_target():
 
 
 class TestPhase2Lifecycle:
-	def setup_method(self):
-		# Fresh fake frappe per test so state doesn't leak.
-		_install_fake_frappe()
+	@pytest.fixture(autouse=True)
+	def _fresh_state(self, monkeypatch):
+		# Fresh fake frappe per test so state doesn't leak. Routed through
+		# monkeypatch.setitem so the real frappe + line_profile.* modules
+		# are restored at teardown (no pollution to subsequent test files).
+		_install_fake_frappe(monkeypatch)
 		# Force-reload capture so its module-level state (the
 		# _resolved_fns_by_run dict) and frappe references are clean.
 		for name in list(sys.modules):
 			if name.startswith("frappe_profiler.line_profile"):
-				del sys.modules[name]
+				monkeypatch.delitem(sys.modules, name, raising=False)
 
 	def test_is_active_returns_run_uuid_after_start(self):
 		from frappe_profiler.line_profile import capture

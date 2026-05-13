@@ -450,13 +450,13 @@ def resolve_freeform(dotted_path: str) -> dict:
 	eligible, reason = _check_eligibility(obj)
 
 	code = getattr(obj, "__code__", None)
-	file = code.co_filename if code is not None else "<unknown>"
+	file_path = code.co_filename if code is not None else "<unknown>"
 	lineno = code.co_firstlineno if code is not None else 0
 
 	return {
 		"dotted_path": rewritten or dotted_path,
 		"qualname": qualname,
-		"file": file,
+		"file": file_path,
 		"lineno": lineno,
 		"app": parts[0],
 		"cumulative_ms": 0.0,

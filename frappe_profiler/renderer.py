@@ -207,6 +207,9 @@ def render(
 		# only re-renders on Regenerate Reports / Retry Analyze — the stamp
 		# means a user opening an old file can immediately tell whether the
 		# settings they expect are actually baked in.
+		_large_duration_threshold_ms = float(
+			getattr(_cfg, "large_duration_threshold_ms", 1000.0) or 0.0
+		)
 		render_config = {
 			"hide_framework_tables": _hide_framework_tables,
 			"tracked_apps": tuple(getattr(_cfg, "tracked_apps", ()) or ()),
@@ -216,10 +219,12 @@ def render(
 			"min_action_duration_ms": float(
 				getattr(_cfg, "min_action_duration_ms", 0.0) or 0.0
 			),
+			"large_duration_threshold_ms": _large_duration_threshold_ms,
 		}
 	except Exception:
 		_ai_findings_on = _ai_indexes_on = True
 		_hide_framework_tables = True
+		_large_duration_threshold_ms = 1000.0
 		render_config = {
 			"hide_framework_tables": True,
 			"tracked_apps": (),
@@ -227,7 +232,13 @@ def render(
 			"ai_suggest_findings": True,
 			"ai_suggest_indexes": True,
 			"min_action_duration_ms": 0.0,
+			"large_duration_threshold_ms": 1000.0,
 		}
+	# v0.6.x: Jinja-callable that formats a duration with the configured
+	# threshold. Closures over the resolved threshold so templates can just
+	# write {{ fmt_ms(action.duration_ms) }} (no threshold arg needed).
+	def _fmt_ms(v, decimals: int = 0) -> str:
+		return _format_duration_ms(v, _large_duration_threshold_ms, decimals)
 	if not _ai_findings_on:
 		for _f in all_findings:
 			_f["llm_fix"] = None
@@ -381,6 +392,11 @@ def render(
 		tracked_apps = get_tracked_apps()
 	except Exception:
 		tracked_apps = ()
+	# v0.6.x: attach a call-tree drill-down chain to each finding that has a
+	# callsite + an action_ref. Walks the action's pyinstrument tree from the
+	# finding's origin function down to the deepest user-code frame. Lets
+	# non-LLM users see the same actionable chain the AI narrative produces.
+	_attach_drilldown_chains(all_findings, actions, tracked_apps=tracked_apps)
 	findings_by_app = _bucket_findings_by_app(findings, tracked_apps)
 	observational_findings_by_app = _bucket_findings_by_app(
 		observational_findings, tracked_apps
@@ -472,6 +488,10 @@ def render(
 		"server_tz": _get_server_timezone(),
 		# Format datetimes per the site's System Settings (drops microseconds).
 		"fmt_dt": _format_datetime_display,
+		# v0.6.x: duration formatter that honours large_duration_threshold_ms
+		# from Profiler Settings. Above the threshold → "5.23s"; below → "ms"
+		# (with caller-chosen decimals to preserve %.1f / %.2f precision).
+		"fmt_ms": _fmt_ms,
 		# Severity breakdown of ALL findings — feeds the "Issues found" stat
 		# card's sub-line (which sums to the card's total).
 		"severity_counts": {
@@ -622,7 +642,7 @@ def _render_phase2_function_table(fn: dict) -> str:
 	"""
 	rows = fn.get("lines") or []
 	dotted = fn.get("dotted_path", "")
-	file = fn.get("file", "")
+	file_path = fn.get("file", "")
 	source = fn.get("source") or "curated"
 
 	# Auto-expanded descendants get a chain-indent + arrow so the report
@@ -642,7 +662,7 @@ def _render_phase2_function_table(fn: dict) -> str:
 		f'<div style="font-family: ui-monospace, Menlo, monospace; '
 		f'font-weight: 600; margin-bottom: 4px;">{header_prefix}{_e(dotted)}</div>',
 		f'<div style="color: #6b7280; font-size: 12px; margin-bottom: 8px;">'
-		f'{_e(file)}</div>',
+		f'{_e(file_path)}</div>',
 	]
 
 	if not rows:
@@ -928,6 +948,10 @@ def _action_to_dict(child: Any) -> dict:
 		"queries_count": child.queries_count or 0,
 		"query_time_ms": child.query_time_ms or 0,
 		"slowest_query_ms": child.slowest_query_ms or 0,
+		# v0.6.x: the per-action pyinstrument tree (Long Text). Carried into
+		# the dict so render-time helpers (drill-down walker, etc.) can look
+		# up the call chain without re-reading the child row.
+		"call_tree_json": getattr(child, "call_tree_json", "") or "",
 	}
 
 
@@ -1213,6 +1237,166 @@ _SQL_REDFLAG_FINDING_TYPES = frozenset({
 	"Missing Index", "Full Table Scan", "Filesort", "Temporary Table",
 	"Low Filter Ratio",
 })
+
+
+def _find_node_in_tree(tree: dict, basename: str, function: str) -> dict | None:
+	"""Depth-first walk a pyinstrument call tree looking for a node that matches
+	``(basename(filename), function)``. Returns the first hit, or ``None``.
+
+	The basename match (rather than full path) survives bench-relative vs
+	absolute path differences between where the analyzer ran and where the
+	render is happening — same trick ``_build_phase2_callsite_index`` uses
+	(``renderer.py:552``).
+	"""
+	if not isinstance(tree, dict):
+		return None
+	want = (basename or "").strip()
+	want_fn = (function or "").strip()
+	if not want_fn:
+		return None
+	stack = [tree]
+	while stack:
+		node = stack.pop()
+		if not isinstance(node, dict):
+			continue
+		node_file = (node.get("filename") or "").rsplit("/", 1)[-1]
+		node_fn = (node.get("function") or "")
+		if node_fn == want_fn and (not want or node_file == want):
+			return node
+		children = node.get("children") or []
+		# DFS in-order via reverse-append so leftmost children pop first.
+		stack.extend(reversed(children))
+	return None
+
+
+def _walk_drilldown_chain(
+	tree: dict,
+	callsite: dict,
+	tracked_apps: tuple[str, ...] = (),
+	max_depth: int = 4,
+	signal_floor_pct: float = 10.0,
+) -> list[dict]:
+	"""Build a *Drill-down* chain below the finding's origin frame.
+
+	Given a per-action pyinstrument tree (dict form from
+	``analyzers/call_tree._walk_pyi_frame``) and a finding's callsite
+	(``{"filename": ..., "function": ...}``), locate the origin node then walk
+	hottest-child links downward until one of:
+
+	- the next child's filename is in framework code, OR
+	- depth reaches ``max_depth``, OR
+	- no children remain, OR
+	- the next child's ``cumulative_ms`` is below ``signal_floor_pct`` % of the
+	  origin's ``cumulative_ms`` (drops noisy near-leaf frames).
+
+	Returns a list of ``{filename, lineno, function, cumulative_ms,
+	pct_of_origin}`` dicts — one per level *below* the origin. The origin
+	itself is omitted (already rendered in the smoking-gun block).
+
+	Defensive: any malformed input → ``[]``.
+	"""
+	if not isinstance(tree, dict) or not isinstance(callsite, dict):
+		return []
+	filename = callsite.get("filename") or ""
+	function = callsite.get("function") or ""
+	if not function:
+		return []
+	from frappe_profiler.analyzers.base import is_framework_callsite
+
+	# If the finding's own callsite is already in framework code, the chain
+	# below would be even further from user-actionable code — skip.
+	if is_framework_callsite(filename, tracked_apps=tracked_apps or None):
+		return []
+
+	origin = _find_node_in_tree(tree, filename.rsplit("/", 1)[-1], function)
+	if origin is None:
+		return []
+
+	origin_ms = float(origin.get("cumulative_ms") or 0)
+	if origin_ms <= 0:
+		return []
+
+	floor_ms = origin_ms * (signal_floor_pct / 100.0)
+	chain: list[dict] = []
+	node = origin
+	for _ in range(max(0, max_depth)):
+		children = node.get("children") or []
+		if not children:
+			break
+		# Pick the hottest child by cumulative_ms.
+		hottest = max(
+			(c for c in children if isinstance(c, dict)),
+			key=lambda c: float(c.get("cumulative_ms") or 0),
+			default=None,
+		)
+		if hottest is None:
+			break
+		child_ms = float(hottest.get("cumulative_ms") or 0)
+		if child_ms < floor_ms:
+			break
+		child_file = hottest.get("filename") or ""
+		if is_framework_callsite(child_file, tracked_apps=tracked_apps or None):
+			break
+		chain.append({
+			"filename": child_file,
+			"lineno": int(hottest.get("lineno") or 0),
+			"function": hottest.get("function") or "",
+			"cumulative_ms": child_ms,
+			"pct_of_origin": int(round(child_ms / origin_ms * 100)) if origin_ms else 0,
+		})
+		node = hottest
+
+	return chain
+
+
+def _attach_drilldown_chains(findings, actions, tracked_apps: tuple[str, ...] = ()) -> None:
+	"""Walk each finding's representative call tree and attach a
+	``drilldown_chain`` to its ``technical_detail`` dict. Mutates findings in
+	place — same pattern as ``_attach_representative_callsites``.
+
+	Tree JSON parses are cached per ``action_idx`` so a session with several
+	findings on the same slow action only deserialises the tree once.
+	"""
+	if not findings or not actions:
+		return
+
+	# Index actions by their original ``idx`` so action_ref lookups survive the
+	# min_action_duration_ms filter (which preserves idx but reshapes the list).
+	actions_by_idx: dict[int, dict] = {}
+	for a in actions:
+		try:
+			actions_by_idx[int(a.get("idx"))] = a
+		except (TypeError, ValueError):
+			continue
+
+	tree_cache: dict[int, dict] = {}
+	for finding in findings:
+		detail = finding.get("technical_detail") or {}
+		callsite = detail.get("callsite") or {}
+		if not callsite.get("function"):
+			continue
+		ref = finding.get("action_ref")
+		if ref in (None, ""):
+			continue
+		try:
+			idx = int(ref)
+		except (TypeError, ValueError):
+			continue
+		action = actions_by_idx.get(idx)
+		if not action:
+			continue
+		if idx not in tree_cache:
+			try:
+				tree_cache[idx] = json.loads(action.get("call_tree_json") or "{}")
+			except (TypeError, ValueError):
+				tree_cache[idx] = {}
+		tree = tree_cache.get(idx) or {}
+		if not tree:
+			continue
+		chain = _walk_drilldown_chain(tree, callsite, tracked_apps=tracked_apps)
+		if chain:
+			detail["drilldown_chain"] = chain
+			finding["technical_detail"] = detail
 
 
 def _attach_representative_callsites(findings, recordings, *, file_cache: dict | None = None) -> None:
@@ -1753,7 +1937,7 @@ def _read_source_snippet(
 	else:
 		resolved = _resolve_source_path(filename)
 		try:
-			with open(resolved, "r", encoding="utf-8") as fh:
+			with open(resolved, encoding="utf-8") as fh:
 				lines = fh.read().splitlines()
 		except Exception:
 			lines = None
@@ -1950,7 +2134,7 @@ def _resolve_frame_key_to_callsite(function_key, *, cache: dict | None = None) -
 			bare = func.rsplit(".", 1)[-1]
 			pat = re.compile(r"^[ \t]*(?:async[ \t]+)?def[ \t]+" + re.escape(bare) + r"\b")
 			try:
-				with open(abs_path, "r", encoding="utf-8") as fh:
+				with open(abs_path, encoding="utf-8") as fh:
 					for i, line in enumerate(fh, start=1):
 						if pat.match(line):
 							return {
@@ -1996,7 +2180,7 @@ def _read_source_window(
 	else:
 		resolved = _resolve_source_path(filename)
 		try:
-			with open(resolved, "r", encoding="utf-8") as fh:
+			with open(resolved, encoding="utf-8") as fh:
 				lines = fh.read().splitlines()
 		except Exception:
 			lines = None
@@ -2334,6 +2518,24 @@ def _now_iso() -> str:
 	return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _format_duration_ms(ms, threshold_ms: float = 1000.0, decimals: int = 0) -> str:
+	"""Render a duration as ``"<n>ms"`` (with ``decimals`` digits) — or, if it
+	crosses ``threshold_ms``, as ``"<n.nn>s"`` (always 2 decimals). The
+	``decimals`` arg controls only the ms branch so the existing ``%.1f`` /
+	``%.2f`` callsites (sub-ms query timings) keep their resolution below the
+	threshold. ``threshold_ms = 0`` disables the conversion.
+
+	Defensive on input: ``None`` / non-numeric → ``"0ms"``; honours sign.
+	"""
+	try:
+		v = float(ms) if ms is not None else 0.0
+	except (TypeError, ValueError):
+		return "0ms"
+	if threshold_ms and abs(v) >= threshold_ms:
+		return f"{v / 1000:.2f}s"
+	return f"{v:.{decimals}f}ms"
+
+
 def _format_datetime_display(value) -> str:
 	"""Format a datetime (or datetime-string) for display in the report using
 	the site's System Settings (Date Format + Time Format) — which also drops
@@ -2488,7 +2690,7 @@ def build_donut_svg(slices: list) -> str:
 	parts = ['<svg width="160" height="160" xmlns="http://www.w3.org/2000/svg">']
 	angle_start = -math.pi / 2  # start at 12 o'clock
 
-	for label, ms, color in slices:
+	for _label, ms, color in slices:
 		fraction = ms / total
 		angle_end = angle_start + fraction * 2 * math.pi
 		x1 = cx + r * math.cos(angle_start)

@@ -13,13 +13,14 @@ split:
   isolation, no Frappe / Redis access.
 - ``run_analyze(session_uuid, run_uuid)`` is the **impure** RQ entry
   point — pulls samples from Redis, calls aggregate_samples, calls
-  analyze, persists to the Profiler Phase 2 Run row, propagates findings
+  analyze, persists to the Profiler Phase Two Run row, propagates findings
   to the parent Session, triggers re-render, publishes realtime events.
 """
 
 import json
 import traceback
 
+from frappe_profiler import safe_commit
 from frappe_profiler.analyzers.base import AnalyzerResult
 
 try:
@@ -303,7 +304,7 @@ def run_analyze(session_uuid: str, run_uuid: str) -> None:
 
 
 def _find_run_row(session_uuid: str, run_uuid: str):
-	"""Return the Profiler Phase 2 Run child row whose parent session
+	"""Return the Profiler Phase Two Run child row whose parent session
 	matches session_uuid. None if not found."""
 	parent_docname = frappe.db.get_value(
 		"Profiler Session", {"session_uuid": session_uuid}, "name"
@@ -311,7 +312,7 @@ def _find_run_row(session_uuid: str, run_uuid: str):
 	if not parent_docname:
 		return None
 	matches = frappe.get_all(
-		"Profiler Phase 2 Run",
+		"Profiler Phase Two Run",
 		filters={"parent": parent_docname, "run_uuid": run_uuid},
 		fields=["name", "parent"],
 		limit=1,
@@ -359,7 +360,7 @@ def _persist_run(
 
 	parent.flags.ignore_validate_update_after_submit = True
 	parent.save(ignore_permissions=True)
-	frappe.db.commit()
+	safe_commit()
 
 
 def _mark_run_failed(parent_docname: str, run_uuid: str, error: str, tb: str) -> None:
@@ -381,7 +382,7 @@ def _mark_run_failed(parent_docname: str, run_uuid: str, error: str, tb: str) ->
 				break
 		parent.flags.ignore_validate_update_after_submit = True
 		parent.save(ignore_permissions=True)
-		frappe.db.commit()
+		safe_commit()
 	except Exception:
 		# Truly best-effort — don't mask the original exception.
 		try:

@@ -19,7 +19,7 @@ Emits four finding types:
 
 import json
 
-from frappe_profiler.analyzers.base import AnalyzerResult, SEVERITY_ORDER
+from frappe_profiler.analyzers.base import SEVERITY_ORDER, AnalyzerResult
 
 # Thresholds — tunable via site_config.json: profiler_infra_*
 DEFAULT_CPU_HIGH_PCT = 85

@@ -189,13 +189,13 @@ def aggregate_samples(samples: list[list[dict]], picks: list[dict]) -> list[dict
 
 	results = []
 	for pick in picks:
-		file = pick["file"]
+		file_path = pick["file"]
 		qualname = pick["qualname"]
 		lines_out = []
 		for src in pick.get("source_lines", []):
 			lineno = src["lineno"]
 			content = src["content"]
-			merged = totals.get((file, qualname, lineno))
+			merged = totals.get((file_path, qualname, lineno))
 			hits = merged["hits"] if merged else 0
 			total_us = merged["total_us"] if merged else 0
 			total_ms = total_us / 1000.0
@@ -211,7 +211,7 @@ def aggregate_samples(samples: list[list[dict]], picks: list[dict]) -> list[dict
 		results.append({
 			"dotted_path": pick["dotted_path"],
 			"qualname": qualname,
-			"file": file,
+			"file": file_path,
 			"lines": lines_out,
 		})
 	return results

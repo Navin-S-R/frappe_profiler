@@ -29,8 +29,9 @@ required_apps = ["frappe"]
 # every file edit during development, and still includes __version__
 # so release-to-release upgrades invalidate cleanly on production
 # (where mtimes are stable but version differs).
-from frappe_profiler import __version__ as _frappe_profiler_version
 import os as _os
+
+from frappe_profiler import __version__ as _frappe_profiler_version
 
 
 def _asset_version(relative_path: str) -> str:

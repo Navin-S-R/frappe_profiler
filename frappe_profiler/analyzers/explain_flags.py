@@ -76,6 +76,7 @@ def _get_framework_doctypes() -> frozenset[str]:
 		return _framework_doctypes_cache
 	try:
 		import frappe
+
 		from frappe_profiler.analyzers.base import FRAMEWORK_APPS
 
 		rows = frappe.db.sql(

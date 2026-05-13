@@ -13,7 +13,6 @@ import pytest
 
 from frappe_profiler import capture
 
-
 # ---- Thresholds ----------------------------------------------------------
 
 WRAP_OVERHEAD_BASELINE_NS_PER_CALL_MAX = 1500

@@ -29,6 +29,9 @@ class FakeUser:
 
 
 def test_auto_assign_role_adds_to_system_managers(monkeypatch):
+	"""v0.6.x: the install hook fetches roles via a single ``Has Role``
+	query (was an N+1 over every user). Only users that ACTUALLY need
+	Profiler User added get loaded as full docs."""
 	import frappe
 
 	users_in_db = {
@@ -37,12 +40,31 @@ def test_auto_assign_role_adds_to_system_managers(monkeypatch):
 		"carol@example.com": FakeUser("carol@example.com", ["System Manager", "Profiler User"]),
 	}
 
-	def fake_get_all(doctype, filters=None, pluck=None, **kwargs):
-		assert doctype == "User"
-		return list(users_in_db.keys())
+	# Has Role rows: each (parent=user, role=role_name) pair across all users.
+	has_role_rows = [
+		{"parent": user_name, "role": r.role}
+		for user_name, user in users_in_db.items()
+		for r in user.roles
+	]
+	# We only care about the two roles the install hook filters on.
+	has_role_rows = [r for r in has_role_rows if r["role"] in ("System Manager", "Profiler User")]
+
+	get_doc_calls = []
+
+	def fake_get_all(doctype, filters=None, fields=None, pluck=None, **kwargs):
+		assert doctype == "Has Role", f"expected single Has Role query, got {doctype!r}"
+		# Filter must be {"role": ("in", [...])} with both roles listed.
+		assert filters and "role" in filters
+		op, roles = filters["role"]
+		assert op == "in"
+		assert set(roles) == {"System Manager", "Profiler User"}
+		# Return only the matching rows from our seeded data.
+		want = set(roles)
+		return [r for r in has_role_rows if r["role"] in want]
 
 	def fake_get_doc(doctype, name):
 		assert doctype == "User"
+		get_doc_calls.append(name)
 		return users_in_db[name]
 
 	monkeypatch.setattr(frappe, "get_all", fake_get_all, raising=False)
@@ -56,6 +78,11 @@ def test_auto_assign_role_adds_to_system_managers(monkeypatch):
 	assert users_in_db["bob@example.com"].added_roles == []
 	# Carol (already has both) → not touched
 	assert users_in_db["carol@example.com"].added_roles == []
+	# Critical perf assertion: only Alice was loaded as a full doc — NOT
+	# Bob (doesn't qualify) and NOT Carol (already has the role).
+	assert get_doc_calls == ["alice@example.com"], (
+		f"expected ONLY alice loaded as doc, got {get_doc_calls!r}"
+	)
 
 
 def test_on_user_role_change_adds_profiler_user_when_sysmanager_present(monkeypatch):

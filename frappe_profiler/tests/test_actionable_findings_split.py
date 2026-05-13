@@ -35,6 +35,9 @@ def test_actionable_finding_types_has_concrete_fixes_only():
 		"Redundant Call",
 		"Slow Frontend Render",
 		"Heavy Response",
+		# v0.6.x: Phase-2 line-profile output points at a specific line
+		# of code with a concrete refactor target — actionable.
+		"Hot Line",
 	}
 	assert renderer._ACTIONABLE_FINDING_TYPES == expected_actionable, (
 		"_ACTIONABLE_FINDING_TYPES drifted from the expected set. "
@@ -109,7 +112,6 @@ def test_template_has_observations_subsection_inside_findings():
 	# Observations is now a <details class="subsection"> inside Findings.
 	findings_idx = template.find("Findings &mdash; what to fix")
 	obs_idx = template.find("Framework-level observations")
-	findings_close_idx = template.find("</details>", obs_idx)
 	assert findings_idx > 0 and obs_idx > 0
 	assert obs_idx > findings_idx, (
 		"Framework-level observations subsection must live inside the "

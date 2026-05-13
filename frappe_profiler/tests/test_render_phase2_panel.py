@@ -207,3 +207,55 @@ class TestRenderPhase2PanelSelfContainment:
 		# No <script src=...> or <link href=...> with external URLs
 		assert "<script src=" not in html
 		assert "<link " not in html
+
+
+class TestRenderPhase2PanelPosition:
+	"""v0.6.x: Phase 2 is hoisted above the Findings section in the report.
+	A render-level check that the rendered HTML places the ``id="phase2"``
+	anchor before the ``<h2>Findings &mdash; what to fix</h2>`` heading.
+	"""
+
+	def _session_doc(self, *, with_phase2=True):
+		"""Build a minimal SimpleNamespace doc that ``render_raw`` accepts."""
+		phase_2_runs = []
+		if with_phase2:
+			fn = _function("my_app.foo", [_line(10, "x = 1", 50, 100.0)])
+			phase_2_runs.append(_run("r1", "Ready", [fn]))
+		return SimpleNamespace(
+			name="PS-pos", session_uuid="pos-uuid", title="phase2 position test",
+			user="a@example.com", status="Ready",
+			started_at="2026-05-13T00:00:00", stopped_at="2026-05-13T00:00:01",
+			notes=None, top_severity="Low", summary_html=None,
+			total_duration_ms=100, total_query_time_ms=10,
+			total_queries=1, total_requests=1,
+			top_queries_json="[]", table_breakdown_json="[]",
+			hot_frames_json="[]", session_time_breakdown_json=None,
+			total_python_ms=None, total_sql_ms=None,
+			analyzer_warnings=None, v5_aggregate_json="{}",
+			actions=[], findings=[], phase_2_runs=phase_2_runs,
+		)
+
+	def test_phase2_anchor_renders_before_findings_h2(self):
+		html = renderer.render_raw(self._session_doc(with_phase2=True), recordings=[])
+		phase2_idx = html.find('id="phase2"')
+		findings_h2 = html.find("<h2>Findings &mdash; what to fix</h2>")
+		assert phase2_idx > 0, "id=\"phase2\" wrapper missing from rendered HTML"
+		assert findings_h2 > 0, "Findings <h2> missing from rendered HTML"
+		assert phase2_idx < findings_h2, (
+			"Phase 2 panel must render before the Findings <h2> — it is the "
+			"showcase section, hoisted above the actionable list"
+		)
+
+	def test_phase2_jump_nav_link_appears_when_runs_present(self):
+		html = renderer.render_raw(self._session_doc(with_phase2=True), recordings=[])
+		# The jump-nav link is the visible affordance for the hoisted section.
+		assert 'href="#phase2"' in html
+		assert "Phase 2 line drill-down" in html
+
+	def test_phase2_omitted_when_no_runs(self):
+		html = renderer.render_raw(self._session_doc(with_phase2=False), recordings=[])
+		# Conditional both ways: no panel + no jump link when the session
+		# had no phase-2 runs.
+		assert 'id="phase2"' not in html
+		assert 'href="#phase2"' not in html
+		assert "Phase 2 line drill-down" not in html

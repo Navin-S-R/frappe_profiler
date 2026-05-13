@@ -16,8 +16,10 @@ misconfiguration surfaces at save time instead of in a bad report.
 import sys
 import types
 
+import pytest
 
-def _install_frappe_stub():
+
+def _install_frappe_stub(monkeypatch):
 	"""Install a frappe stub with the minimum surface the controller
 	needs — msgprint, log_error, cache.delete_value, Document parent
 	class. Each test gets a fresh ``msgprint`` Mock that collects calls.
@@ -51,22 +53,24 @@ def _install_frappe_stub():
 			return getattr(self, k, default)
 
 	doc_mod.Document = Document
-	sys.modules["frappe"] = stub
-	sys.modules["frappe.model"] = model_mod
-	sys.modules["frappe.model.document"] = doc_mod
+	monkeypatch.setitem(sys.modules, "frappe", stub)
+	monkeypatch.setitem(sys.modules, "frappe.model", model_mod)
+	monkeypatch.setitem(sys.modules, "frappe.model.document", doc_mod)
 	return stub
 
 
-def _fresh_controller():
+def _fresh_controller(monkeypatch):
 	"""Return a fresh ProfilerSettings instance with msgprint-capturing
-	frappe stub."""
-	stub = _install_frappe_stub()
+	frappe stub. All sys.modules mutations route via monkeypatch so the
+	real frappe is restored at test teardown — no pollution of
+	subsequent test files."""
+	stub = _install_frappe_stub(monkeypatch)
 	# Force re-import so the controller picks up the fresh stub's msgprint.
 	for mod in list(sys.modules.keys()):
 		if mod.startswith(
 			"frappe_profiler.frappe_profiler.doctype.profiler_settings"
 		):
-			del sys.modules[mod]
+			monkeypatch.delitem(sys.modules, mod, raising=False)
 	from frappe_profiler.frappe_profiler.doctype.profiler_settings.profiler_settings import (
 		ProfilerSettings,
 	)
@@ -78,8 +82,8 @@ def _row(app_name):
 
 
 class TestFrameworkAppWarning:
-	def test_warns_when_frappe_added(self):
-		ProfilerSettings, stub = _fresh_controller()
+	def test_warns_when_frappe_added(self, monkeypatch):
+		ProfilerSettings, stub = _fresh_controller(monkeypatch)
 		doc = ProfilerSettings()
 		doc.tracked_apps = [_row("frappe")]
 		doc._warn_on_framework_apps_in_tracked()
@@ -88,18 +92,18 @@ class TestFrameworkAppWarning:
 		assert "misconfiguration" in stub.msgprint_calls[0]["title"].lower()
 		assert stub.msgprint_calls[0]["indicator"] == "orange"
 
-	def test_warns_when_erpnext_added(self):
-		ProfilerSettings, stub = _fresh_controller()
+	def test_warns_when_erpnext_added(self, monkeypatch):
+		ProfilerSettings, stub = _fresh_controller(monkeypatch)
 		doc = ProfilerSettings()
 		doc.tracked_apps = [_row("erpnext")]
 		doc._warn_on_framework_apps_in_tracked()
 		assert len(stub.msgprint_calls) == 1
 		assert "erpnext" in stub.msgprint_calls[0]["msg"]
 
-	def test_warns_once_for_both_framework_apps(self):
+	def test_warns_once_for_both_framework_apps(self, monkeypatch):
 		"""frappe + erpnext + custom_app → single warning listing both
 		framework apps (not two separate warnings)."""
-		ProfilerSettings, stub = _fresh_controller()
+		ProfilerSettings, stub = _fresh_controller(monkeypatch)
 		doc = ProfilerSettings()
 		doc.tracked_apps = [
 			_row("frappe"), _row("erpnext"), _row("my_custom_app"),
@@ -111,8 +115,8 @@ class TestFrameworkAppWarning:
 		# Custom app shouldn't be in the warning.
 		assert "my_custom_app" not in stub.msgprint_calls[0]["msg"]
 
-	def test_no_warning_for_custom_apps_only(self):
-		ProfilerSettings, stub = _fresh_controller()
+	def test_no_warning_for_custom_apps_only(self, monkeypatch):
+		ProfilerSettings, stub = _fresh_controller(monkeypatch)
 		doc = ProfilerSettings()
 		doc.tracked_apps = [
 			_row("my_custom_app"), _row("jewellery_erpnext"),
@@ -120,19 +124,19 @@ class TestFrameworkAppWarning:
 		doc._warn_on_framework_apps_in_tracked()
 		assert stub.msgprint_calls == []
 
-	def test_no_warning_for_empty_tracked_apps(self):
-		ProfilerSettings, stub = _fresh_controller()
+	def test_no_warning_for_empty_tracked_apps(self, monkeypatch):
+		ProfilerSettings, stub = _fresh_controller(monkeypatch)
 		doc = ProfilerSettings()
 		doc.tracked_apps = []
 		doc._warn_on_framework_apps_in_tracked()
 		assert stub.msgprint_calls == []
 
-	def test_frappe_profiler_itself_does_not_trigger_warning(self):
+	def test_frappe_profiler_itself_does_not_trigger_warning(self, monkeypatch):
 		"""frappe_profiler is in FRAMEWORK_APPS (its own code paths
 		should be filtered out of findings) but it's not a
 		'framework app' in the UX sense — adding it to Tracked Apps
 		is odd but not actively wrong."""
-		ProfilerSettings, stub = _fresh_controller()
+		ProfilerSettings, stub = _fresh_controller(monkeypatch)
 		doc = ProfilerSettings()
 		doc.tracked_apps = [_row("frappe_profiler")]
 		doc._warn_on_framework_apps_in_tracked()
@@ -140,15 +144,15 @@ class TestFrameworkAppWarning:
 		# trip the "you probably misread the field" heuristic.
 		assert stub.msgprint_calls == []
 
-	def test_all_framework_stock_apps_are_detected(self):
+	def test_all_framework_stock_apps_are_detected(self, monkeypatch):
 		"""Every app in FRAMEWORK_APPS (except frappe_profiler) must
 		trigger the warning. Pins the full list so a future addition
 		to FRAMEWORK_APPS is covered by the warning automatically."""
-		_install_frappe_stub()
+		_install_frappe_stub(monkeypatch)
 		from frappe_profiler.analyzers.base import FRAMEWORK_APPS
 
 		for app in FRAMEWORK_APPS - {"frappe_profiler"}:
-			ProfilerSettings, stub = _fresh_controller()
+			ProfilerSettings, stub = _fresh_controller(monkeypatch)
 			doc = ProfilerSettings()
 			doc.tracked_apps = [_row(app)]
 			doc._warn_on_framework_apps_in_tracked()
@@ -158,8 +162,8 @@ class TestFrameworkAppWarning:
 
 
 class TestNormalization:
-	def test_strips_whitespace_and_dedupes(self):
-		ProfilerSettings, _ = _fresh_controller()
+	def test_strips_whitespace_and_dedupes(self, monkeypatch):
+		ProfilerSettings, _ = _fresh_controller(monkeypatch)
 		doc = ProfilerSettings()
 		doc.tracked_apps = [
 			_row("myapp"),

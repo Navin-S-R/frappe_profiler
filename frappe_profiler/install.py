@@ -10,6 +10,8 @@ non-admin users who should be able to record their own profiling sessions.
 
 import frappe
 
+from frappe_profiler import safe_commit
+
 PROFILER_USER_ROLE = "Profiler User"
 
 
@@ -24,7 +26,7 @@ def after_install():
 				"is_custom": 0,
 			}
 		).insert(ignore_permissions=True)
-		frappe.db.commit()
+		safe_commit()
 
 	# v0.4.0: auto-assign the Profiler User role to every existing
 	# System Manager. Idempotent — users who already have it are skipped.
@@ -78,7 +80,7 @@ def _seed_tracked_apps_from_installed_apps():
 	for app_name in custom_apps:
 		settings.append("tracked_apps", {"app_name": app_name})
 	settings.save(ignore_permissions=True)
-	frappe.db.commit()
+	safe_commit()
 
 
 def _assign_profiler_user_to_system_managers():
@@ -86,15 +88,34 @@ def _assign_profiler_user_to_system_managers():
 
 	Idempotent: existing Profiler Users are left untouched. Never removes
 	roles. Safe to call repeatedly.
+
+	v0.6.x: was an N+1 — one ``get_doc("User", name)`` per user in the
+	system. Now uses a single ``Has Role`` query to find users with
+	System Manager (and read their existing roles in the same fetch), so
+	we only ``get_doc`` + ``save`` the subset that actually needs the new
+	role added. On a site with 500 users where 5 are System Managers,
+	this drops from 500 → ~5 doc loads.
 	"""
-	user_names = frappe.get_all("User", pluck="name")
-	for name in user_names:
-		user = frappe.get_doc("User", name)
-		role_names = {r.role for r in (user.roles or [])}
+	# Pull every user-role pair in one query, grouped by user. We only
+	# care about two roles, but fetching them both in one round-trip is
+	# faster than a per-user introspection.
+	role_rows = frappe.get_all(
+		"Has Role",
+		filters={"role": ("in", ["System Manager", PROFILER_USER_ROLE])},
+		fields=["parent", "role"],
+	)
+	roles_by_user: dict[str, set[str]] = {}
+	for row in role_rows:
+		roles_by_user.setdefault(row["parent"], set()).add(row["role"])
+
+	for name, role_names in roles_by_user.items():
 		if "System Manager" not in role_names:
 			continue
 		if PROFILER_USER_ROLE in role_names:
 			continue
+		# Only the users that need a NEW role assigned get loaded as docs
+		# (so save() fires the right lifecycle events / hooks).
+		user = frappe.get_doc("User", name)
 		user.append("roles", {"role": PROFILER_USER_ROLE})
 		user.save(ignore_permissions=True)
 

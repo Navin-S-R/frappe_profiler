@@ -287,6 +287,7 @@ class TestFrappeMetaTablesExcluded:
 		# Disable the toggle so the row reaches the template and the
 		# "Frappe framework meta table" disclaimer renders as it used to.
 		from unittest.mock import patch
+
 		from frappe_profiler import renderer
 		from frappe_profiler.settings import ProfilerConfig
 		breakdown = [{
@@ -525,6 +526,7 @@ class TestHideFrameworkTablesToggle:
 
 	def test_toggle_off_shows_every_table(self):
 		from unittest.mock import patch
+
 		from frappe_profiler import renderer
 		from frappe_profiler.settings import ProfilerConfig
 
@@ -556,7 +558,8 @@ class TestHideFrameworkTablesToggle:
 		# leaderboard, full recordings, etc. The filter must NOT touch those.
 		# Here we use a doc with an action whose path mentions tabUser as a
 		# smoke test that other sections still render the name.
-		import json, types
+		import json
+		import types
 		breakdown = [self._four_tables()[0]]  # only tabSales Invoice in the breakdown
 		from frappe_profiler import renderer
 		action = types.SimpleNamespace(
@@ -610,12 +613,14 @@ class TestRenderConfigFooter:
 		assert "ai_suggest_findings = <code>on</code>" in html
 		assert "ai_suggest_indexes = <code>on</code>" in html
 		assert "min_action_duration_ms = <code>0</code>" in html
+		assert "large_duration_threshold_ms = <code>1000</code>" in html
 		# The nudge phrase explains why the user might be looking at stale
 		# data — the whole point of the stamp.
 		assert "Regenerate Reports" in html
 
 	def test_footer_reflects_patched_settings(self):
 		from unittest.mock import patch
+
 		from frappe_profiler import renderer
 		from frappe_profiler.settings import ProfilerConfig
 
@@ -626,6 +631,7 @@ class TestRenderConfigFooter:
 			ai_suggest_findings=False,
 			ai_suggest_indexes=False,
 			min_action_duration_ms=42.0,
+			large_duration_threshold_ms=2500.0,
 		)
 		with patch("frappe_profiler.settings.get_config", return_value=cfg):
 			html = renderer.render_raw(self._doc(), recordings=[])
@@ -636,3 +642,4 @@ class TestRenderConfigFooter:
 		assert "ai_suggest_findings = <code>off</code>" in html
 		assert "ai_suggest_indexes = <code>off</code>" in html
 		assert "min_action_duration_ms = <code>42</code>" in html
+		assert "large_duration_threshold_ms = <code>2500</code>" in html

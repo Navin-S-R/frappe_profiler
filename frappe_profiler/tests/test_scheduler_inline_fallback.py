@@ -107,6 +107,7 @@ def test_retry_analyze_uses_scheduler_aware_enqueue():
 	not a bare frappe.enqueue call with the analyze.run method string.
 	"""
 	import inspect
+
 	from frappe_profiler import api
 
 	src = inspect.getsource(api.retry_analyze)
@@ -132,6 +133,7 @@ def test_enqueue_analyze_swallows_inline_failure(monkeypatch):
 	import types
 
 	import frappe
+
 	from frappe_profiler import api as api_mod
 
 	# Stub is_scheduler_disabled → True so we take the inline branch.
@@ -171,6 +173,7 @@ def test_stop_returns_final_status_when_inline(monkeypatch):
 	the Profiler Session doc after inline analyze runs, so a failed
 	inline analyze doesn't report Ready to the widget."""
 	import inspect
+
 	from frappe_profiler import api
 
 	src = inspect.getsource(api.stop)
@@ -205,6 +208,7 @@ def test_enqueue_analyze_blocks_huge_inline_session(monkeypatch):
     import types
 
     import frappe
+
     from frappe_profiler import api as api_mod
     from frappe_profiler import session as session_mod
 
@@ -302,6 +306,7 @@ def test_enqueue_analyze_cap_is_called_by_stop_session():
     skips.
     """
     import inspect
+
     from frappe_profiler import api
 
     stop_src = inspect.getsource(api._stop_session)
@@ -320,6 +325,7 @@ def test_enqueue_analyze_cap_is_called_by_retry_analyze():
     without the cap check.
     """
     import inspect
+
     from frappe_profiler import api
 
     retry_src = inspect.getsource(api.retry_analyze)

@@ -176,6 +176,7 @@ class TestAiFixBlockRendering:
 		# AI-fix block is omitted on re-render of a session analyzed earlier
 		# while the section was on.
 		from unittest.mock import patch
+
 		from frappe_profiler import settings
 		doc = _doc([_finding(llm_fix={
 			"suggestion": _GOOD_SUGGESTION, "model": "claude-sonnet-4-6",

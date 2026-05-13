@@ -23,7 +23,6 @@ integration tests, which the harness doesn't provide).
 import os
 import re
 
-
 _API_PATH = os.path.join(
 	os.path.dirname(__file__), "..", "api.py"
 )

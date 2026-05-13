@@ -13,7 +13,6 @@ import inspect
 import json
 import os
 
-
 HERE = os.path.dirname(__file__)
 
 
@@ -162,6 +161,7 @@ def test_renderer_passes_always_sanitize_true():
 	to sanitize_html, or the JSON / no-tag fast-paths will bypass bleach
 	and leak XSS through |safe in the template."""
 	import inspect
+
 	from frappe_profiler import renderer
 
 	src = inspect.getsource(renderer.render)
@@ -176,6 +176,7 @@ def test_renderer_sanitizes_notes_before_template_context():
 	"""The render function must run session.notes through sanitize_html
 	and pass the result as notes_html, not as session.notes directly."""
 	import inspect
+
 	from frappe_profiler import renderer
 
 	src = inspect.getsource(renderer.render)
@@ -260,7 +261,7 @@ def test_auto_notes_caps_long_sessions_with_overflow_marker():
 	"""A 200-action session shouldn't fill the notes field with 200
 	<li> entries — cap at 50 and surface a '… and N more' marker so
 	users know the list is truncated."""
-	from frappe_profiler.analyze import _build_auto_notes_html, _AUTO_NOTES_MAX_ENTRIES
+	from frappe_profiler.analyze import _AUTO_NOTES_MAX_ENTRIES, _build_auto_notes_html
 
 	recordings = [
 		{"method": "GET", "path": f"/item/{i}", "cmd": None,
@@ -302,6 +303,7 @@ def test_persist_auto_fills_notes_when_field_is_empty():
 	populate it with _build_auto_notes_html when empty, otherwise the
 	whole feature is a dead path."""
 	import inspect
+
 	from frappe_profiler import analyze
 
 	src = inspect.getsource(analyze._persist)
@@ -326,6 +328,7 @@ def test_auto_notes_filters_realtime_polling_noise():
 	subscription permission and should be filtered out of the
 	reproducer (still visible in the per-action table)."""
 	import json as _json
+
 	from frappe_profiler.analyze import _build_auto_notes_html
 
 	recordings = [
@@ -430,6 +433,7 @@ def test_auto_notes_real_user_sequence_reads_naturally():
 	"""End-to-end: a realistic flow produces a human-readable
 	reproducer that reads like a story, not an HTTP log."""
 	import json as _json
+
 	from frappe_profiler.analyze import _build_auto_notes_html
 
 	recordings = [
@@ -580,6 +584,7 @@ def test_build_humanized_notes_html_returns_empty_when_ai_disabled():
 	return "" so _persist falls back to the plain auto-notes list."""
 	from types import SimpleNamespace
 	from unittest.mock import patch
+
 	from frappe_profiler import analyze
 
 	recordings = [{"cmd": "frappe.client.save", "duration": 50, "calls": [],
@@ -595,7 +600,8 @@ def test_build_humanized_notes_html_returns_empty_on_llm_failure():
 	because the humanizer did."""
 	from types import SimpleNamespace
 	from unittest.mock import patch
-	from frappe_profiler import analyze, ai_fix
+
+	from frappe_profiler import ai_fix, analyze
 
 	recordings = [{"cmd": "frappe.client.save", "duration": 50, "calls": [],
 	               "form_dict": {"doctype": "Item"}}]
@@ -610,6 +616,7 @@ def test_persist_prefers_humanized_then_falls_back():
 	"""Source guard: _persist must try _build_humanized_notes_html first
 	and fall back to _build_auto_notes_html."""
 	import inspect
+
 	from frappe_profiler import analyze
 
 	src = inspect.getsource(analyze._persist)

@@ -570,3 +570,88 @@ class TestRenderTimeCallsiteResolution:
 		assert "Most-called from:" not in html
 		# Card still renders (the fix_hint is in the technical_detail block).
 		assert "Add an index" in html
+
+
+class TestDocEventHookInsideSmokingGun:
+	"""v0.6.x: the target-document + doc-event-hook breadcrumb is rendered
+	INSIDE the smoking-gun box (alongside the Phase 2 + Drill-down
+	callouts), not in a separate finding-detail box below. Keeps all
+	context cues in one visual block."""
+
+	def test_hook_line_lives_inside_smoking_gun(self):
+		finding = _finding_child(
+			filename="/apps/ugly_code/ugly_code/python/common.py",
+			lineno=6,
+			function="looped_validate",
+			source_snippet=[
+				{"lineno": 6, "content": "def looped_validate(doc, event):"},
+			],
+			extra_detail={
+				"target_doc": {"doctype": "Sales Invoice", "name": "SI-0001"},
+				"hook_events": [{"doctype": "Sales Invoice", "event": "validate"}],
+			},
+		)
+		doc = _fake_doc([finding])
+		html = renderer.render_raw(doc, recordings=[])
+
+		hook_pos = html.find("Doc-event hook:")
+		sg_open = html.find('class="smoking-gun"', 0)
+		# The first finding-detail block lives RIGHT AFTER the smoking-gun
+		# for this finding — locate it from sg_open onwards.
+		fd_open = html.find('class="finding-detail"', sg_open)
+		assert hook_pos > 0, "Doc-event hook line missing from output"
+		assert sg_open > 0
+		assert fd_open > 0
+		assert sg_open < hook_pos < fd_open, (
+			"Doc-event hook breadcrumb must render INSIDE the smoking-gun "
+			f"block (between {sg_open} and {fd_open}), got {hook_pos}"
+		)
+
+	def test_target_doc_appears_with_hook(self):
+		"""When both target_doc + hook_events are set, both render on the
+		same line, separated by a middot."""
+		finding = _finding_child(
+			filename="/apps/ugly_code/ugly_code/python/common.py",
+			lineno=6,
+			function="looped_validate",
+			source_snippet=[{"lineno": 6, "content": "def looped_validate(doc, event):"}],
+			extra_detail={
+				"target_doc": {"doctype": "Sales Invoice", "name": "SI-0001"},
+				"hook_events": [{"doctype": "Sales Invoice", "event": "validate"}],
+			},
+		)
+		doc = _fake_doc([finding])
+		html = renderer.render_raw(doc, recordings=[])
+
+		# Both the document chip and the hook chip render — single span line.
+		assert "Document:" in html
+		assert "<strong>Sales Invoice</strong>" in html
+		assert "SI-0001" in html
+		assert "Doc-event hook:" in html
+		assert "Sales Invoice &#9656; validate" in html
+
+	def test_finding_without_callsite_renders_hook_as_fallback(self):
+		"""For the rare finding that has no callsite (so no smoking-gun
+		block), the hook breadcrumb still renders as a fallback in the
+		.finding-detail block — we don't drop user-relevant context."""
+		# Build a finding manually so callsite has no filename/lineno.
+		finding = SimpleNamespace(
+			finding_type="Slow Hot Path",
+			severity="Medium",
+			title="callsite-less finding",
+			customer_description="",
+			estimated_impact_ms=50.0,
+			affected_count=1,
+			action_ref="0",
+			technical_detail_json=json.dumps({
+				"hook_events": [{"doctype": "Sales Invoice", "event": "on_submit"}],
+			}),
+		)
+		doc = _fake_doc([finding])
+		html = renderer.render_raw(doc, recordings=[])
+
+		# Hook still appears, but now inside .finding-detail (not smoking-gun
+		# — there's no callsite to attach to).
+		assert "Doc-event hook:" in html
+		assert "Sales Invoice &#9656; on_submit" in html
+

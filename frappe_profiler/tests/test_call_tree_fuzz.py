@@ -11,7 +11,8 @@ is skipped.
 import pytest
 
 hypothesis = pytest.importorskip("hypothesis")
-from hypothesis import given, settings, strategies as st  # noqa: E402
+from hypothesis import given, settings  # noqa: E402
+from hypothesis import strategies as st
 
 from frappe_profiler.analyzers import call_tree
 

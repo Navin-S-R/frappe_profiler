@@ -33,8 +33,8 @@ from collections import Counter, defaultdict
 
 from frappe_profiler.analyzers.base import (
 	AnalyzerResult,
-	is_frappe_metadata_column,
 	is_frappe_meta_table,
+	is_frappe_metadata_column,
 	is_write_hot_table,
 )
 

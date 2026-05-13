@@ -15,11 +15,23 @@ matches the browser's expanded state.
 import sys
 import types
 
-# pdf_export.py imports frappe at module top. Stub it out so this
-# pure-string-transformation test doesn't require a bench runtime.
-if "frappe" not in sys.modules:
-	sys.modules["frappe"] = types.ModuleType("frappe")
+import pytest
 
+# pdf_export.py imports frappe at module top. Stub it for this
+# pure-string-transformation test — scoped to a per-test fixture so the
+# stub doesn't leak to other test files (was a suite-wide pollution
+# source before the conftest fence; even with the fence, doing this
+# via fixture makes the contract explicit and auto-restoring).
+
+
+@pytest.fixture(autouse=True)
+def _frappe_stub(monkeypatch):
+	monkeypatch.setitem(sys.modules, "frappe", types.ModuleType("frappe"))
+
+
+# Import is safe under any sys.modules state because pdf_export only
+# touches frappe inside its functions; we deferred the import below
+# the fixture for clarity.
 from frappe_profiler.pdf_export import _expand_collapsible_sections  # noqa: E402
 
 
