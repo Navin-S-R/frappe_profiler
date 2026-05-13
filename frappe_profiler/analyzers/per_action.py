@@ -120,6 +120,7 @@ _APPLY_WORKFLOW_CMD = "frappe.model.workflow.apply_workflow"
 # the character class below. Permits spaces because workflow action
 # names are sometimes multi-word ("Submit for Approval").
 import re as _re  # noqa: E402
+
 _SAFE_SUFFIX_RE = _re.compile(r"^[A-Za-z][A-Za-z0-9._\- ]{0,59}$")
 
 

@@ -9,7 +9,6 @@ in ``profiler_session.js``. Pattern: source-inspect (mirrors
 import os
 import re
 
-
 _API_PATH = os.path.join(os.path.dirname(__file__), "..", "api.py")
 _JS_PATH = os.path.join(
 	os.path.dirname(__file__), "..", "frappe_profiler", "doctype",

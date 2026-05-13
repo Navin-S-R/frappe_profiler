@@ -11,7 +11,6 @@ exists, both exist, neither exists, rename fails) without a real bench."""
 import sys
 import types
 
-
 OLD = "Profiler Phase 2 Run"
 NEW = "Profiler Phase Two Run"
 
@@ -68,6 +67,7 @@ def _import_patch():
 	stub. ``importlib.reload`` re-runs top-level code so the patch's
 	``import frappe`` binds to the stub, not whatever was cached before."""
 	import importlib
+
 	import frappe_profiler.patches.v0_6_0.rename_phase_two_doctype as patch_mod
 	return importlib.reload(patch_mod)
 

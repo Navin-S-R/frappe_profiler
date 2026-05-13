@@ -23,7 +23,6 @@ from frappe_profiler.analyzers.base import (
 	walk_callsite,
 )
 
-
 DEFAULT_REDUNDANT_HIGH_MULTIPLIER = 5
 
 

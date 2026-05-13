@@ -287,6 +287,7 @@ class TestFrappeMetaTablesExcluded:
 		# Disable the toggle so the row reaches the template and the
 		# "Frappe framework meta table" disclaimer renders as it used to.
 		from unittest.mock import patch
+
 		from frappe_profiler import renderer
 		from frappe_profiler.settings import ProfilerConfig
 		breakdown = [{
@@ -525,6 +526,7 @@ class TestHideFrameworkTablesToggle:
 
 	def test_toggle_off_shows_every_table(self):
 		from unittest.mock import patch
+
 		from frappe_profiler import renderer
 		from frappe_profiler.settings import ProfilerConfig
 
@@ -556,7 +558,8 @@ class TestHideFrameworkTablesToggle:
 		# leaderboard, full recordings, etc. The filter must NOT touch those.
 		# Here we use a doc with an action whose path mentions tabUser as a
 		# smoke test that other sections still render the name.
-		import json, types
+		import json
+		import types
 		breakdown = [self._four_tables()[0]]  # only tabSales Invoice in the breakdown
 		from frappe_profiler import renderer
 		action = types.SimpleNamespace(
@@ -617,6 +620,7 @@ class TestRenderConfigFooter:
 
 	def test_footer_reflects_patched_settings(self):
 		from unittest.mock import patch
+
 		from frappe_profiler import renderer
 		from frappe_profiler.settings import ProfilerConfig
 

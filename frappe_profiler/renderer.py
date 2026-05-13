@@ -1937,7 +1937,7 @@ def _read_source_snippet(
 	else:
 		resolved = _resolve_source_path(filename)
 		try:
-			with open(resolved, "r", encoding="utf-8") as fh:
+			with open(resolved, encoding="utf-8") as fh:
 				lines = fh.read().splitlines()
 		except Exception:
 			lines = None
@@ -2134,7 +2134,7 @@ def _resolve_frame_key_to_callsite(function_key, *, cache: dict | None = None) -
 			bare = func.rsplit(".", 1)[-1]
 			pat = re.compile(r"^[ \t]*(?:async[ \t]+)?def[ \t]+" + re.escape(bare) + r"\b")
 			try:
-				with open(abs_path, "r", encoding="utf-8") as fh:
+				with open(abs_path, encoding="utf-8") as fh:
 					for i, line in enumerate(fh, start=1):
 						if pat.match(line):
 							return {
@@ -2180,7 +2180,7 @@ def _read_source_window(
 	else:
 		resolved = _resolve_source_path(filename)
 		try:
-			with open(resolved, "r", encoding="utf-8") as fh:
+			with open(resolved, encoding="utf-8") as fh:
 				lines = fh.read().splitlines()
 		except Exception:
 			lines = None
@@ -2690,7 +2690,7 @@ def build_donut_svg(slices: list) -> str:
 	parts = ['<svg width="160" height="160" xmlns="http://www.w3.org/2000/svg">']
 	angle_start = -math.pi / 2  # start at 12 o'clock
 
-	for label, ms, color in slices:
+	for _label, ms, color in slices:
 		fraction = ms / total
 		angle_end = angle_start + fraction * 2 * math.pi
 		x1 = cx + r * math.cos(angle_start)

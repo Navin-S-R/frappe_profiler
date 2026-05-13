@@ -10,9 +10,9 @@ apps allowlist. Tests here pin the precedence (DocType > site_config
 dataclass immutability that makes caching safe.
 """
 
-from dataclasses import FrozenInstanceError
 import sys
 import types
+from dataclasses import FrozenInstanceError
 
 import pytest
 

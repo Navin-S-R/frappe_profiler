@@ -112,7 +112,6 @@ def test_template_has_observations_subsection_inside_findings():
 	# Observations is now a <details class="subsection"> inside Findings.
 	findings_idx = template.find("Findings &mdash; what to fix")
 	obs_idx = template.find("Framework-level observations")
-	findings_close_idx = template.find("</details>", obs_idx)
 	assert findings_idx > 0 and obs_idx > 0
 	assert obs_idx > findings_idx, (
 		"Framework-level observations subsection must live inside the "

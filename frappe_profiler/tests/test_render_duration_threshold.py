@@ -8,7 +8,6 @@ or above the threshold display as seconds (e.g. ``5.23s``); below it, they
 stay as milliseconds (``800ms``)."""
 
 import types
-
 from unittest.mock import patch
 
 from frappe_profiler import renderer

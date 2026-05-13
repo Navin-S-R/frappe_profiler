@@ -13,7 +13,6 @@ guard, eligible-type guard, cache short-circuit, and persistence shape.
 import os
 import re
 
-
 _API_PATH = os.path.join(os.path.dirname(__file__), "..", "api.py")
 
 

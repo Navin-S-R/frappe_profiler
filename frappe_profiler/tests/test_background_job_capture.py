@@ -22,7 +22,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 # --------------------------------------------------------------------------
 # frappe.enqueue monkey-patch — registers the RQ job id with the session
 # --------------------------------------------------------------------------

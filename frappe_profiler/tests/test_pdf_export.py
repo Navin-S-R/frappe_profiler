@@ -10,8 +10,9 @@ from frappe_profiler import pdf_export
 
 @pytest.fixture
 def mock_session(monkeypatch):
-	import frappe
 	from types import SimpleNamespace
+
+	import frappe
 
 	state = {"pdf_call_count": 0}
 

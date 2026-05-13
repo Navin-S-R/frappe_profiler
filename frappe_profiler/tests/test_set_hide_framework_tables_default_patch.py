@@ -67,6 +67,7 @@ def _import_patch(monkeypatch):
 	need to touch the patch module — only the frappe stub.
 	"""
 	import importlib
+
 	import frappe_profiler.patches.v0_6_0.set_hide_framework_tables_default as patch_mod
 	return importlib.reload(patch_mod)
 

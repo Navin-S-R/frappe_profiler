@@ -28,7 +28,6 @@ import pytest
 # blows up under that pollution. The module object stays usable via this name.
 from frappe_profiler import analyze as _analyze  # noqa: E402
 
-
 # --------------------------------------------------------------------------
 # table_breakdown — co-occurrence → recommended_index
 # --------------------------------------------------------------------------
@@ -199,6 +198,7 @@ class TestRenderedIndexCandidatePanel:
 		# v0.6.x per-section hard off: even with ai_index populated on the
 		# table entry, the renderer strips it when ai_suggest_indexes is off.
 		from unittest.mock import patch
+
 		from frappe_profiler import renderer, settings
 
 		entry = _table_entry()

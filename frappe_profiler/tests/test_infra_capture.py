@@ -20,6 +20,7 @@ def test_redis_source_uses_frappe_cache_directly(monkeypatch):
 	matching which can match explanatory comments.
 	"""
 	import frappe
+
 	from frappe_profiler import infra_capture
 
 	# Use instance state (not a class attribute) so parallel or
@@ -63,6 +64,7 @@ def test_rq_source_uses_frappe_cache_directly():
 	rq.Queue connection, not getattr(frappe.cache, 'redis', None) which
 	would pass None and fall through to rq's default connection logic."""
 	import inspect
+
 	from frappe_profiler import infra_capture
 
 	read_rq_src = inspect.getsource(infra_capture._read_rq)

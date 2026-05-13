@@ -364,7 +364,7 @@ def install_wraps():
 
 def uninstall_wraps():
 	"""Restore originals. Used by before_uninstall and tests."""
-	for module, attr, fn_name in _wrap_targets():
+	for module, attr, _fn_name in _wrap_targets():
 		current = getattr(module, attr)
 		if getattr(current, "_profiler_is_our_wrap", False):
 			setattr(module, attr, current._profiler_original)

@@ -12,7 +12,7 @@ Each node in the tree is a dict with the shape produced by
 ``analyzers/call_tree._walk_pyi_frame``: function / filename / lineno /
 self_ms / cumulative_ms / children."""
 
-from frappe_profiler.renderer import _walk_drilldown_chain, _find_node_in_tree
+from frappe_profiler.renderer import _find_node_in_tree, _walk_drilldown_chain
 
 
 def _node(function, filename, lineno, cumulative_ms, children=None):

@@ -249,8 +249,9 @@ class TestIgnoredAppsFilter:
 		assert "<code>erpnext</code>" in html and "<code>frappe</code>" in html
 
 	def test_singular_word_when_one_finding_hidden(self):
-		from frappe_profiler import renderer
 		import re
+
+		from frappe_profiler import renderer
 
 		with patch("frappe_profiler.settings.get_ignored_apps",
 		           return_value=("erpnext",)):
@@ -301,8 +302,9 @@ class TestIgnoredAppsFilter:
 		# The "Issues found" stat card sums to the kept count, not the total.
 		# Build 3 high-severity findings (one per app); ignore frappe+erpnext;
 		# the card should show "1" (myapp survives) — not "3".
-		from frappe_profiler import renderer
 		import re
+
+		from frappe_profiler import renderer
 
 		doc = _fake_session_doc_with_findings(
 			_finding_row(title="F", severity="High", callsite_filename="frappe/x.py"),

@@ -56,6 +56,7 @@ def _import_patch():
 	``import frappe`` at the top of the patch), which rebinds the
 	module's local ``frappe`` to whatever's in sys.modules now."""
 	import importlib
+
 	import frappe_profiler.patches.v0_5_2.bump_cache_threshold_default as patch_mod
 	return importlib.reload(patch_mod)
 

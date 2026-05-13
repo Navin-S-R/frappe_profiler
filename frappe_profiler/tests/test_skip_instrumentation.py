@@ -291,7 +291,7 @@ def test_form_dict_cmd_still_wins_over_path():
 	form_dict value is the canonical one and should win."""
 	from frappe_profiler.hooks_callbacks import _extract_cmd_from_request
 
-	local = _set_fake_local(
+	_set_fake_local(
 		cmd="frappe_profiler.api.status",
 		path="/api/method/frappe.client.save",
 	)
@@ -322,6 +322,7 @@ def test_before_request_early_exits_on_skipped_cmd():
 	after_request hook will register the recording even though we
 	meant to skip it."""
 	import inspect
+
 	from frappe_profiler import hooks_callbacks
 
 	src = inspect.getsource(hooks_callbacks.before_request)

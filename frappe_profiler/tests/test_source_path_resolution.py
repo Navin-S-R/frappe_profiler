@@ -17,7 +17,6 @@ import types
 
 from frappe_profiler import analyze, renderer
 
-
 # A real, always-present app-relative path: this very test file's package home.
 _APP_REL = "frappe_profiler/renderer.py"
 _ABS_REAL = renderer.__file__  # the resolved absolute path of the same file

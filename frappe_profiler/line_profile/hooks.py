@@ -25,7 +25,6 @@ import frappe
 from frappe_profiler import hooks_callbacks
 from frappe_profiler.line_profile import capture
 
-
 # ---------------------------------------------------------------------------
 # Request hooks
 # ---------------------------------------------------------------------------

@@ -19,7 +19,6 @@ import requests
 
 from frappe_profiler import ai_fix
 
-
 # --------------------------------------------------------------------------
 # Fake HTTP response + the canned bodies the two protocols return.
 # --------------------------------------------------------------------------
@@ -31,7 +30,7 @@ class _FakeResp:
 		self._raise_on_json = raise_on_json
 		self.text = text
 
-	def json(self):
+	def json(self):  # noqa: F811 — mimics requests.Response.json()
 		if self._raise_on_json:
 			raise ValueError("not json")
 		return self._payload
@@ -42,7 +41,7 @@ _ANTHROPIC_OK = {"content": [{"type": "text", "text": "**Fix**\n\nadd an index"}
 
 
 def _post_returning(resp):
-	def _fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+	def _fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002, F811
 		_fake_post.last = SimpleNamespace(url=url, headers=headers, body=json, timeout=timeout)
 		return resp
 	_fake_post.last = None
@@ -50,7 +49,7 @@ def _post_returning(resp):
 
 
 def _post_raising(exc):
-	def _fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+	def _fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002, F811
 		raise exc
 	return _fake_post
 
@@ -652,7 +651,6 @@ def test_eligible_finding_types_is_a_frozenset_of_known_types():
 # --------------------------------------------------------------------------
 
 from frappe_profiler import settings as _settings
-
 
 _PROVIDER_OK = {"model": "m", "base_url": "http://x", "needs_key": False, "api_key": ""}
 

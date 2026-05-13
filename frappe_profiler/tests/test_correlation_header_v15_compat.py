@@ -175,7 +175,7 @@ class TestExposeHeadersMerging:
 	substring."""
 
 	def test_merges_into_existing_expose_header_on_v15_response(self, monkeypatch):
-		frappe = _install_frappe_stub_with_local(monkeypatch)
+		_install_frappe_stub_with_local(monkeypatch)
 		hc = _fresh_module(monkeypatch)
 
 		resp = _FakeResponse()
@@ -190,7 +190,7 @@ class TestExposeHeadersMerging:
 	def test_does_not_duplicate_on_second_call(self, monkeypatch):
 		"""Idempotent: calling the injector twice must not append
 		the token a second time."""
-		frappe = _install_frappe_stub_with_local(monkeypatch)
+		_install_frappe_stub_with_local(monkeypatch)
 		hc = _fresh_module(monkeypatch)
 
 		resp = _FakeResponse()
@@ -204,7 +204,7 @@ class TestExposeHeadersMerging:
 		"""Prevents a substring-match false positive: an upstream
 		header "X-Profiler-Recording-Id-Legacy" should NOT prevent
 		us from appending our real token."""
-		frappe = _install_frappe_stub_with_local(monkeypatch)
+		_install_frappe_stub_with_local(monkeypatch)
 		hc = _fresh_module(monkeypatch)
 
 		resp = _FakeResponse()

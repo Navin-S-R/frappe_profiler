@@ -230,7 +230,7 @@ def test_slow_hot_path_suppressed_when_dominated_by_sql():
 def test_repeated_hot_frame_finding_aggregates_across_actions():
 	# Same frame in 4 different actions, total 800ms
 	per_action_trees = []
-	for i in range(4):
+	for _ in range(4):
 		t = _node("<root>", "", 500, [
 			_node("my_app.discounts.calc", "apps/my_app/d.py", 200, []),
 		])
@@ -274,7 +274,7 @@ def test_repeated_hot_frame_filters_wrappers_entirely():
 	per_action_trees = []
 	# Four different 'wrapper' functions in four different files.
 	# All should be filtered — none should appear in the leaderboard.
-	for i in range(4):
+	for _ in range(4):
 		per_action_trees.append(_node("<root>", "", 500, [
 			_node("wrapper", "my_app/a.py", 50, []),
 			_node("wrapper", "my_app/b.py", 50, []),
@@ -573,39 +573,21 @@ def test_pure_helper_production_payload_all_filtered():
 	to being dominated by framework plumbing."""
 	from frappe_profiler.analyzers.call_tree import _is_pure_helper_frame
 
-	# Exact (function, filename) pairs from the report
-	production_noise = [
-		("execute_query", "frappe/query_builder/utils.py"),
-		("save", "frappe/model/document.py"),         # kept — public entry
-		("_save", "frappe/model/document.py"),
-		("run_method", "frappe/model/document.py"),   # kept — hook dispatcher
-		("composer", "frappe/model/document.py"),
-		("runner", "frappe/model/document.py"),
-		("fn", "frappe/model/document.py"),
-		("get_meta", "frappe/model/meta.py"),
-		("__init__", "frappe/model/meta.py"),
-		("get_values", "frappe/database/database.py"),
-		("getdoctype", "frappe/desk/form/load.py"),
-		("execute", "frappe/model/qb_query.py"),
-		("get_meta_bundle", "frappe/desk/form/load.py"),
-		("__init__", "frappe/model/document.py"),     # kept — but ambiguous
-		("load_from_db", "frappe/model/document.py"),  # kept
-		("get_meta", "frappe/desk/form/meta.py"),
-		("__init__", "frappe/desk/form/meta.py"),
-		("load_children_from_db", "frappe/model/document.py"),  # kept
-		("getouterframes", "inspect.py"),
-		("getframeinfo", "inspect.py"),
-		("load_from_db", "frappe/model/meta.py"),
-		("process", "frappe/model/meta.py"),
-		("insert", "frappe/model/document.py"),       # kept — public entry
-		("wrapper", "erpnext/__init__.py"),
-		("wrapper", "utils/__init__.py"),
-		("sql", "frappe/database/database.py"),
-		("execute_query", "frappe/database/database.py"),
-		("execute", "MySQLdb/cursors.py"),
-		("get_doc_str", "frappe/model/document.py"),  # kept
-		("_query", "MySQLdb/cursors.py"),
-	]
+	# Exact (function, filename) pairs from a production report — the
+	# `must_filter` list below is the curated subset that this test
+	# actually asserts on. Originally recorded here for historical
+	# context; kept as a comment to avoid an unused-variable flag.
+	#   execute_query / frappe/query_builder/utils.py
+	#   save / _save / run_method / composer / runner / fn / __init__ /
+	#   load_from_db / insert / get_doc_str — all frappe/model/document.py
+	#   get_meta / __init__ — frappe/model/meta.py and frappe/desk/form/meta.py
+	#   get_values / sql / execute_query — frappe/database/database.py
+	#   getdoctype / get_meta_bundle — frappe/desk/form/load.py
+	#   execute — frappe/model/qb_query.py
+	#   load_from_db / process — frappe/model/meta.py
+	#   getouterframes / getframeinfo — inspect.py
+	#   wrapper — erpnext/__init__.py, utils/__init__.py
+	#   execute / _query — MySQLdb/cursors.py
 
 	# v0.5.2 round 2: ALL of frappe/model/document.py is filtered
 	# (save / insert / submit / _save / run_method / __init__ /
@@ -1039,6 +1021,7 @@ def test_hooks_callbacks_before_request_snapshot_runs_before_pyi_start():
 	against commentary that mentions the function names.
 	"""
 	import inspect
+
 	from frappe_profiler import hooks_callbacks
 
 	src = inspect.getsource(hooks_callbacks.before_request)
@@ -1064,6 +1047,7 @@ def test_hooks_callbacks_before_job_snapshot_runs_before_pyi_start():
 	"""Same ordering guard for before_job — background jobs have the
 	same self-capture exposure as HTTP requests."""
 	import inspect
+
 	from frappe_profiler import hooks_callbacks
 
 	src = inspect.getsource(hooks_callbacks.before_job)
@@ -1189,14 +1173,14 @@ def test_top_level_app_rejects_stdlib_and_third_party(monkeypatch):
 	known installed Frappe app (MySQLdb etc.) also collapse to
 	[other] once frappe.get_installed_apps is consulted.
 	"""
-	from frappe_profiler.analyzers.call_tree import _top_level_app
-
 	# Simulate a real site with a small installed-apps list. In
 	# production get_installed_apps returns e.g.
 	# ["frappe", "erpnext", "frappe_profiler"]. The call is made
 	# inside _top_level_app so the monkeypatch intercepts it for
 	# the whole test.
 	import frappe
+
+	from frappe_profiler.analyzers.call_tree import _top_level_app
 	monkeypatch.setattr(
 		frappe,
 		"get_installed_apps",
@@ -1238,9 +1222,9 @@ def test_top_level_app_falls_back_when_installed_apps_unavailable(monkeypatch):
 	test environment), accept the first-segment as the bucket name.
 	This is the legacy behavior — a conservative fallback that
 	preserves the pre-v0.5.1 unit tests, which don't mock frappe."""
-	from frappe_profiler.analyzers.call_tree import _top_level_app
-
 	import frappe
+
+	from frappe_profiler.analyzers.call_tree import _top_level_app
 
 	def _raise(*a, **k):
 		raise RuntimeError("no site context")

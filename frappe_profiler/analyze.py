@@ -22,9 +22,8 @@ import html
 import json
 import time
 
-import sqlparse
-
 import frappe
+import sqlparse
 from frappe.database.utils import is_query_type
 from frappe.recorder import (
 	RECORDER_REQUEST_HASH,

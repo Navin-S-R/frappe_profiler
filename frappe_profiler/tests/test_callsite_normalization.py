@@ -195,17 +195,27 @@ class TestEndToEndRender:
 		from frappe_profiler import renderer
 
 		doc = types.SimpleNamespace()
-		doc.title = "T"; doc.session_uuid = "t"; doc.user = "a"
+		doc.title = "T"
+		doc.session_uuid = "t"
+		doc.user = "a"
 		doc.status = "Ready"
-		doc.started_at = "2026-04-17"; doc.stopped_at = "2026-04-17"
-		doc.notes = None; doc.top_severity = "High"
-		doc.total_duration_ms = 2000; doc.total_query_time_ms = 0
-		doc.total_queries = 20; doc.total_requests = 5
-		doc.summary_html = None; doc.top_queries_json = "[]"
-		doc.table_breakdown_json = "[]"; doc.hot_frames_json = "[]"
+		doc.started_at = "2026-04-17"
+		doc.stopped_at = "2026-04-17"
+		doc.notes = None
+		doc.top_severity = "High"
+		doc.total_duration_ms = 2000
+		doc.total_query_time_ms = 0
+		doc.total_queries = 20
+		doc.total_requests = 5
+		doc.summary_html = None
+		doc.top_queries_json = "[]"
+		doc.table_breakdown_json = "[]"
+		doc.hot_frames_json = "[]"
 		doc.session_time_breakdown_json = "{}"
-		doc.total_python_ms = 0; doc.total_sql_ms = 0
-		doc.analyzer_warnings = None; doc.v5_aggregate_json = "{}"
+		doc.total_python_ms = 0
+		doc.total_sql_ms = 0
+		doc.analyzer_warnings = None
+		doc.v5_aggregate_json = "{}"
 		doc.actions = []
 
 		# Slow Query with STRING callsite (top_queries shape).

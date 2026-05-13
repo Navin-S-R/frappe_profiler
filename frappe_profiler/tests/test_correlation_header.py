@@ -106,6 +106,7 @@ def test_correlation_header_gated_on_profiler_session_id():
     header block.
     """
     import inspect
+
     from frappe_profiler import hooks_callbacks
 
     src = inspect.getsource(hooks_callbacks.after_request)
@@ -157,6 +158,7 @@ def test_hooks_callbacks_invokes_snapshot():
     infra_capture. Source inspection is an established pattern in this
     codebase (see test_api_start_kwargs.py)."""
     import inspect
+
     from frappe_profiler import hooks_callbacks
 
     before = inspect.getsource(hooks_callbacks.before_request)
@@ -174,6 +176,7 @@ def test_hooks_callbacks_invokes_snapshot():
 
 def test_stop_session_force_stops_infra_inflight():
     import inspect
+
     from frappe_profiler import api
 
     src = inspect.getsource(api._stop_session)
@@ -182,6 +185,7 @@ def test_stop_session_force_stops_infra_inflight():
 
 def test_after_request_injects_correlation_header():
     import inspect
+
     from frappe_profiler import hooks_callbacks
 
     src = inspect.getsource(hooks_callbacks.after_request)

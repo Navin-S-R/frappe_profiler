@@ -13,9 +13,9 @@ covering the impure orchestration layer.
 import json
 import sys
 import types
+from unittest.mock import patch
 
 import pytest
-from unittest.mock import patch
 
 
 class _FakeCache:

@@ -133,7 +133,6 @@ class TestDrilldownRender:
 		# locate it and assert the framework path isn't inside that span.
 		dd_idx = html.find("Drill-down:")
 		assert dd_idx > 0
-		dd_end = html.find("</div>", dd_idx + 4000) if html.find("</div>", dd_idx + 4000) > 0 else len(html)
 		dd_segment = html[dd_idx:dd_idx + 4000]
 		assert "frappe/frappe/model/document.py" not in dd_segment, (
 			"framework frame leaked into the drill-down block"
