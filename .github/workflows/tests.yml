@@ -68,7 +68,16 @@ jobs:
 
       - name: Run pytest
         run: |
-          python -m pytest frappe_profiler/tests/ -v --tb=short
+          python -m pytest frappe_profiler/tests/ -v --tb=long -rA 2>&1 | tee pytest-${{ matrix.python-version }}.log
+
+      - name: Upload pytest log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-log-${{ matrix.python-version }}
+          path: pytest-${{ matrix.python-version }}.log
+          if-no-files-found: warn
+          retention-days: 7
 
   lint:
     name: ruff
