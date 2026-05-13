@@ -75,5 +75,8 @@ def test_persists_notes_and_re_renders():
 	assert 'frappe.db.set_value(' in body
 	assert '"notes"' in body
 	assert "_assemble_humanized_notes(" in body
-	assert "frappe.db.commit()" in body
+	# v0.6.x: explicit commits now route through ``safe_commit`` (rollback
+	# guard added in the audit-response round). The intent — commit after
+	# the set_value — is preserved.
+	assert ("frappe.db.commit()" in body) or ("safe_commit()" in body)
 	assert "regenerate_reports(session_uuid)" in body

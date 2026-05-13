@@ -194,7 +194,7 @@
    "fieldname": "phase_2_runs",
    "fieldtype": "Table",
    "label": "Phase 2 Runs",
-   "options": "Profiler Phase 2 Run",
+   "options": "Profiler Phase Two Run",
    "read_only": 1
   },
   {

@@ -610,6 +610,7 @@ class TestRenderConfigFooter:
 		assert "ai_suggest_findings = <code>on</code>" in html
 		assert "ai_suggest_indexes = <code>on</code>" in html
 		assert "min_action_duration_ms = <code>0</code>" in html
+		assert "large_duration_threshold_ms = <code>1000</code>" in html
 		# The nudge phrase explains why the user might be looking at stale
 		# data — the whole point of the stamp.
 		assert "Regenerate Reports" in html
@@ -626,6 +627,7 @@ class TestRenderConfigFooter:
 			ai_suggest_findings=False,
 			ai_suggest_indexes=False,
 			min_action_duration_ms=42.0,
+			large_duration_threshold_ms=2500.0,
 		)
 		with patch("frappe_profiler.settings.get_config", return_value=cfg):
 			html = renderer.render_raw(self._doc(), recordings=[])
@@ -636,3 +638,4 @@ class TestRenderConfigFooter:
 		assert "ai_suggest_findings = <code>off</code>" in html
 		assert "ai_suggest_indexes = <code>off</code>" in html
 		assert "min_action_duration_ms = <code>42</code>" in html
+		assert "large_duration_threshold_ms = <code>2500</code>" in html

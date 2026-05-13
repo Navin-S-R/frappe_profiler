@@ -1,6 +1,39 @@
 __version__ = "0.5.2"
 
 
+def safe_commit() -> None:
+	"""Commit pending changes with an explicit rollback-on-error guard.
+
+	Frappe's ``frappe.db.commit()`` does NOT auto-rollback when the SQL
+	COMMIT itself fails (rare but possible — replica lag, write timeout,
+	deadlock retry exhausted). Without an explicit rollback, the
+	connection is left in a tainted state that breaks the next statement
+	with a confusing error far from the original cause. This helper is
+	the Frappe-idiomatic guard the Lens audit recommends — wraps the
+	commit, rolls back on exception, re-raises so the caller sees the
+	failure.
+
+	For best-effort callers (the janitor sweeps, etc.) the outer
+	exception handler in the entry function absorbs the re-raise and
+	moves on — no behavioural change. For must-succeed callers (analyze
+	pipeline, install hook, PDF attachment), the exception now properly
+	surfaces and the connection stays clean.
+	"""
+	import frappe
+	try:
+		frappe.db.commit()
+	except Exception:
+		try:
+			frappe.db.rollback()
+		except Exception:
+			# Rollback failing on top of commit failing is exceptionally
+			# rare — typically the connection is already gone. Swallow
+			# the rollback exception so the original (more informative)
+			# commit exception is what bubbles up.
+			pass
+		raise
+
+
 # ---------------------------------------------------------------------------
 # frappe.enqueue monkey-patch (Phase 2)
 # ---------------------------------------------------------------------------

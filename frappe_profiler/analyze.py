@@ -33,7 +33,7 @@ from frappe.recorder import (
 )
 from frappe.utils.scheduler import is_scheduler_disabled
 
-from frappe_profiler import renderer, session
+from frappe_profiler import renderer, safe_commit, session
 from frappe_profiler.analyzers import (
 	call_tree,
 	explain_flags,
@@ -295,7 +295,7 @@ def _bg_wait_for_pending_jobs(session_uuid: str, docname: str, deadline):
 	# Keep the UI honest while we wait.
 	try:
 		frappe.db.set_value("Profiler Session", docname, "status", "Analyzing")
-		frappe.db.commit()
+		safe_commit()
 	except Exception:
 		pass
 	_publish_progress(
@@ -357,7 +357,7 @@ def run(session_uuid: str, _bg_wait_until: float | None = None):
 
 		# Phase: Analyzing
 		frappe.db.set_value("Profiler Session", docname, "status", "Analyzing")
-		frappe.db.commit()
+		safe_commit()
 		# v0.5.1: push "analyzing" to any open widgets on this user's
 		# session. Without this the widget would either have to poll
 		# status() to learn about the transition, or rely on the inline
@@ -485,7 +485,7 @@ def run(session_uuid: str, _bg_wait_until: float | None = None):
 		# fill the suggestions in afterward via the "Generate AI fixes"
 		# button on the form (api.backfill_ai_fixes).
 		try:
-			_enrich_findings_with_ai_suggestions(context)
+			_enrich_findings_with_ai_suggestions(context, recordings=recordings)
 		except Exception:
 			try:
 				context.warnings.append(
@@ -522,7 +522,7 @@ def run(session_uuid: str, _bg_wait_until: float | None = None):
 
 		# Phase: Ready
 		frappe.db.set_value("Profiler Session", docname, "status", "Ready")
-		frappe.db.commit()
+		safe_commit()
 		_publish_progress(100, "Report ready", session_uuid)
 
 		# Notify the UI so the floating widget can navigate the user to
@@ -540,7 +540,7 @@ def run(session_uuid: str, _bg_wait_until: float | None = None):
 		frappe.log_error(title=f"frappe_profiler analyze {session_uuid}")
 		try:
 			frappe.db.set_value("Profiler Session", docname, "status", "Failed")
-			frappe.db.commit()
+			safe_commit()
 		except Exception:
 			pass
 		# v0.5.1: push "failed" to any open widgets so they transition
@@ -667,7 +667,7 @@ def _enrich_recordings(recordings: list[dict]) -> list[str]:
 	# that protects against future refactors that might leave dirty
 	# state in the transaction.
 	try:
-		frappe.db.commit()
+		safe_commit()
 	except Exception:
 		pass
 
@@ -1080,7 +1080,7 @@ def _persist(
 		doc.append("findings", finding)
 
 	doc.save(ignore_permissions=True)
-	frappe.db.commit()
+	safe_commit()
 
 
 # Profiler Finding.title is a Frappe Data field — VARCHAR(140). Titles
@@ -1172,7 +1172,7 @@ def _enrich_findings_with_source_snippets(findings: list[dict]) -> None:
 		finding["technical_detail_json"] = json.dumps(detail, default=str)
 
 
-def _enrich_findings_with_ai_suggestions(context) -> None:
+def _enrich_findings_with_ai_suggestions(context, *, recordings: list | None = None) -> None:
 	"""Mutate ``context.findings`` in place: when Profiler Settings has
 	``ai_enabled`` AND ``ai_auto_suggest``, ask the configured LLM for a
 	fix for the top ``ai_auto_suggest_max`` eligible findings (0 = all),
@@ -1226,6 +1226,13 @@ def _enrich_findings_with_ai_suggestions(context) -> None:
 
 	file_cache: dict = {}
 	phase2_index = _phase2_index_for(getattr(context, "docname", None))
+	# v0.6.x: when recordings are in scope (analyze-time path), build the
+	# lookup maps once so each finding's payload can carry verbatim SQL
+	# evidence (top-N queries from its action's recording).
+	recordings_by_uuid = {
+		(r.get("uuid") or ""): r for r in (recordings or []) if r.get("uuid")
+	}
+	actions_by_idx = {a["idx"]: a for a in (getattr(context, "actions", None) or []) if "idx" in a}
 	started = time.monotonic()
 	failures = 0
 	skipped_for_time = 0
@@ -1258,7 +1265,11 @@ def _enrich_findings_with_ai_suggestions(context) -> None:
 				technical_detail_json=f.get("technical_detail_json") or "{}",
 				llm_fix_json=None,
 			)
-			result = ai_fix.suggest_fix(_ai_payload_for_finding(ns, file_cache, phase2_index=phase2_index))
+			result = ai_fix.suggest_fix(_ai_payload_for_finding(
+				ns, file_cache, phase2_index=phase2_index,
+				recordings_by_uuid=recordings_by_uuid,
+				actions_by_idx=actions_by_idx,
+			))
 			f["llm_fix_json"] = json.dumps(result, default=str)
 		except Exception:
 			failures += 1
@@ -1279,7 +1290,14 @@ def _enrich_findings_with_ai_suggestions(context) -> None:
 		)
 
 
-def _ai_payload_for_finding(child, file_cache: dict, *, phase2_index: dict | None = None) -> dict:
+def _ai_payload_for_finding(
+	child,
+	file_cache: dict,
+	*,
+	phase2_index: dict | None = None,
+	recordings_by_uuid: dict | None = None,
+	actions_by_idx: dict | None = None,
+) -> dict:
 	"""Build the dict ``ai_fix.suggest_fix`` expects from a finding-like
 	object — a ``Profiler Finding`` child row, or a ``SimpleNamespace``
 	shaped like one (``finding_type`` / ``severity`` / ``title`` /
@@ -1289,7 +1307,19 @@ def _ai_payload_for_finding(child, file_cache: dict, *, phase2_index: dict | Non
 	the callsite, plus — when a Phase-2 line-profile pass instrumented this
 	finding's function — the hottest line from it (number / content / ms /
 	hits). ``phase2_index`` is a ``renderer._build_phase2_callsite_index``
-	result, ``{(basename, function): hotline}``."""
+	result, ``{(basename, function): hotline}``.
+
+	v0.6.x: when both ``recordings_by_uuid`` (``{recording_uuid: recording}``)
+	and ``actions_by_idx`` (``{idx: action_dict}``) are provided AND the
+	finding has an ``action_ref``, the top-N slowest queries from that
+	action's recording are attached to ``technical_detail.example_queries``.
+	This gives the AI **verbatim SQL evidence** for Slow-Hot-Path / N+1
+	findings whose hot function ran raw SQL — without it the model has to
+	infer the query shape from the Python source, which is the leading
+	cause of nonsense substitutions (e.g. inventing ``filters={"name":
+	("in", [some_var] * N)}`` to fit an unrelated example pattern).
+	Already-set ``example_queries`` (e.g. from SQL red-flag analyzers) wins
+	— this only fills the gap."""
 	from frappe_profiler import ai_fix
 
 	payload = renderer._finding_to_dict(child, file_cache=file_cache)
@@ -1318,7 +1348,71 @@ def _ai_payload_for_finding(child, file_cache: dict, *, phase2_index: dict | Non
 				"total_ms": hot.get("total_ms") or 0,
 				"hits": hot.get("hits") or 0,
 			}
+
+	_maybe_attach_recorded_queries(
+		payload,
+		action_ref=getattr(child, "action_ref", None) or (child.get("action_ref") if isinstance(child, dict) else None),
+		recordings_by_uuid=recordings_by_uuid,
+		actions_by_idx=actions_by_idx,
+	)
 	return payload
+
+
+_AI_EXAMPLE_QUERIES_MAX = 3
+_AI_EXAMPLE_QUERY_MIN_MS = 0.5  # drop sub-half-ms queries (cache hits, etc.)
+
+
+def _maybe_attach_recorded_queries(
+	payload: dict,
+	*,
+	action_ref,
+	recordings_by_uuid: dict | None,
+	actions_by_idx: dict | None,
+) -> None:
+	"""When recordings + actions are available AND the finding has an
+	``action_ref``, attach the top-N slowest SQL queries from that action's
+	recording to ``payload.technical_detail.example_queries`` (best-effort).
+
+	Skipped silently when any of the inputs is missing or the finding's
+	technical_detail already carries example_queries (a SQL red-flag analyzer
+	set them — those are the most relevant queries by definition; don't
+	overwrite)."""
+	if not recordings_by_uuid or not actions_by_idx or action_ref in (None, ""):
+		return
+	try:
+		idx = int(action_ref)
+	except (TypeError, ValueError):
+		return
+	action = actions_by_idx.get(idx)
+	if not action:
+		return
+	recording_uuid = action.get("recording_uuid") if isinstance(action, dict) else getattr(action, "recording_uuid", None)
+	if not recording_uuid:
+		return
+	recording = recordings_by_uuid.get(recording_uuid)
+	if not recording:
+		return
+	calls = recording.get("calls") if isinstance(recording, dict) else None
+	if not calls:
+		return
+	detail = payload.setdefault("technical_detail", {}) or {}
+	if detail.get("example_queries"):
+		# Analyzer (SQL red flag) set these; respect — they're the most relevant.
+		return
+	top = []
+	for c in sorted(calls, key=lambda c: -(c.get("duration") or c.get("duration_ms") or 0)):
+		dur = c.get("duration") or c.get("duration_ms") or 0
+		if dur < _AI_EXAMPLE_QUERY_MIN_MS:
+			continue
+		q = (c.get("query") or "").strip()
+		if not q:
+			continue
+		top.append(q)
+		if len(top) >= _AI_EXAMPLE_QUERIES_MAX:
+			break
+	if top:
+		detail["example_queries"] = top
+		payload["technical_detail"] = detail
 
 
 def _phase2_index_for(doc_or_docname) -> dict:
@@ -1418,7 +1512,7 @@ def _run_ai_backfill(doc, *, cap: int | None = None,
 				pass
 	if out["added"]:
 		try:
-			frappe.db.commit()
+			safe_commit()
 		except Exception:
 			pass
 	return out
@@ -1600,7 +1694,7 @@ def _run_table_index_ai_backfill(doc, *, table_name: str) -> dict:
 		"Profiler Session", doc.name, "table_breakdown_json",
 		json.dumps(breakdown, default=str),
 	)
-	frappe.db.commit()
+	safe_commit()
 	return {"ok": True, "table": table_name}
 
 
@@ -1992,7 +2086,7 @@ def _finalize_with_empty_session(docname: str) -> None:
 		"were made, or the session was stopped before any flow was performed.</p>"
 	)
 	doc.save(ignore_permissions=True)
-	frappe.db.commit()
+	safe_commit()
 
 
 def _render_and_attach_reports(docname: str, recordings: list[dict]) -> None:
@@ -2025,7 +2119,7 @@ def _render_and_attach_reports(docname: str, recordings: list[dict]) -> None:
 	except Exception:
 		frappe.log_error(title="frappe_profiler render raw report")
 
-	frappe.db.commit()
+	safe_commit()
 
 
 def _save_report_file(*, docname: str, filename: str, attached_to_field: str, content: str) -> str | None:

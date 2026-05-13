@@ -77,7 +77,9 @@ class TestSuggestFixSurface:
 		assert 'frappe.db.set_value(' in body
 		assert '"Profiler Finding"' in body
 		assert '"llm_fix_json"' in body
-		assert "frappe.db.commit()" in body
+		# v0.6.x: explicit commits route through ``safe_commit`` (rollback
+		# guard from the audit-response round).
+		assert ("frappe.db.commit()" in body) or ("safe_commit()" in body)
 
 	def test_builds_context_via_shared_payload_helper(self):
 		body = _fn_body("suggest_fix")

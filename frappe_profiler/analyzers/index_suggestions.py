@@ -182,6 +182,36 @@ _PREFIX_REQUIRED_TYPES = frozenset({
 _NEVER_SUGGEST_COLUMNS = FRAPPE_METADATA_COLUMNS
 
 
+# v0.6.x: MariaDB doesn't accept parameterised identifiers in
+# ``SHOW INDEX FROM ?`` (DDL/SCHEMA statements expect a bare token, not a
+# bind value), so the only safe pattern is **strict input validation** at
+# the boundary. Allowed shapes:
+#   1. ``tab<DocType name>`` — the Frappe convention; DocType names may
+#      contain letters, digits, spaces, underscores, hyphens.
+#   2. ``information_schema.<simple-name>`` — schema views the analyzer
+#      legitimately introspects.
+# Anything else is rejected outright and the index-introspection helper
+# returns an empty set (its "I couldn't read indexes" fall-through).
+_SAFE_TAB_TABLE_RE = re.compile(r"^tab[A-Za-z0-9 _\-]+$")
+_SAFE_INFOSCHEMA_RE = re.compile(r"^information_schema\.[A-Za-z0-9_]+$")
+
+
+def _is_safe_table_name(name) -> bool:
+	"""True iff ``name`` is one of the table-name shapes the indexer is
+	allowed to inspect via raw SQL. See ``_SAFE_TAB_TABLE_RE`` /
+	``_SAFE_INFOSCHEMA_RE`` for the exact grammar. Any other shape (an
+	attempt at SQL injection via crafted DocType names, a stray space,
+	a backtick, a semicolon, …) returns False and short-circuits the
+	caller back to its empty-set fallback."""
+	if not isinstance(name, str) or not name:
+		return False
+	# Defence in depth: reject backticks, quotes, semicolons even though
+	# the regexes wouldn't match them — make the intent obvious to readers.
+	if any(c in name for c in ("`", "'", '"', ";", "\\", "\n", "\r", "\x00")):
+		return False
+	return bool(_SAFE_TAB_TABLE_RE.match(name) or _SAFE_INFOSCHEMA_RE.match(name))
+
+
 def _get_indexed_columns(table: str) -> set[str]:
 	"""Return the set of columns on ``table`` that already have at
 	least one index WHERE this column is the leftmost of the index key.
@@ -192,7 +222,15 @@ def _get_indexed_columns(table: str) -> set[str]:
 
 	Returns an empty set on any DB error (table missing, access denied,
 	no real Frappe site), which conservatively keeps all suggestions.
+
+	The table name is **interpolated** into the SQL (MariaDB doesn't
+	accept parameterised identifiers in DDL), so it must pass the
+	``_is_safe_table_name`` whitelist first. Anything outside the
+	``tab<DocType>`` / ``information_schema.<simple>`` grammar is
+	rejected without ever reaching the database.
 	"""
+	if not _is_safe_table_name(table):
+		return set()
 	try:
 		import frappe
 		rows = frappe.db.sql(f"SHOW INDEX FROM `{table}`", as_dict=True) or []

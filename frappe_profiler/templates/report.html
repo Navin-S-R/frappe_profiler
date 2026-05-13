@@ -562,7 +562,7 @@
     <div class="finding-header">
       <span class="severity-badge {{ f.severity | lower }}">{{ f.severity }}</span>
       <span class="finding-title">{{ f.title }}</span>
-      <span class="finding-impact">~{{ "%.0f" | format(f.estimated_impact_ms) }}ms{% if f.affected_count > 1 %} &middot; {{ f.affected_count }}×{% endif %}</span>
+      <span class="finding-impact">~{{ fmt_ms(f.estimated_impact_ms) }}{% if f.affected_count > 1 %} &middot; {{ f.affected_count }}×{% endif %}</span>
     </div>
     {# v0.6.0 Round 3: customer_description dropped from rendering — it
        repeated what the title + smoking-gun block already convey, reading
@@ -617,12 +617,43 @@
         {% if p2_hot %}
         <div style="margin-top: 6px; font-size: 12px; padding-top: 6px; border-top: 1px dashed #d1d5db;">
           <strong style="color: #1d4ed8;">Phase 2:</strong>
-          hottest line {{ p2_hot.lineno }} &mdash; {{ "%.0f" | format(p2_hot.total_ms) }}ms{% if p2_hot.hits %} / {{ p2_hot.hits }} hit{{ "s" if p2_hot.hits != 1 else "" }}{% endif %}
+          hottest line {{ p2_hot.lineno }} &mdash; {{ fmt_ms(p2_hot.total_ms) }}{% if p2_hot.hits %} / {{ p2_hot.hits }} hit{{ "s" if p2_hot.hits != 1 else "" }}{% endif %}
           {% if p2_hot.content %}
           <code style="margin-left: 6px; padding: 1px 6px; background: #fef3c7; border-radius: 2px;">{{ p2_hot.content | trim }}</code>
           {% endif %}
         </div>
         {% endif %}
+      {% endif %}
+      {# v0.6.x: deterministic call-tree drill-down. Walks from the finding's
+         origin function down to the deepest user-code frame. Hidden when the
+         chain is empty (origin is already a leaf, or the next frame is
+         framework code). Complements the AI fix block below — gives non-LLM
+         users the same actionable trail. #}
+      {% set _drilldown = (f.technical_detail or {}).get("drilldown_chain") if f.technical_detail else None %}
+      {% if _drilldown %}
+      <div style="margin-top: 6px; font-size: 12px; padding-top: 6px; border-top: 1px dashed #d1d5db;">
+        <strong style="color: #1d4ed8;">Drill-down:</strong>
+        time inside <code>{{ callsite.function }}</code> walked through &mdash;
+        <div style="margin-top: 4px;">
+        {% for level in _drilldown %}
+          <div style="padding: 1px 0 1px {{ (loop.index0 + 1) * 12 }}px; color: #374151;">
+            <span class="muted">&#x21B3;</span>
+            <code>{{ level.filename }}:{{ level.lineno }}</code>
+            <span class="muted">({{ level.function }})</span>
+            &mdash; {{ fmt_ms(level.cumulative_ms) }}{% if level.pct_of_origin %} <span class="muted">&middot; {{ level.pct_of_origin }}% of parent</span>{% endif %}
+          </div>
+        {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+      {# v0.6.x: hoisted from .finding-detail — the target document + the
+         doc-event lifecycle hook breadcrumb live at the same visual level
+         as the Phase 2 / Drill-down callouts inside the smoking-gun box,
+         so all three context cues stay together. #}
+      {% if detail.target_doc or detail.hook_events %}
+      <div style="margin-top: 6px; font-size: 12px; padding-top: 6px; border-top: 1px dashed #d1d5db; color: #374151;">
+        {% if detail.target_doc %}<span class="muted">Document:</span> <strong>{{ detail.target_doc.doctype }}</strong>{% if detail.target_doc.name %} <code>{{ detail.target_doc.name }}</code>{% endif %}{% endif %}{% if detail.target_doc and detail.hook_events %} &middot; {% endif %}{% if detail.hook_events %}<span class="muted">Doc-event hook:</span> {% for he in detail.hook_events %}<code>{{ he.doctype }} &#9656; {{ he.event }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}
+      </div>
       {% endif %}
     </div>
     {% endif %}
@@ -633,9 +664,12 @@
          remaining detail rows (query, DDL, fix hint, etc.) live here as
          supporting context. #}
 
-      {# v0.6.x: which document this action touched, and which doc-event
-         lifecycle hook the hot function fired in (when known). #}
-      {% if detail.target_doc or detail.hook_events %}
+      {# v0.6.x: target document + doc-event hook breadcrumb is rendered
+         INSIDE the smoking-gun box for callsite-bearing findings (which is
+         every Slow-Hot-Path / N+1 / Hot-Line finding). For the rare finding
+         without a callsite, fall back to rendering it here so the breadcrumb
+         isn't dropped. #}
+      {% if (not callsite.filename or not callsite.lineno) and (detail.target_doc or detail.hook_events) %}
         <p class="small" style="margin: 0 0 10px; color: #374151;">
           {% if detail.target_doc %}<span class="muted">Document:</span> <strong>{{ detail.target_doc.doctype }}</strong>{% if detail.target_doc.name %} <code>{{ detail.target_doc.name }}</code>{% endif %}{% endif %}{% if detail.target_doc and detail.hook_events %} &middot; {% endif %}{% if detail.hook_events %}<span class="muted">Doc-event hook:</span> {% for he in detail.hook_events %}<code>{{ he.doctype }} &#9656; {{ he.event }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}
         </p>
@@ -675,8 +709,8 @@
       {% if detail.occurrences %}
         <p class="small muted">
           {{ detail.occurrences }} occurrences
-          {% if detail.average_time_ms %} &middot; ~{{ "%.1f" | format(detail.average_time_ms) }}ms each{% endif %}
-          {% if detail.total_time_ms %} &middot; {{ "%.0f" | format(detail.total_time_ms) }}ms total{% endif %}
+          {% if detail.average_time_ms %} &middot; ~{{ fmt_ms(detail.average_time_ms, 1) }} each{% endif %}
+          {% if detail.total_time_ms %} &middot; {{ fmt_ms(detail.total_time_ms) }} total{% endif %}
         </p>
       {% endif %}
 
@@ -687,8 +721,8 @@
       {% if detail.projected_avg_time_ms is defined and detail.projected_avg_time_ms %}
         <p class="small projected-after-fix">
           <span class="projected-label">Projected after fix:</span>
-          ~{{ "%.1f" | format(detail.projected_avg_time_ms) }}ms each
-          {% if detail.projected_total_ms %} &middot; ~{{ "%.0f" | format(detail.projected_total_ms) }}ms total{% endif %}
+          ~{{ fmt_ms(detail.projected_avg_time_ms, 1) }} each
+          {% if detail.projected_total_ms %} &middot; ~{{ fmt_ms(detail.projected_total_ms) }} total{% endif %}
           {% if detail.projected_speedup_label %} <span class="projected-speedup">({{ detail.projected_speedup_label }})</span>{% endif %}
         </p>
       {% endif %}
@@ -720,7 +754,7 @@
   <span class="app-bucket-meta small muted">
     &middot; {{ bucket.count }} finding{{ "s" if bucket.count != 1 else "" }}
     {% if bucket.total_impact_ms %}
-      &middot; ~{{ "%.0f" | format(bucket.total_impact_ms) }}ms
+      &middot; ~{{ fmt_ms(bucket.total_impact_ms) }}
     {% endif %}
   </span>
 {% endmacro %}
@@ -773,10 +807,10 @@
       {% endif %}
     </td>
     <td><span class="small">{{ action.event_type }}</span></td>
-    <td class="num">{{ "%.0f" | format(action.duration_ms) }}ms</td>
+    <td class="num">{{ fmt_ms(action.duration_ms) }}</td>
     <td class="num">{{ action.queries_count }}</td>
-    <td class="num">{{ "%.0f" | format(action.query_time_ms) }}ms</td>
-    <td class="num">{{ "%.0f" | format(action.slowest_query_ms) }}ms</td>
+    <td class="num">{{ fmt_ms(action.query_time_ms) }}</td>
+    <td class="num">{{ fmt_ms(action.slowest_query_ms) }}</td>
   </tr>
   {% if action.entry_callsite %}
   <tr>
@@ -791,10 +825,10 @@
   <tr>
     <td>{{ idx }}</td>
     <td><code>{{ job.method }}</code></td>
-    <td class="num">{{ "%.0f" | format(job.duration_ms) }}ms</td>
+    <td class="num">{{ fmt_ms(job.duration_ms) }}</td>
     <td class="num">{{ job.queries_count }}</td>
-    <td class="num">{{ "%.0f" | format(job.query_time_ms) }}ms</td>
-    <td class="num">{{ "%.0f" | format(job.slowest_query_ms) }}ms</td>
+    <td class="num">{{ fmt_ms(job.query_time_ms) }}</td>
+    <td class="num">{{ fmt_ms(job.slowest_query_ms) }}</td>
     {% if any_findings_counted %}
       <td class="num">{{ job.findings_count if job.findings_count is not none else '&mdash;' | safe }}</td>
     {% endif %}
@@ -808,7 +842,7 @@
           {% for q in job.top_queries %}
             <div style="margin:8px 0;padding:8px 10px;background:#ffffff;border:1px solid #e5e7eb;border-radius:4px;">
               <div class="small muted" style="margin-bottom:4px;">
-                {% if q.index is not none %}#{{ q.index }} &middot; {% endif %}{{ "%.2f" | format(q.duration) }}ms
+                {% if q.index is not none %}#{{ q.index }} &middot; {% endif %}{{ fmt_ms(q.duration, 2) }}
                 {% if q.exact_copies and q.exact_copies > 1 %} &middot; {{ q.exact_copies }} exact copies{% endif %}
               </div>
               <pre style="margin:0;white-space:pre-wrap;word-break:break-word;">{{ q.query }}</pre>
@@ -827,7 +861,7 @@
 {% macro hot_frame_row(row) %}
   <tr>
     <td><code>{{ row.display_name }}</code></td>
-    <td class="num">{{ row.total_ms | round(0) | int }}</td>
+    <td class="num">{{ fmt_ms(row.total_ms) }}</td>
     <td class="num">{{ row.occurrences }}</td>
     <td class="num">{{ row.distinct_actions }}</td>
   </tr>
@@ -836,7 +870,7 @@
 {% macro top_query_row(q, idx) %}
   <tr>
     <td>{{ idx }}</td>
-    <td class="num">{{ "%.0f" | format(q.duration_ms or 0) }}ms</td>
+    <td class="num">{{ fmt_ms(q.duration_ms or 0) }}</td>
     <td><code class="small">{{ q.callsite or "" }}</code></td>
     <td><pre class="sql-inline">{{ (q.normalized_query or "") }}</pre></td>
   </tr>
@@ -881,7 +915,7 @@
      jobs / Server Resource / Frontend) link only when they'll render. #}
   <div class="section small" style="padding:10px 16px;">
     <strong>Jump to:</strong>
-    <a href="#findings">Findings</a> ·
+    {% if phase2_html %}<a href="#phase2">Phase 2 line drill-down</a> · {% endif %}<a href="#findings">Findings</a> ·
     <a href="#per-action">Per-action</a>{% if background_jobs and background_jobs.count %} · <a href="#background-jobs">Background jobs</a>{% endif %}{% if doc_event_breakdown and doc_event_breakdown.count %} · <a href="#doc-event-lifecycle">Doc events</a>{% endif %}{% if infra_timeline %} · <a href="#server-resource">Server resource</a>{% endif %}{% if frontend_xhr_matched or frontend_vitals_by_page %} · <a href="#frontend">Frontend</a>{% endif %} ·
     <a href="#top-queries">Top queries</a> ·
     <a href="#db-tables">DB tables</a>
@@ -909,13 +943,13 @@
 
     {% if executive_summary.bullets %}
     <div class="exec-bullets">
-      <p class="small muted">Top {{ executive_summary.bullets | length }} highest-impact finding{{ "s" if executive_summary.bullets | length != 1 else "" }}{% if executive_summary.total_impact_ms %} ({{ executive_summary.total_impact_ms | int }}ms combined){% endif %}:</p>
+      <p class="small muted">Top {{ executive_summary.bullets | length }} highest-impact finding{{ "s" if executive_summary.bullets | length != 1 else "" }}{% if executive_summary.total_impact_ms %} ({{ fmt_ms(executive_summary.total_impact_ms) }} combined){% endif %}:</p>
       <ol>
         {% for b in executive_summary.bullets %}
         <li>
           <span class="exec-bullet-severity severity-{{ b.severity | lower }}">{{ b.severity }}</span>
           <span class="exec-bullet-text">{{ b.text }}</span>
-          {% if b.impact_ms %}<span class="exec-bullet-impact">~{{ b.impact_ms | int }}ms</span>{% endif %}
+          {% if b.impact_ms %}<span class="exec-bullet-impact">~{{ fmt_ms(b.impact_ms) }}</span>{% endif %}
         </li>
         {% endfor %}
       </ol>
@@ -948,8 +982,8 @@
   <div class="stats">
     <div class="stat">
       <div class="label">Total time</div>
-      <div class="value">{{ "%.0f" | format(session.total_duration_ms or 0) }}<span class="sub" style="font-size:1rem">ms</span></div>
-      <div class="sub">{{ "%.0f" | format((session.total_duration_ms or 0) - (session.total_query_time_ms or 0)) }}ms server code &middot; {{ "%.0f" | format(session.total_query_time_ms or 0) }}ms database</div>
+      <div class="value">{{ fmt_ms(session.total_duration_ms or 0) }}</div>
+      <div class="sub">{{ fmt_ms((session.total_duration_ms or 0) - (session.total_query_time_ms or 0)) }} server code &middot; {{ fmt_ms(session.total_query_time_ms or 0) }} database</div>
     </div>
     <div class="stat">
       <div class="label">Database queries</div>
@@ -992,6 +1026,21 @@
       <p class="empty">No summary available.</p>
     {% endif %}
   </details>
+
+  {# v0.6.x: hoisted above Findings — the line-level drill-down is the
+     report's most distinctive section, so it lands first after the
+     Summary narrative. The panel is pre-rendered by
+     _render_phase2_panel(session_doc) in renderer.py and returns "" when
+     the session has no phase-2 runs, so the section silently disappears
+     for sessions that never had drill-down. The HTML is fully self-
+     contained (inline styles, no external assets) so the safe-report
+     self-containment canary still passes. The <div id="phase2"> wrapper
+     is purely for the in-page jump-nav anchor. #}
+  {% if phase2_html %}
+  <div id="phase2">
+    {{ phase2_html | safe }}
+  </div>
+  {% endif %}
 
   {# --------------- FINDINGS (v0.5.2: per-app sub-grouping) --------------- #}
   <details class="section" open id="findings">
@@ -1051,16 +1100,6 @@
     </details>
     {% endif %}
   </details>
-
-  {# v0.6.0 phase-2 line-profile panel — pre-rendered in renderer.py so this
-     template stays slim. _render_phase2_panel returns "" when the session
-     has no phase-2 runs, so the section silently disappears for sessions
-     that never had drill-down. The HTML is fully self-contained (inline
-     styles, no external assets) so the safe-report self-containment canary
-     still passes. #}
-  {% if phase2_html %}
-  {{ phase2_html | safe }}
-  {% endif %}
 
   {# --------------- PER-ACTION BREAKDOWN --------------- #}
   <details class="section" open id="per-action">
@@ -1128,7 +1167,7 @@
     <summary><h2>Background jobs</h2></summary>
     <p class="small muted">
       {{ background_jobs.count }} background job{{ 's' if background_jobs.count != 1 else '' }}
-      ran during this flow &mdash; {{ "%.0f" | format(background_jobs.total_ms) }}ms total,
+      ran during this flow &mdash; {{ fmt_ms(background_jobs.total_ms) }} total,
       {{ background_jobs.total_queries }} quer{{ 'ies' if background_jobs.total_queries != 1 else 'y' }}.
       These also appear in the per-action breakdown above.
     </p>
@@ -1209,12 +1248,12 @@
           {% if g.is_save_target %}&middot; saved/submitted directly{% endif %}
           {% if g.touched_during %}&middot; touched during {{ g.touched_during | join(", ") }} save/submit{% endif %}
           &middot; {{ g.method_count }} hot method{{ "s" if g.method_count != 1 else "" }}
-          &middot; ~{{ "%.0f" | format(g.total_ms) }}ms
+          &middot; ~{{ fmt_ms(g.total_ms) }}
         </span>
       </div>
       {% for ev in g.events %}
       <div style="margin: 8px 0 0 14px;">
-        <div class="small"><strong>{{ ev.event }}</strong> <span class="muted">&mdash; ~{{ "%.0f" | format(ev.total_ms) }}ms</span></div>
+        <div class="small"><strong>{{ ev.event }}</strong> <span class="muted">&mdash; ~{{ fmt_ms(ev.total_ms) }}</span></div>
         <table style="width: 100%; border-collapse: collapse; font-size: 0.84rem; margin: 2px 0 0;">
           {% for m in ev.methods %}
           <tr>
@@ -1223,7 +1262,7 @@
               <span class="small muted">{{ m.filename }}{% if m.lineno %}:{{ m.lineno }}{% endif %}</span>
               <span class="small muted">[{{ m.kind }}]</span>
             </td>
-            <td style="padding: 2px 8px; border: none; text-align: right; white-space: nowrap;">~{{ "%.0f" | format(m.ms) }}ms{% if m.count > 1 %} &times;{{ m.count }}{% endif %}</td>
+            <td style="padding: 2px 8px; border: none; text-align: right; white-space: nowrap;">~{{ fmt_ms(m.ms) }}{% if m.count > 1 %} &times;{{ m.count }}{% endif %}</td>
           </tr>
           {% endfor %}
         </table>
@@ -1349,9 +1388,9 @@
         {% for m in frontend_xhr_matched %}
         <tr style="border-bottom: 1px solid #f3f4f6;">
           <td style="padding: 4px 8px;">{{ m.action_label }}</td>
-          <td style="padding: 4px 8px; text-align: right;">{{ m.backend_ms | int }}ms</td>
-          <td style="padding: 4px 8px; text-align: right;">{{ m.xhr_ms | int }}ms</td>
-          <td style="padding: 4px 8px; text-align: right;">{{ m.network_delta_ms | int }}ms</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ fmt_ms(m.backend_ms) }}</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ fmt_ms(m.xhr_ms) }}</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ fmt_ms(m.network_delta_ms) }}</td>
           <td style="padding: 4px 8px; text-align: right;">{{ m.status }}</td>
           <td style="padding: 4px 8px; text-align: right;">{{ ((m.response_size_bytes or 0) / 1024) | round(1) }}KB</td>
           <td style="padding: 4px 8px;">
@@ -1382,11 +1421,11 @@
           <td style="padding: 4px 8px;">
             <code style="font-size: 0.75rem;">{{ page }}</code>
           </td>
-          <td style="padding: 4px 8px; text-align: right;">{{ (v.fcp_ms or 0) | int }}ms</td>
-          <td style="padding: 4px 8px; text-align: right;">{{ (v.lcp_ms or 0) | int }}ms</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ fmt_ms(v.fcp_ms or 0) }}</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ fmt_ms(v.lcp_ms or 0) }}</td>
           <td style="padding: 4px 8px; text-align: right;">{{ "%.3f" | format(v.cls or 0) }}</td>
-          <td style="padding: 4px 8px; text-align: right;">{{ (v.ttfb_ms or 0) | int }}ms</td>
-          <td style="padding: 4px 8px; text-align: right;">{{ (v.dom_content_loaded_ms or 0) | int }}ms</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ fmt_ms(v.ttfb_ms or 0) }}</td>
+          <td style="padding: 4px 8px; text-align: right;">{{ fmt_ms(v.dom_content_loaded_ms or 0) }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -1410,7 +1449,7 @@
           {% for o in frontend_orphans %}
           <tr style="border-bottom: 1px solid #f3f4f6;">
             <td style="padding: 4px 8px;"><code style="font-size: 0.75rem;">{{ o.url }}</code></td>
-            <td style="padding: 4px 8px; text-align: right;">{{ (o.duration_ms or 0) | int }}ms</td>
+            <td style="padding: 4px 8px; text-align: right;">{{ fmt_ms(o.duration_ms or 0) }}</td>
             <td style="padding: 4px 8px;">{{ o.reason }}</td>
           </tr>
           {% endfor %}
@@ -1430,7 +1469,7 @@
       <thead>
         <tr>
           <th>Function</th>
-          <th class="num">Total ms</th>
+          <th class="num">Total time</th>
           <th class="num">Occurrences</th>
           <th class="num">Distinct actions</th>
         </tr>
@@ -1451,7 +1490,7 @@
         <thead>
           <tr>
             <th>Function</th>
-            <th class="num">Total ms</th>
+            <th class="num">Total time</th>
             <th class="num">Occurrences</th>
             <th class="num">Distinct actions</th>
           </tr>
@@ -1540,9 +1579,9 @@
         <summary style="cursor: pointer; padding: 8px 12px; background: #f3f4f6; border-radius: 4px; user-select: none;">
           <strong>{{ loop.index }}. {{ action.action_label }}</strong>
           <span class="small muted">
-            &middot; {{ "%.0f" | format(action.duration_ms) }}ms
+            &middot; {{ fmt_ms(action.duration_ms) }}
             &middot; {{ action.queries_count }} queries
-            &middot; {{ "%.0f" | format(action.query_time_ms) }}ms in DB
+            &middot; {{ fmt_ms(action.query_time_ms) }} in DB
           </span>
         </summary>
         <div style="padding: 10px 4px;">
@@ -1566,7 +1605,7 @@
             <tbody>
             {% for call in top_in_action[:10] %}
               <tr>
-                <td class="num">{{ "%.1f" | format(call.duration or 0) }}ms</td>
+                <td class="num">{{ fmt_ms(call.duration or 0, 1) }}</td>
                 <td class="num">
                   {% if call.normalized_copies and call.normalized_copies > 1 %}{{ call.normalized_copies }}×{% endif %}
                 </td>
@@ -1607,7 +1646,7 @@
       {% if written %}
       <p class="small muted" style="margin-bottom:10px;">
         <strong>Tables written to this session</strong> ({{ written | length }}):
-        {% for t in written[:12] %}<code title="{{ t.write_count }} write(s){% if t.get('write_time_ms') %}, {{ '%.0f' | format(t.write_time_ms) }}ms{% endif %}">{{ t.table }}</code>&nbsp;({{ t.write_count }}){% if not loop.last %}, {% endif %}{% endfor %}{% if written | length > 12 %} … and {{ written | length - 12 }} more{% endif %}.
+        {% for t in written[:12] %}<code title="{{ t.write_count }} write(s){% if t.get('write_time_ms') %}, {{ fmt_ms(t.write_time_ms) }}{% endif %}">{{ t.table }}</code>&nbsp;({{ t.write_count }}){% if not loop.last %}, {% endif %}{% endfor %}{% if written | length > 12 %} … and {{ written | length - 12 }} more{% endif %}.
         <br>Writes are usually cheap (a handful of sub-millisecond <code>INSERT</code>&nbsp;/&nbsp;<code>UPDATE</code> rows), so a write-heavy table normally won't be near the top of the time-sorted list below &mdash; that's why a document save doesn't dominate this section. Drill into the <a href="#per-action">per-action breakdown</a> to see exactly what each save / submit wrote.
       </p>
       {% endif %}
@@ -1626,10 +1665,10 @@
         {% for t in table_breakdown %}
           <tr>
             <td><code>{{ t.table }}</code></td>
-            <td class="num">{{ "%.0f" | format(t.duration_ms) }}ms</td>
+            <td class="num">{{ fmt_ms(t.duration_ms) }}</td>
             <td class="num">{{ t.queries }}</td>
-            <td class="num">{{ t.get("read_count", "—") }}{% if t.get("read_time_ms") %} <span class="small muted">/ {{ "%.0f" | format(t.read_time_ms) }}ms</span>{% endif %}</td>
-            <td class="num">{{ t.get("write_count", "—") }}{% if t.get("write_time_ms") %} <span class="small muted">/ {{ "%.0f" | format(t.write_time_ms) }}ms</span>{% endif %}</td>
+            <td class="num">{{ t.get("read_count", "—") }}{% if t.get("read_time_ms") %} <span class="small muted">/ {{ fmt_ms(t.read_time_ms) }}</span>{% endif %}</td>
+            <td class="num">{{ t.get("write_count", "—") }}{% if t.get("write_time_ms") %} <span class="small muted">/ {{ fmt_ms(t.write_time_ms) }}</span>{% endif %}</td>
           </tr>
           {% if t.get("recommended_index") %}
           {% set rec = t.recommended_index %}
@@ -1717,7 +1756,7 @@
       <details style="margin: 12px 0; padding: 12px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px;">
         <summary style="cursor: pointer; font-weight: 600; color: #111827;">
           {{ loop.index }}. {{ action.action_label }}
-          <span class="small muted" style="font-weight: 400;">({{ "%.0f" | format(action.duration_ms) }}ms, {{ action.queries_count }} queries)</span>
+          <span class="small muted" style="font-weight: 400;">({{ fmt_ms(action.duration_ms) }}, {{ action.queries_count }} queries)</span>
         </summary>
         <div style="padding-top: 12px;">
 
@@ -1737,7 +1776,7 @@
               <div style="margin: 8px 0; padding: 8px; background: white; border: 1px solid #e5e7eb; border-radius: 4px;">
                 <div class="small muted">
                   #{{ call.index if call.index is defined else loop.index0 }}
-                  &middot; {{ "%.2f" | format(call.duration or 0) }}ms
+                  &middot; {{ fmt_ms(call.duration or 0, 2) }}
                   {% if call.exact_copies and call.exact_copies > 1 %}&middot; {{ call.exact_copies }} exact copies{% endif %}
                   {% if call.normalized_copies and call.normalized_copies > call.exact_copies %}&middot; {{ call.normalized_copies }} normalized copies{% endif %}
                 </div>
@@ -1781,7 +1820,8 @@
       ignored_apps = <code>{{ render_config.ignored_apps | join(", ") if render_config.ignored_apps else "(none)" }}</code> &middot;
       ai_suggest_findings = <code>{{ "on" if render_config.ai_suggest_findings else "off" }}</code> &middot;
       ai_suggest_indexes = <code>{{ "on" if render_config.ai_suggest_indexes else "off" }}</code> &middot;
-      min_action_duration_ms = <code>{{ render_config.min_action_duration_ms | round(0) | int }}</code>.
+      min_action_duration_ms = <code>{{ render_config.min_action_duration_ms | round(0) | int }}</code> &middot;
+      large_duration_threshold_ms = <code>{{ render_config.large_duration_threshold_ms | round(0) | int }}</code>.
       Settings affect FUTURE renders only &mdash; click <em>Regenerate Reports</em> on the Profiler Session after a settings change.
     </p>
     {% endif %}

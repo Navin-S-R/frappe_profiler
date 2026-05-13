@@ -109,6 +109,46 @@ class TestBuildMessages:
 		assert "verbatim" in low
 		assert "no before/after snippet" in low or "no fabricated code block" in low
 
+	def test_system_prompt_enforces_sql_semantic_equivalence(self):
+		"""v0.6.x: prompt forbids inventing WHERE / JOIN / LIMIT when
+		substituting raw SQL with frappe.get_all etc. Mitigates the
+		leading hallucination mode (model copies a variable from
+		elsewhere in the function into a bogus `filters=` clause)."""
+		system, _ = ai_fix._build_messages(self._finding())
+		low = system.lower()
+		# The new rule names the exact hallucination shape we want
+		# to prevent: list-multiplication into an "in" filter.
+		assert "sql substitution discipline" in low or "semantically equivalent" in low
+		assert "[some_var] * n" in low or "[some_var] * n`" in low
+		assert "frappe.session.user" in system, (
+			"prompt must call out the specific variable-copy hallucination "
+			"(frappe.session.user) so the model recognises the failure mode"
+		)
+		# Inverse rule: no WHERE in the SQL → no filters= in the replacement.
+		assert "no `filters=`" in low or "no filters=" in low
+
+	def test_system_prompt_includes_counter_example_with_no_filters(self):
+		"""A LIMIT-only SQL (no WHERE) maps to frappe.get_all(..., limit=50)
+		with NO filters. Counter-example shipped to keep the model from
+		assuming every get_all replacement needs filters."""
+		system, _ = ai_fix._build_messages(self._finding())
+		# The counter-example is recognisable by its content — a raw SQL with
+		# no WHERE clause + a frappe.get_all replacement without filters=.
+		assert "SELECT name, email FROM `tabUser` LIMIT 50" in system
+		assert "frappe.get_all('User', fields=['name', 'email'], limit=50)" in system
+		# Extract the diff inside the SECOND EXAMPLE and assert filters= is
+		# absent there (the surrounding prose legitimately mentions "NO
+		# `filters=`" so we only check the code fence).
+		_, _, counter = system.partition("SECOND EXAMPLE")
+		assert counter, "second example block missing from prompt"
+		_, _, diff_block = counter.partition("```diff")
+		diff, _, _ = diff_block.partition("```")
+		assert diff.strip(), "diff fence missing in second example"
+		assert "filters=" not in diff, (
+			"counter-example DIFF must NOT contain `filters=` — that's the "
+			"entire point of showing a no-filter substitution"
+		)
+
 	def test_system_prompt_warns_off_indexing_frappe_metadata_columns(self):
 		system, _ = ai_fix._build_messages(self._finding())
 		low = system.lower()

@@ -26,7 +26,7 @@ import time
 import frappe
 from frappe.utils import now_datetime
 
-from frappe_profiler import session
+from frappe_profiler import safe_commit, session
 
 # Roles allowed to call the profiler API. System Manager is always allowed
 # (Frappe's superuser role); Profiler User is our dedicated role created
@@ -328,7 +328,7 @@ def _mark_stopping(user: str, session_uuid: str) -> str | None:
 		docname,
 		{"status": "Stopping", "stopped_at": now_datetime()},
 	)
-	frappe.db.commit()
+	safe_commit()
 	return docname
 
 
@@ -420,7 +420,7 @@ def _enqueue_analyze(session_uuid: str, docname: str | None = None) -> bool:
 							),
 						},
 					)
-					frappe.db.commit()
+					safe_commit()
 				except Exception:
 					frappe.log_error(
 						title="frappe_profiler inline cap mark Failed"
@@ -934,7 +934,7 @@ def retry_analyze(session_uuid: str) -> dict:
 		doc["name"],
 		{"status": "Stopping", "analyzer_warnings": None},
 	)
-	frappe.db.commit()
+	safe_commit()
 
 	# v0.4.0: clear the cached PDF so the next download regenerates from
 	# the fresh HTML produced by the re-run analyze.
@@ -1176,11 +1176,41 @@ def suggest_fix(session_uuid: str, finding_ref: str, regenerate=0) -> dict:
 
 	# Build the LLM context: the finding dict + a wide source window + (when a
 	# Phase-2 line-profile pass instrumented this finding's function) its
-	# hottest line — shared with the analyze-time auto-suggest path.
+	# hottest line + (best-effort) the top-N slowest SQL queries from this
+	# action's recording — shared with the analyze-time auto-suggest path.
 	from frappe_profiler import analyze as _analyze_mod
+
+	# v0.6.x: fetch the single action's recording from Redis so the AI gets
+	# verbatim SQL evidence to ground against (the leading cause of bogus AI
+	# refactorings was the model inferring SQL shape from Python source
+	# instead of reading the actual query). Best-effort — if the recording
+	# expired from Redis, fall through with just the source-window context.
+	recordings_by_uuid: dict = {}
+	actions_by_idx: dict = {}
+	try:
+		actions_by_idx = {
+			int(a.idx) if hasattr(a, "idx") else i: {
+				"idx": int(getattr(a, "idx", i)),
+				"recording_uuid": a.recording_uuid or "",
+			}
+			for i, a in enumerate(doc.actions or [])
+		}
+		ref = (getattr(child, "action_ref", None) or "").strip()
+		if ref and ref.lstrip("-").isdigit():
+			act = actions_by_idx.get(int(ref))
+			rec_uuid = (act or {}).get("recording_uuid")
+			if rec_uuid:
+				recs = list(_analyze_mod._fetch_recordings([rec_uuid]))
+				recordings_by_uuid = {r.get("uuid"): r for r in recs if r.get("uuid")}
+	except Exception:
+		# Never let a recording-fetch error block the AI suggestion — fall
+		# through with whatever context we already have.
+		recordings_by_uuid = {}
 
 	finding_dict = _analyze_mod._ai_payload_for_finding(
 		child, {}, phase2_index=_analyze_mod._phase2_index_for(doc),
+		recordings_by_uuid=recordings_by_uuid,
+		actions_by_idx=actions_by_idx,
 	)
 
 	try:
@@ -1192,7 +1222,7 @@ def suggest_fix(session_uuid: str, finding_ref: str, regenerate=0) -> dict:
 		frappe.db.set_value(
 			"Profiler Finding", child.name, "llm_fix_json", json.dumps(result),
 		)
-		frappe.db.commit()
+		safe_commit()
 	except Exception:
 		# Failing to persist isn't fatal — the operator still gets the
 		# suggestion in the dialog, just not cached / in the report.
@@ -1409,7 +1439,7 @@ def humanize_steps(session_uuid: str) -> dict:
 		"Profiler Session", row["name"], "notes",
 		_analyze_mod._assemble_humanized_notes(steps_md),
 	)
-	frappe.db.commit()
+	safe_commit()
 
 	regen = regenerate_reports(session_uuid)
 	return {
@@ -1755,7 +1785,7 @@ def start_line_profile_pass(session_uuid: str, picks, auto_expand=True) -> dict:
 	})
 	parent.flags.ignore_validate_update_after_submit = True
 	parent.save(ignore_permissions=True)
-	frappe.db.commit()
+	safe_commit()
 
 	frappe.publish_realtime("phase_2_run_recording", {
 		"session_uuid": session_uuid,
@@ -1798,7 +1828,7 @@ def force_stop_phase2() -> dict:
 	stuck_rows = frappe.db.sql(
 		"""
 		SELECT pp2r.name, pp2r.parent, pp2r.run_uuid
-		FROM `tabProfiler Phase 2 Run` pp2r
+		FROM `tabProfiler Phase Two Run` pp2r
 		JOIN `tabProfiler Session` ps ON ps.name = pp2r.parent
 		WHERE pp2r.status = 'Recording'
 		  AND ps.user = %s
@@ -1807,28 +1837,45 @@ def force_stop_phase2() -> dict:
 		as_dict=True,
 	)
 
-	failed = 0
+	# v0.6.x: group stuck rows by their parent Profiler Session so each
+	# parent doc is loaded + saved EXACTLY ONCE per batch (was N loads + N
+	# saves when one session held multiple stuck runs — the common case
+	# for a user spamming the picker).
+	rows_by_parent: dict[str, list[dict]] = {}
 	for row in stuck_rows:
+		rows_by_parent.setdefault(row["parent"], []).append(row)
+
+	failed = 0
+	for parent_name, rows in rows_by_parent.items():
 		try:
-			parent = frappe.get_doc("Profiler Session", row["parent"])
+			parent = frappe.get_doc("Profiler Session", parent_name)
+			matched_in_parent = 0
+			wanted_uuids = {r["run_uuid"] for r in rows}
 			for child in (parent.phase_2_runs or []):
-				if child.run_uuid == row["run_uuid"]:
+				if child.run_uuid in wanted_uuids:
 					child.status = "Failed"
 					child.warnings_json = frappe.as_json([
 						"Force-stopped by user via api.force_stop_phase2.",
 					])
 					child.ended_at = now_datetime()
-					_lp_capture.cleanup_run(row["run_uuid"])
-					break
-			parent.flags.ignore_validate_update_after_submit = True
-			parent.save(ignore_permissions=True)
-			failed += 1
+					try:
+						_lp_capture.cleanup_run(child.run_uuid)
+					except Exception:
+						frappe.log_error(
+							title="force_stop_phase2 redis cleanup",
+							message=f"{parent_name}/{child.run_uuid}",
+						)
+					matched_in_parent += 1
+			if matched_in_parent:
+				parent.flags.ignore_validate_update_after_submit = True
+				parent.save(ignore_permissions=True)
+				failed += matched_in_parent
 		except Exception as exc:
 			frappe.log_error(
-				title="force_stop_phase2 row save",
-				message=f"{row['name']}: {exc}",
+				title="force_stop_phase2 parent save",
+				message=f"{parent_name}: {exc}",
 			)
-	frappe.db.commit()
+	safe_commit()
 
 	return {
 		"cleared_active_flag": bool(cleared_run),
@@ -1844,9 +1891,11 @@ def stop_line_profile_pass(run_uuid: str) -> dict:
 
 	user = _require_profiler_user()
 
-	# Find the run row + parent session.
-	rows = frappe.get_all(
-		"Profiler Phase 2 Run",
+	# Find the run row + parent session. v0.6.x: ``get_list`` (instead of
+	# ``get_all``) respects user permissions on Profiler Phase Two Run —
+	# defence-in-depth on top of the ``_require_profiler_user()`` gate.
+	rows = frappe.get_list(
+		"Profiler Phase Two Run",
 		filters={"run_uuid": run_uuid},
 		fields=["name", "parent", "status"],
 		limit=1,
@@ -1872,7 +1921,7 @@ def stop_line_profile_pass(run_uuid: str) -> dict:
 			break
 	parent.flags.ignore_validate_update_after_submit = True
 	parent.save(ignore_permissions=True)
-	frappe.db.commit()
+	safe_commit()
 
 	frappe.publish_realtime("phase_2_run_analyzing", {
 		"session_uuid": session_uuid,
@@ -1947,8 +1996,10 @@ def retry_phase2_analyze(run_uuid: str) -> dict:
 
 	_require_profiler_user()
 
-	rows = frappe.get_all(
-		"Profiler Phase 2 Run",
+	# v0.6.x: ``get_list`` respects user permissions (defence-in-depth on
+	# top of ``_require_profiler_user()``).
+	rows = frappe.get_list(
+		"Profiler Phase Two Run",
 		filters={"run_uuid": run_uuid},
 		fields=["name", "parent", "status"],
 		limit=1,
@@ -1967,7 +2018,7 @@ def retry_phase2_analyze(run_uuid: str) -> dict:
 			break
 	parent.flags.ignore_validate_update_after_submit = True
 	parent.save(ignore_permissions=True)
-	frappe.db.commit()
+	safe_commit()
 
 	try:
 		_lp_analyzer.run_analyze(session_uuid, run_uuid)
@@ -1982,4 +2033,62 @@ def retry_phase2_analyze(run_uuid: str) -> dict:
 		"run_uuid": run_uuid,
 		"session_uuid": session_uuid,
 		"status": "Ready",
+	}
+
+
+@frappe.whitelist()
+def retry_phase2_analyzes_batch(run_uuids) -> dict:
+	"""Batch variant of ``retry_phase2_analyze`` — accepts a list of
+	``run_uuid``s and retries each in a single server round-trip.
+
+	v0.6.x: addresses the Lens-audit *"frappe.call(...) inside a loop"*
+	finding on the form's "Retry Phase 2" affordance — instead of N
+	client→server round-trips (one per stuck run, which is the common
+	case when a worker died and every Analyzing row needs a kick), the
+	UI fires ONE call and the loop runs server-side.
+
+	Per-run failures are isolated: one bad retry doesn't abort the
+	rest. The response carries a per-run status list so the UI can
+	report a useful aggregate (``"3 of 5 ran Ready, 2 Failed"``)."""
+	import json as _json
+
+	_require_profiler_user()
+
+	# Accept JSON-encoded list (Frappe's whitelisted-API arg marshalling
+	# stringifies lists when they cross the request boundary) OR a real
+	# Python list when called from another server-side helper.
+	if isinstance(run_uuids, str):
+		try:
+			run_uuids = _json.loads(run_uuids)
+		except (TypeError, ValueError):
+			frappe.throw("run_uuids must be a JSON array of run-uuid strings.")
+	if not isinstance(run_uuids, (list, tuple)) or not run_uuids:
+		frappe.throw("run_uuids must be a non-empty list of run-uuid strings.")
+
+	results: list[dict] = []
+	for run_uuid in run_uuids:
+		if not isinstance(run_uuid, str) or not run_uuid.strip():
+			results.append({"run_uuid": run_uuid, "status": "Skipped",
+			                "error": "empty / non-string run_uuid"})
+			continue
+		try:
+			results.append(retry_phase2_analyze(run_uuid))
+		except Exception as exc:
+			# Don't let one bad row abort the rest of the batch.
+			results.append({
+				"run_uuid": run_uuid,
+				"status": "Failed",
+				"error": str(exc),
+			})
+
+	# Quick aggregate for the UI to render a single message.
+	tallies = {"Ready": 0, "Failed": 0, "Analyzing": 0, "Skipped": 0}
+	for r in results:
+		st = r.get("status") or "Failed"
+		tallies[st] = tallies.get(st, 0) + 1
+
+	return {
+		"count": len(results),
+		"tallies": tallies,
+		"results": results,
 	}

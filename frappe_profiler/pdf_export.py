@@ -13,6 +13,8 @@ import re
 
 import frappe
 
+from frappe_profiler import safe_commit
+
 # v0.5.2 round 4: wkhtmltopdf uses old QtWebKit which doesn't reliably
 # render collapsed <details> content even under @media print — the
 # Observations subsection and Analyzer notes section end up invisible
@@ -43,7 +45,7 @@ def get_or_generate_pdf(session_uuid: str) -> str:
 	pdf_bytes = _html_to_pdf(html)
 	url = _save_pdf_attachment(doc.name, session_uuid, pdf_bytes)
 	frappe.db.set_value("Profiler Session", doc.name, "raw_report_pdf_file", url)
-	frappe.db.commit()
+	safe_commit()
 	return url
 
 
@@ -63,12 +65,17 @@ def clear_cached_pdf(session_uuid: str) -> None:
 	if not current_url:
 		return
 	try:
-		file_row = frappe.get_doc("File", {"file_url": current_url})
-		frappe.delete_doc("File", file_row.name, force=True, ignore_permissions=True)
+		# v0.6.x: was get_doc(...).name; switched to a single get_value to
+		# skip loading the full File doc (and its child tables) just to read
+		# one scalar — addresses Lens audit "get_doc used only for reading
+		# fields" at this site.
+		file_name = frappe.db.get_value("File", {"file_url": current_url}, "name")
+		if file_name:
+			frappe.delete_doc("File", file_name, force=True, ignore_permissions=True)
 	except Exception:
 		pass
 	frappe.db.set_value("Profiler Session", docname, "raw_report_pdf_file", None)
-	frappe.db.commit()
+	safe_commit()
 
 
 def _load_session(session_uuid: str):
@@ -83,6 +90,11 @@ def _load_session(session_uuid: str):
 def _load_raw_html(doc) -> str:
 	if not doc.raw_report_file:
 		frappe.throw("This session has no report to convert.")
+	# audit: ok (get_doc kept — .get_content() is a doc-instance method
+	# that streams the attached bytes; db.get_value can only return field
+	# values, not file content. Lens flagged this as "get_doc used only
+	# for reading fields" but it isn't reading a field, it's reading the
+	# attached binary).
 	file_row = frappe.get_doc("File", {"file_url": doc.raw_report_file})
 	return file_row.get_content().decode("utf-8")
 

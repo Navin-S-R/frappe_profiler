@@ -67,6 +67,10 @@ _DEFAULTS = {
 	"hot_line_high_min_ms": 100.0,
 	"pyinstrument_sampler_interval_ms": 1.0,
 	"min_action_duration_ms": 0.0,
+	# v0.6.x: durations above this threshold (in ms) are rendered as seconds
+	# in the report (e.g. 5234ms → 5.23s). Below it, ms is preserved. Set to
+	# a very large value to effectively disable the conversion.
+	"large_duration_threshold_ms": 1000.0,
 	"phase2_max_runs_per_session": 10,
 	"phase2_default_auto_expand": True,
 	# v0.6.0: how long the analyze job waits (seconds, capped at 300) for the
@@ -146,6 +150,9 @@ class ProfilerConfig:
 	hot_line_high_min_ms: float = 100.0
 	pyinstrument_sampler_interval_ms: float = 1.0
 	min_action_duration_ms: float = 0.0
+	# v0.6.x: durations >= this threshold render as seconds in the report;
+	# below the threshold, render as ms. Falsy → use _DEFAULTS via _float.
+	large_duration_threshold_ms: float = 1000.0
 	phase2_max_runs_per_session: int = 10
 	phase2_default_auto_expand: bool = True
 	background_job_wait_seconds: int = 60
@@ -228,6 +235,12 @@ def _read_doctype_row() -> dict | None:
 		# min_action_duration_ms intentionally allows 0 (= show all
 		# actions, the default). Coerce, don't fall through.
 		"min_action_duration_ms": float(doc.get("min_action_duration_ms") or 0),
+		# Falsy (0/None/missing) → None so _float falls through to
+		# _DEFAULTS["large_duration_threshold_ms"] = 1000.
+		"large_duration_threshold_ms": (
+			float(doc.get("large_duration_threshold_ms"))
+			if doc.get("large_duration_threshold_ms") else None
+		),
 		"phase2_max_runs_per_session": int(doc.get("phase2_max_runs_per_session") or 0) or None,
 		# 0 is legitimate (= don't wait) — don't fall through to the default.
 		"background_job_wait_seconds": int(
@@ -350,6 +363,7 @@ def _resolve() -> ProfilerConfig:
 			if row.get("min_action_duration_ms") is not None
 			else _DEFAULTS["min_action_duration_ms"]
 		),
+		large_duration_threshold_ms=_float("large_duration_threshold_ms"),
 		phase2_max_runs_per_session=_int_with_default("phase2_max_runs_per_session"),
 		phase2_default_auto_expand=bool(
 			row.get("phase2_default_auto_expand")

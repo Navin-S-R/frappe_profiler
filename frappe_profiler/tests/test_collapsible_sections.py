@@ -187,3 +187,33 @@ def test_collapsible_css_is_present():
 		"Subsection CSS rule missing — framework observations will "
 		"look identical to top-level sections"
 	)
+
+
+def test_phase2_section_appears_before_findings():
+	"""v0.6.x: the Phase 2 line-level drill-down is the report's most
+	distinctive section — it must be hoisted above the actionable
+	Findings list so readers see it immediately after the Summary."""
+	template = _read_template()
+	phase2_anchor = template.find('id="phase2"')
+	findings_anchor = template.find('id="findings"')
+	assert phase2_anchor > 0, "Phase 2 anchor (id=\"phase2\") missing from template"
+	assert findings_anchor > 0, "Findings anchor (id=\"findings\") missing from template"
+	assert phase2_anchor < findings_anchor, (
+		"Phase 2 (id=\"phase2\") must render BEFORE Findings (id=\"findings\") — "
+		"it is the report's showcase section"
+	)
+
+
+def test_phase2_jump_nav_link_present():
+	"""The Jump-to nav must include a Phase 2 link (conditional on the
+	session having phase-2 runs)."""
+	template = _read_template()
+	assert 'href="#phase2"' in template, (
+		"Jump-to nav missing #phase2 link — Phase 2 section won't be "
+		"reachable from the top-of-report navigation"
+	)
+	# Conditional wrapper: the link only renders when phase2_html exists.
+	assert "{% if phase2_html %}<a href=\"#phase2\"" in template, (
+		"Phase 2 nav link must be wrapped in {% if phase2_html %} so "
+		"sessions without runs don't show a dangling link"
+	)
