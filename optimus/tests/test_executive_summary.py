@@ -50,17 +50,41 @@ class TestHeadlinePace:
 		)
 		assert es["pace"] == "slow"
 
-	def test_headline_includes_ms_queries_operations(self):
+	def test_headline_includes_seconds_queries_operations(self):
 		es = _build_executive_summary(
 			findings=[], session_doc=_doc(total_ms=1200, queries=30, actions=3),
 			v5={},
 		)
 		# Plain-English wording for a non-developer: "operations" not "actions",
 		# "database queries" not bare "queries".
-		assert "1200ms" in es["headline"]
+		# v0.7.x: 1200ms is above the default 1000ms threshold, so the
+		# duration renders as seconds wrapped in the .time-high highlight
+		# span (the timing rule applied everywhere else in the report).
+		assert '<span class="time-high">1.20s</span>' in es["headline"]
 		assert "30 database queries" in es["headline"]
 		assert "3 operation" in es["headline"]
 		assert "action" not in es["headline"]
+
+	def test_headline_below_threshold_keeps_ms(self):
+		"""Below the threshold the duration must stay as plain ms — no
+		highlight span. Same behaviour as fmt_ms() everywhere else."""
+		es = _build_executive_summary(
+			findings=[], session_doc=_doc(total_ms=800, queries=10, actions=2),
+			v5={},
+		)
+		assert "800ms" in es["headline"]
+		assert '<span class="time-high">' not in es["headline"]
+
+	def test_headline_respects_custom_threshold(self):
+		"""Admins can raise the threshold via Optimus Settings; the
+		exec-summary headline must honour their setting, not hardcoded
+		1000ms. With threshold=5000, a 2000ms session still reads as ms."""
+		es = _build_executive_summary(
+			findings=[], session_doc=_doc(total_ms=2000, queries=10, actions=2),
+			v5={}, large_duration_threshold_ms=5000.0,
+		)
+		assert "2000ms" in es["headline"]
+		assert '<span class="time-high">' not in es["headline"]
 
 
 class TestTopBullets:
@@ -210,7 +234,10 @@ class TestEndToEndRender:
 			"Slow-session card must have pace-slow class for red border"
 		)
 		# Headline has pace values, plain-English wording (operations, not actions).
-		assert "6000ms" in html
+		# v0.7.x: 6000ms is above the 1000ms threshold, so the duration
+		# renders as seconds wrapped in .time-high (the timing rule the
+		# rest of the report already uses).
+		assert '<span class="time-high">6.00s</span>' in html
 		assert "operation" in html
 		# Top finding surfaced by its title.
 		assert "Same query ran 50× at myapp/foo.py:10" in html

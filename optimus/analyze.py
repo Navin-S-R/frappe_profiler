@@ -2121,11 +2121,14 @@ def _build_summary_html(
 	medium = sum(1 for f in findings if f.get("severity") == "Medium")
 	low = sum(1 for f in findings if f.get("severity") == "Low")
 
+	# v0.7.x: emit each summary point as a bullet (joined into one <ul>
+	# at the end of the function). Each ``parts`` entry is the bullet's
+	# inner HTML (no <li> wrapper here — added in the final join).
 	parts = [
-		f"<p>This session covered <strong>{n_actions} operation"
+		f"This session covered <strong>{n_actions} operation"
 		f"{'s' if n_actions != 1 else ''}</strong> (page loads, saves and "
 		f"background jobs) with <strong>{total_queries} database "
-		f"quer{'ies' if total_queries != 1 else 'y'}</strong>.</p>"
+		f"quer{'ies' if total_queries != 1 else 'y'}</strong>."
 	]
 
 	if context.actions:
@@ -2178,27 +2181,28 @@ def _build_summary_html(
 
 		if tied_finding:
 			parts.append(
-				f"<p>The slowest one was <strong>{slowest_label_esc}</strong> at "
+				f"The slowest one was <strong>{slowest_label_esc}</strong> at "
 				f"{slowest_ms:.0f}ms — and most of its time went into "
 				f"{_finding_phrase(tied_finding)}. See the Findings section below "
-				"for what to ask your developer to fix.</p>"
+				"for what to ask your developer to fix."
 			)
 		elif overall_finding:
 			parts.append(
-				f"<p>The slowest one was <strong>{slowest_label_esc}</strong> at "
+				f"The slowest one was <strong>{slowest_label_esc}</strong> at "
 				f"{slowest_ms:.0f}ms. The biggest issue this session "
 				f"(it affects several operations) was {_finding_phrase(overall_finding)}. "
-				"See the Findings section below.</p>"
+				"See the Findings section below."
 			)
 		else:
 			parts.append(
-				f"<p>The slowest one was <strong>{slowest_label_esc}</strong> at "
-				f"{slowest_ms:.0f}ms.</p>"
+				f"The slowest one was <strong>{slowest_label_esc}</strong> at "
+				f"{slowest_ms:.0f}ms."
 			)
 
 	if not findings:
+		# Two-bullet reassurance (was one block of two <p>s pre-v0.7.x).
 		parts.append(
-			"<p>We checked your flow for the usual culprits — "
+			"We checked your flow for the usual culprits — "
 			"<strong>repeated queries (N+1 patterns)</strong>, "
 			"<strong>full table scans</strong>, "
 			"<strong>filesort operations</strong>, "
@@ -2206,11 +2210,13 @@ def _build_summary_html(
 			"<strong>low filter ratios</strong>, "
 			"<strong>missing indexes</strong>, and "
 			"<strong>individually slow queries</strong> (&gt;200ms) — "
-			"and nothing significant turned up.</p>"
-			"<p>Either your flow is already well-optimized, or the data "
+			"and nothing significant turned up."
+		)
+		parts.append(
+			"Either your flow is already well-optimized, or the data "
 			"volume is too small to surface bottlenecks at this scale. "
 			"Try running the profiler again with a larger dataset for "
-			"more insight.</p>"
+			"more insight."
 		)
 	else:
 		total_issues = high + medium + low
@@ -2223,12 +2229,19 @@ def _build_summary_html(
 			bits.append(f"{low} minor")
 		breakdown = (" — " + ", ".join(bits)) if bits else ""
 		parts.append(
-			f"<p>We found <strong>{total_issues} potential issue"
+			f"We found <strong>{total_issues} potential issue"
 			f"{'s' if total_issues != 1 else ''}</strong>{breakdown}. See the "
-			"Findings section below for the ones to ask your developer to fix first.</p>"
+			"Findings section below for the ones to ask your developer to fix first."
 		)
 
-	return "\n".join(parts)
+	# Wrap into a single <ul> — each parts entry becomes one <li>. Inline
+	# style mirrors the How-to-read list's pattern for visual consistency
+	# with the rest of the report.
+	bullets = "\n".join(f"<li>{p}</li>" for p in parts)
+	return (
+		'<ul class="small" style="margin: 4px 0 0 18px; padding: 0; '
+		'line-height: 1.7;">\n' + bullets + "\n</ul>"
+	)
 
 
 def _finalize_with_empty_session(docname: str) -> None:
@@ -2237,9 +2250,15 @@ def _finalize_with_empty_session(docname: str) -> None:
 	doc.status = "Ready"
 	doc.total_requests = 0
 	doc.total_queries = 0
+	# v0.7.x: same bullet shape as the populated Summary for visual
+	# consistency — a single <li> inside <ul> reads as a deliberate
+	# summary line rather than dangling prose.
 	doc.summary_html = (
-		"<p>No traffic was recorded during this session. Either no requests "
-		"were made, or the session was stopped before any flow was performed.</p>"
+		'<ul class="small" style="margin: 4px 0 0 18px; padding: 0; '
+		'line-height: 1.7;">\n'
+		"<li>No traffic was recorded during this session. Either no requests "
+		"were made, or the session was stopped before any flow was performed.</li>\n"
+		"</ul>"
 	)
 	doc.save(ignore_permissions=True)
 	safe_commit()

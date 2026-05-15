@@ -424,7 +424,11 @@ class TestActionContextInReport:
 		doc = _doc([action], findings=[])
 		recs = [{"uuid": "r0", "calls": [], "form_dict": {"fieldname": "name", "filters": "{}"}}]
 		html = renderer.render_raw(doc, recordings=recs)
-		assert "&rarr;" not in html
+		# Anchor on the breadcrumb's structural form, not the bare arrow —
+		# v0.7.x added a Lens promo line in the header that also uses
+		# &rarr;, so the previous unanchored assertion no longer
+		# distinguishes "no target doc" from "any arrow anywhere".
+		assert '<span class="small muted">&rarr;' not in html
 
 	def test_doc_action_without_recording_does_not_crash(self):
 		# Recording expired from Redis → no form_dict to read → no target_doc, no crash.

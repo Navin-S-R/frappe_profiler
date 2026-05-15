@@ -534,6 +534,31 @@ def render(
 		findings=findings,
 		session_doc=session_doc,
 		v5=v5,
+		large_duration_threshold_ms=_large_duration_threshold_ms,
+	)
+
+	# v0.7.x: build the Summary section's HTML at render time. Pre-v0.7.x
+	# this was baked into ``session_doc.summary_html`` at analyze time, so
+	# template-shape changes (e.g. <p> → <ul>) only applied to sessions
+	# re-analyzed after the change — ``regenerate_reports`` re-renders the
+	# template but doesn't re-run analyzers (see the docstring on
+	# ``_filter_top_queries_for_display`` below for the same pattern).
+	# Building at render time means the bullet shape always matches the
+	# current code, on every regenerate. The analyze-time write to
+	# ``summary_html`` still happens for backwards compatibility but the
+	# template now ignores it.
+	from optimus.analyze import _build_summary_html
+	from optimus.analyzers.base import AnalyzeContext as _SummaryCtx
+	_summary_ctx = _SummaryCtx(
+		session_uuid=getattr(session_doc, "session_uuid", "") or "",
+		docname=getattr(session_doc, "name", "") or "",
+	)
+	_summary_ctx.actions = list(actions) + list(actions_framework)
+	_summary_ctx.findings = all_findings
+	summary_html_rendered = _build_summary_html(
+		_summary_ctx,
+		int(getattr(session_doc, "total_queries", 0) or 0),
+		recordings,
 	)
 
 	context = {
@@ -627,6 +652,10 @@ def render(
 		# files are static; Optimus Settings changes only affect future
 		# renders.)
 		"render_config": render_config,
+		# v0.7.x: render-time-built Summary HTML (see note above the
+		# ``_build_summary_html`` call). The template prefers this over
+		# the stored ``session.summary_html``.
+		"summary_html": summary_html_rendered,
 	}
 
 	return template.render(**context)
@@ -1364,9 +1393,9 @@ def _render_phase2_panel(session_doc: Any) -> str:
 		}
 
 	html = [
-		'<section style="margin-top: 32px; padding: 16px; '
+		'<details class="section" style="margin-top: 32px; padding: 16px; '
 		'border: 1px solid #d1d5db; border-radius: 6px; background: #ffffff;">',
-		'<h2 style="margin: 0 0 8px 0;">Phase 2: Line-Level Drilldown</h2>',
+		'<summary><h2 style="margin: 0 0 8px 0;">Phase 2: Line-Level Drilldown</h2></summary>',
 		'<div style="background: #fef3c7; border-left: 4px solid #f59e0b; '
 		'padding: 8px 12px; margin-bottom: 16px; font-size: 13px;">'
 		'Phase 2 captures only the flow you ran during the line-profile '
@@ -1426,7 +1455,7 @@ def _render_phase2_panel(session_doc: Any) -> str:
 			html.append(_render_phase2_diff_table(diff_meta["rows"]))
 			html.append('</div>')
 
-	html.append('</section>')
+	html.append('</details>')
 	return "".join(html)
 
 
@@ -2802,10 +2831,11 @@ def _build_executive_summary(
 	findings: list[dict],
 	session_doc: Any,
 	v5: dict,
+	large_duration_threshold_ms: float = 1000.0,
 ) -> dict:
 	"""Return a dict shaped for the template's exec-summary card.
 
-	Shape: ``{"headline": str, "bullets": list[str], "show": bool}``
+	Shape: ``{"headline": Markup, "bullets": list[str], "show": bool}``
 
 	``show`` is False when there's nothing meaningful to summarize —
 	e.g. a clean session with no findings. The template renders the
@@ -2826,10 +2856,22 @@ def _build_executive_summary(
 	queries_per_action = (
 		round(total_queries / total_actions, 1) if total_actions else 0
 	)
-	headline = (
-		f"This session took {int(total_ms)}ms across {total_actions} "
-		f"operation{'s' if total_actions != 1 else ''} "
-		f"— {int(total_queries)} database queries, ~{queries_per_action} per operation."
+	# v0.7.x: honour the timing rule for the headline duration. The
+	# helper returns Markup (always — for ms / s / "0ms" branches), so
+	# we build the headline as Markup.format(...) — that escapes the
+	# plain-string args while passing the Markup duration through
+	# unchanged, keeping the <span class="time-high">…</span> intact
+	# under Jinja autoescape.
+	duration_html = _format_duration_ms(total_ms, large_duration_threshold_ms)
+	headline = Markup(
+		"This session took {duration} across {actions} operation{plural} "
+		"— {queries} database queries, ~{qpa} per operation."
+	).format(
+		duration=duration_html,
+		actions=total_actions,
+		plural="s" if total_actions != 1 else "",
+		queries=int(total_queries),
+		qpa=queries_per_action,
 	)
 
 	# Pull the top 3 findings by estimated_impact_ms (already sorted
