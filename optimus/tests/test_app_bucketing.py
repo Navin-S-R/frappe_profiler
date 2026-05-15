@@ -174,12 +174,13 @@ class TestHotPathBucketRename:
 			"bucket is entirely hot-path findings"
 		)
 
-	def test_mixed_bucket_keeps_other_label(self):
-		"""A no-callsite bucket that contains NON-hotpath findings
-		(e.g. an Infra Pressure with no callsite, or anything else
-		that landed there for non-hotpath reasons) keeps the
-		'Other (no callsite)' label — we're not claiming it's all
-		hot paths."""
+	def test_mixed_bucket_is_suppressed(self):
+		"""v0.7.x: a no-callsite bucket containing mixed finding types
+		(hot-path + non-hot-path) is dropped entirely from the rendered
+		Findings section. The all-hotpath case still renames to
+		'Request hotspots' and survives; only the mixed/generic 'Other
+		(no callsite)' label is suppressed because the findings binned
+		there had no actionable file:line for the reader."""
 		buckets = _bucket_findings_by_app([
 			self._hotpath("In savedocs:Save, 66% in validate"),
 			{
@@ -194,9 +195,9 @@ class TestHotPathBucketRename:
 			},
 		])
 		apps = [b["app"] for b in buckets]
-		assert _OTHER_APP_LABEL in apps, (
-			"Mixed no-callsite bucket must keep the 'Other (no "
-			f"callsite)' label. Got: {apps}"
+		assert _OTHER_APP_LABEL not in apps, (
+			"'Other (no callsite)' bucket must be suppressed in v0.7.x. "
+			f"Got: {apps}"
 		)
 
 	def test_hotpath_bucket_ordered_last(self):
@@ -218,18 +219,21 @@ class TestHotPathBucketRename:
 		assert apps == ["myapp", "Request hotspots"]
 
 
-class TestOtherBucketAlwaysLast:
-	def test_other_bucket_tails(self):
-		"""Even if the 'Other' bucket has higher impact than named
-		apps, it's always rendered last — less actionable, so it
-		belongs at the bottom of the visual hierarchy."""
+class TestOtherBucketSuppressed:
+	def test_other_bucket_not_rendered(self):
+		"""v0.7.x: even when there are no-callsite findings, the
+		'Other (no callsite)' bucket is suppressed from the render
+		output. Findings still exist in the underlying list and still
+		count toward severity totals — only the per-app bucket display
+		drops them. Named-app buckets render unchanged."""
 		findings = [
 			_finding(app_filename=None, impact=9999.0),  # no callsite
 			_finding("apps/myapp/foo.py", impact=10.0),
 		]
 		buckets = _bucket_findings_by_app(findings)
 		apps = [b["app"] for b in buckets]
-		assert apps == ["myapp", _OTHER_APP_LABEL]
+		assert _OTHER_APP_LABEL not in apps
+		assert apps == ["myapp"]
 
 	def test_other_bucket_absent_when_no_uncallsite_findings(self):
 		findings = [_finding("apps/myapp/foo.py")]

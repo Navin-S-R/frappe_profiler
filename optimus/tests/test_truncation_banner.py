@@ -97,7 +97,13 @@ class TestTruncationBannerRenders:
 		row.estimated_impact_ms = 500.0
 		row.affected_count = 50
 		row.action_ref = "0"
-		row.technical_detail_json = json.dumps({})
+		# v0.7.x: findings with no callsite are filtered before render.
+		# Give this finding a callsite so the exec-summary still picks
+		# it up (the test's intent is to verify banner-vs-summary order,
+		# not the callsite plumbing).
+		row.technical_detail_json = json.dumps({
+			"callsite": {"filename": "apps/myapp/foo.py", "lineno": 1, "function": "f"},
+		})
 		doc.findings = [row]
 
 		html = renderer.render(doc, recordings=[])

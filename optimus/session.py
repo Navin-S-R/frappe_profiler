@@ -153,11 +153,16 @@ def register_recording(
 		meta = get_session_meta(session_uuid) or {}
 		user = meta.get("user")
 	if user:
-		frappe.cache.set_value(
-			_active_key(user),
-			session_uuid,
-			expires_in_sec=SESSION_TTL_SECONDS,
-		)
+		# v0.7.x: use Redis EXPIRE (no-op when the key has been
+		# deleted) instead of SET, which would re-create a pointer
+		# that the user just cleared via Stop. The pre-v0.7 bug:
+		# an in-flight request whose ``after_request`` fired *just
+		# after* Stop would re-create the active pointer with this
+		# call, causing subsequent HTTP requests on the same worker
+		# to keep being recorded into the (now-stopped) session and
+		# the widget to silently flip back to Recording state.
+		# EXPIRE returns 0 for a missing key — no key resurrected.
+		frappe.cache.expire_key(_active_key(user), SESSION_TTL_SECONDS)
 
 	return True
 

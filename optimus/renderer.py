@@ -20,6 +20,7 @@ import re
 from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from markupsafe import Markup
 
 from optimus.analyzers.base import SEVERITY_ORDER
 
@@ -130,6 +131,26 @@ def render(
 	# representative one (the hottest user-app frame that ran the offending
 	# query) from the recordings so their smoking-gun block can render too.
 	_attach_representative_callsites(all_findings, recordings or [], file_cache=_finding_file_cache)
+	# v0.7.x: drop findings whose callsite has no file:line. They have
+	# no actionable anchor for the reader — pre-v0.7 they bucketed as
+	# "Other (no callsite)" and the user explicitly opted to suppress
+	# that bucket. Filtered AFTER ``_attach_representative_callsites``
+	# so SQL red-flag findings that DID get a representative callsite
+	# survive. The filter is global — these findings also disappear
+	# from the Executive Summary, severity counts, and observations
+	# so there's no phantom-row inconsistency between sections.
+	def _has_renderable_callsite(f):
+		detail = f.get("technical_detail") or {}
+		callsite = detail.get("callsite") or {}
+		return bool((callsite.get("filename") or "").strip())
+
+	all_findings = [f for f in all_findings if _has_renderable_callsite(f)]
+	# v0.7.x: phase-2 callsite index built once and reused for the Jinja
+	# lookup the template uses for cross-link callouts ("Phase 2: hottest
+	# line N — Mms / X hits"). The smoking-gun retargeting reads
+	# drill-down chains (not phase-2) and is wired in after
+	# _attach_drilldown_chains populates them on the findings.
+	_phase2_index = _build_phase2_callsite_index(session_doc)
 	# v0.6.x: which document each save/submit action touched, and which
 	# doc-event lifecycle hook each slow function fired in.
 	_attach_action_context(actions, all_findings, recordings_by_uuid)
@@ -397,6 +418,26 @@ def render(
 	# finding's origin function down to the deepest user-code frame. Lets
 	# non-LLM users see the same actionable chain the AI narrative produces.
 	_attach_drilldown_chains(all_findings, actions, tracked_apps=tracked_apps)
+	# v0.7.x: re-anchor each finding's smoking-gun snippet on the deepest
+	# user-code frame of its drill-down chain (when the chain points at a
+	# different function than the wrapper). Must run AFTER
+	# _attach_drilldown_chains so the chains exist; the bucketed views
+	# below share these dicts by reference so the new callsite is visible
+	# everywhere the finding renders.
+	_retarget_phase1_callsites_to_drilldown_leaf(
+		all_findings, file_cache=_finding_file_cache,
+	)
+	# v0.7.x: collapse findings that share a deepest-user-code anchor
+	# into one primary card with the others attached as sub_findings.
+	# Runs AFTER smoking-gun retargeting + drill-down attachment so
+	# the root-cause key resolution can use either source. The
+	# actionable bucket and the observational bucket are grouped
+	# independently (don't merge an observational into an actionable
+	# group's sub-list or vice versa). Severity counts and the
+	# Executive Summary downstream then see the de-duplicated list.
+	findings = _group_findings_by_root_cause(findings)
+	actionable_findings = findings
+	observational_findings = _group_findings_by_root_cause(observational_findings)
 	findings_by_app = _bucket_findings_by_app(findings, tracked_apps)
 	observational_findings_by_app = _bucket_findings_by_app(
 		observational_findings, tracked_apps
@@ -408,11 +449,56 @@ def render(
 	# secondary; the template renders the primary in the main <table>
 	# and the framework list inside a collapsed <details class="subsection">.
 	# Sort order WITHIN each bucket is preserved (existing duration sort).
-	actions, actions_framework = _split_by_framework_app(
-		actions,
-		lambda a: (a.get("entry_callsite") or {}).get("_abs") or _action_dotted_entry(a),
-		tracked_apps,
-	)
+	#
+	# v0.7.x: the per-action split now keys off the admin's
+	# ``Tracked Apps`` allowlist exclusively. When Tracked Apps is
+	# configured, only actions whose entry resolves to a tracked app
+	# land in the main table — everything else is in the collapsed
+	# framework subsection. When Tracked Apps is empty (default), the
+	# split is skipped and ALL actions stay in the main table. This
+	# fixes a UX regression where every HTTP action that hit a Frappe
+	# endpoint (``/api/method/frappe.client.save``,
+	# ``/api/method/frappe.desk.form.save.savedocs`` — i.e. the actions
+	# the user actually clicked Save / Submit for) was hidden in the
+	# framework subsection, leaving only background jobs in the main
+	# Per-Action Breakdown table.
+	if tracked_apps:
+		actions, actions_framework = _split_by_framework_app(
+			actions,
+			lambda a: (a.get("entry_callsite") or {}).get("_abs") or _action_dotted_entry(a),
+			tracked_apps,
+		)
+	else:
+		actions_framework = []
+	# v0.7.x: link each action to the findings whose ``action_ref``
+	# matches its ``idx``. The per-action row in the template uses
+	# this to embed the full finding card (severity badge, smoking
+	# gun, drill-down, AI fix, root-cause sub_findings) directly
+	# inside the action's sub-row — same structure as the Findings
+	# section, scoped to that action. Findings without an action_ref
+	# (e.g. infra observations, SQL red flags) are skipped — they
+	# still appear in their respective top-level sections.
+	_findings_by_action_ref: dict[str, list] = {}
+	for _f in actionable_findings:
+		_ref = str(_f.get("action_ref") or "").strip()
+		if _ref:
+			_findings_by_action_ref.setdefault(_ref, []).append(_f)
+	for _a in list(actions) + list(actions_framework):
+		_a["related_findings"] = _findings_by_action_ref.get(
+			str(_a.get("idx", "")), [],
+		)
+	# v0.7.x: same linkage for Background Jobs rows. Jobs carry the
+	# original action ``idx`` (set in ``build_background_jobs``) so
+	# they look up against the same per-action-ref map. With this
+	# the BG row macro embeds the same finding cards as action_row,
+	# scoped to the job.
+	for _job in (
+		list(background_jobs.get("jobs", []) or [])
+		+ list(background_jobs.get("jobs_framework", []) or [])
+	):
+		_job["related_findings"] = _findings_by_action_ref.get(
+			str(_job.get("idx", "")), [],
+		)
 	top_queries, top_queries_framework = _split_by_framework_app(
 		top_queries,
 		lambda q: q.get("callsite"),
@@ -448,6 +534,31 @@ def render(
 		findings=findings,
 		session_doc=session_doc,
 		v5=v5,
+		large_duration_threshold_ms=_large_duration_threshold_ms,
+	)
+
+	# v0.7.x: build the Summary section's HTML at render time. Pre-v0.7.x
+	# this was baked into ``session_doc.summary_html`` at analyze time, so
+	# template-shape changes (e.g. <p> → <ul>) only applied to sessions
+	# re-analyzed after the change — ``regenerate_reports`` re-renders the
+	# template but doesn't re-run analyzers (see the docstring on
+	# ``_filter_top_queries_for_display`` below for the same pattern).
+	# Building at render time means the bullet shape always matches the
+	# current code, on every regenerate. The analyze-time write to
+	# ``summary_html`` still happens for backwards compatibility but the
+	# template now ignores it.
+	from optimus.analyze import _build_summary_html
+	from optimus.analyzers.base import AnalyzeContext as _SummaryCtx
+	_summary_ctx = _SummaryCtx(
+		session_uuid=getattr(session_doc, "session_uuid", "") or "",
+		docname=getattr(session_doc, "name", "") or "",
+	)
+	_summary_ctx.actions = list(actions) + list(actions_framework)
+	_summary_ctx.findings = all_findings
+	summary_html_rendered = _build_summary_html(
+		_summary_ctx,
+		int(getattr(session_doc, "total_queries", 0) or 0),
+		recordings,
 	)
 
 	context = {
@@ -534,15 +645,17 @@ def render(
 		# to its hottest phase-2 line when the same function was
 		# instrumented. Helper rather than raw dict because Jinja can't
 		# build tuple keys for the basename + function lookup.
-		"phase2_for_callsite": _make_phase2_lookup(
-			_build_phase2_callsite_index(session_doc)
-		),
+		"phase2_for_callsite": _make_phase2_lookup(_phase2_index),
 		# v0.6.x: snapshot of the render-affecting settings, stamped in the
 		# report footer so a user opening a saved HTML file can immediately
 		# tell which toggles were in effect when it was rendered. (Saved
 		# files are static; Optimus Settings changes only affect future
 		# renders.)
 		"render_config": render_config,
+		# v0.7.x: render-time-built Summary HTML (see note above the
+		# ``_build_summary_html`` call). The template prefers this over
+		# the stored ``session.summary_html``.
+		"summary_html": summary_html_rendered,
 	}
 
 	return template.render(**context)
@@ -565,6 +678,14 @@ def _build_phase2_callsite_index(session_doc: Any) -> dict:
 	multiple runs, the entry with the largest single-line ``total_ms``
 	wins — that's the most informative callout for the developer.
 
+	Per-function, own hottest line — no cross-function redirection.
+	The cross-link's job is "this function's hottest internal line";
+	the smoking-gun snippet's job (handled by
+	``_retarget_phase1_callsites_to_drilldown_leaf``) is "land the
+	reader on the deepest user-code frame". Keeping them separate
+	avoids the cross-link silently re-aiming the user at a different
+	function's data, which was confusing.
+
 	Returns an empty dict when the session has no phase-2 runs or the
 	results blobs are empty / malformed; the macro then renders no
 	callout.
@@ -579,6 +700,7 @@ def _build_phase2_callsite_index(session_doc: Any) -> dict:
 		except Exception:
 			continue
 		run_uuid = getattr(child, "run_uuid", "") or ""
+
 		for fn in results:
 			file_path = fn.get("file") or ""
 			dotted = fn.get("dotted_path") or ""
@@ -623,6 +745,412 @@ def _make_phase2_lookup(index: dict):
 		return index.get((os.path.basename(filename), function_name))
 
 	return lookup
+
+
+def _find_call_line_in_function_body(
+	parent_filename: str,
+	parent_def_lineno: int,
+	callee_function: str,
+	*,
+	file_cache: dict | None = None,
+) -> int | None:
+	"""Return the lineno of the first call to ``callee_function`` inside
+	the function whose ``def`` begins at ``parent_def_lineno`` in
+	``parent_filename``. ``None`` if the source can't be read or no call
+	is found.
+
+	AST primary — locates the matching ``FunctionDef`` / ``AsyncFunctionDef``
+	node by name/lineno, then walks its body for ``Call`` expressions
+	whose target resolves to ``callee_function`` (matches both bare
+	``callee_function(...)`` via ``Name`` and ``obj.callee_function(...)``
+	via ``Attribute``).
+
+	Regex fallback when AST parse fails (truncated file, syntax error
+	elsewhere) — scans lines below the def for ``\\b<callee>\\s*\\(``
+	stopping at a same-or-lower indented ``def `` / ``class `` /
+	``async def `` or after 200 lines.
+
+	Reused across multiple findings in the same file via ``file_cache``
+	(the same per-render cache passed to ``_read_source_snippet``).
+	"""
+	if not parent_filename or not callee_function or not parent_def_lineno:
+		return None
+
+	# Read source through the shared cache so files visited by
+	# _read_source_snippet aren't re-read here.
+	if file_cache is not None and parent_filename in file_cache:
+		lines = file_cache[parent_filename]
+	else:
+		resolved = _resolve_source_path(parent_filename)
+		try:
+			with open(resolved, encoding="utf-8") as fh:
+				lines = fh.read().splitlines()
+		except Exception:
+			lines = None
+		if file_cache is not None:
+			file_cache[parent_filename] = lines
+
+	if not lines:
+		return None
+	source = "\n".join(lines)
+
+	# Strategy 1: AST parse.
+	try:
+		import ast as _ast
+		tree = _ast.parse(source, filename=parent_filename)
+	except Exception:
+		tree = None
+
+	if tree is not None:
+		# Find the function def closest to parent_def_lineno (defensive
+		# against the parent being a nested function — pick by name match
+		# AND minimum lineno distance).
+		candidates: list[_ast.AST] = []
+		for node in _ast.walk(tree):
+			if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+				candidates.append(node)
+		if candidates:
+			# Filter by lineno proximity to the recorded def lineno (within
+			# a few lines is usually enough — pyinstrument's lineno can
+			# be the def or the first executed line of the body).
+			best = min(
+				candidates,
+				key=lambda n: abs((n.lineno or 0) - parent_def_lineno),
+			)
+			# Walk only inside the chosen function; collect Call linenos
+			# whose func name matches.
+			matches: list[int] = []
+			for sub in _ast.walk(best):
+				if not isinstance(sub, _ast.Call):
+					continue
+				func = sub.func
+				name = None
+				if isinstance(func, _ast.Name):
+					name = func.id
+				elif isinstance(func, _ast.Attribute):
+					name = func.attr
+				if name == callee_function and sub.lineno:
+					matches.append(sub.lineno)
+			if matches:
+				return min(matches)
+
+	# Strategy 2: regex fallback. Scan from parent_def_lineno+1 until
+	# a sibling def/class at the parent's indentation level or 200
+	# lines, whichever comes first. Stop at first match.
+	import re as _re
+	call_re = _re.compile(r"\b" + _re.escape(callee_function) + r"\s*\(")
+	# Parent's indentation level (number of leading spaces / tabs).
+	if not (1 <= parent_def_lineno <= len(lines)):
+		return None
+	parent_line = lines[parent_def_lineno - 1]
+	parent_indent = len(parent_line) - len(parent_line.lstrip())
+	# Body must be MORE indented than the parent def.
+	sentinel_re = _re.compile(
+		r"^(?P<indent>\s*)(?:async\s+def|def|class)\s",
+	)
+	max_scan = min(len(lines), parent_def_lineno + 200)
+	for i in range(parent_def_lineno, max_scan):
+		raw = lines[i]
+		# Strip trailing # comments naively (string-aware comment
+		# stripping is overkill here — the worst case is a false
+		# negative which falls back to the def-line behavior).
+		hash_idx = raw.find("#")
+		body = raw if hash_idx < 0 else raw[:hash_idx]
+		stripped = body.lstrip()
+		if not stripped:
+			continue
+		current_indent = len(body) - len(stripped)
+		# Sibling def/class at parent's level (or shallower) → end of body.
+		sentinel_match = sentinel_re.match(body)
+		if sentinel_match and current_indent <= parent_indent:
+			break
+		if current_indent <= parent_indent:
+			# We've exited the parent function's block.
+			break
+		if call_re.search(body):
+			return i + 1  # convert 0-based index back to lineno
+
+	return None
+
+
+def _retarget_phase1_callsites_to_drilldown_leaf(
+	findings: list[dict],
+	file_cache: dict | None = None,
+) -> None:
+	"""Re-aim phase-1 finding callsites at the **call site** of the
+	deepest user-code frame in their drill-down chain, in place.
+
+	A Slow Hot Path / Hook Bottleneck / Repeated Hot Frame finding's
+	default callsite is its **wrapper's** entry frame (the ``def`` line
+	of the function at which the slow path was first flagged, e.g.
+	``looped_validate:6``). The drill-down chain already walks down to
+	the deepest user-code frame (e.g. ``_check_user_exists:18``), but
+	even that frame's ``def`` line is a function header rather than the
+	expensive call. The reader's eye lands on the most actionable info
+	when the snippet shows the **call expression** for the deepest
+	leaf — typically the line inside the **parent** of the deepest
+	frame that invokes it. For the user's case the chain is
+	``looped_validate → _run_validations → _check_user_exists`` and
+	the relevant line is ``    _check_user_exists(doc)`` at
+	``_run_validations:13``.
+
+	Phase-1 only — no phase-2 dependency. The drill-down chain is
+	gated on ``action_ref + tree + walk produces ≥1 step`` and is
+	already populated by ``_attach_drilldown_chains`` (called earlier
+	in the render flow). Most Slow Hot Path findings carry one;
+	findings without a chain are left as-is.
+
+	Hot Line / Function Not Invoked findings are phase-2 native — their
+	callsite is already at the leaf — so they're skipped. SQL "red
+	flag" findings whose callsite is a representative one (a query hot
+	spot) are skipped too: their snippet should keep pointing at the
+	query line.
+
+	The original wrapper location is preserved on the new callsite as
+	``original_wrapper`` (``{filename, lineno, function}``) so the
+	template can render a "Time entered through …" caption beneath
+	the relocated callsite header.
+
+	Fallback chain when the call site can't be located:
+	  1. The parent's body is parsed via AST; if a matching ``Call`` is
+	     found, anchor on its lineno.
+	  2. A regex fallback scans the parent's body for ``<callee>(``.
+	  3. If neither finds the call line, fall back to the leaf's own
+	     ``def`` lineno (previous behavior — still better than the
+	     wrapper's def line).
+	"""
+	if not findings:
+		return
+
+	for finding in findings:
+		ftype = finding.get("finding_type") or ""
+		if ftype in {"Hot Line", "Function Not Invoked"}:
+			continue
+		detail = finding.get("technical_detail")
+		if not isinstance(detail, dict):
+			continue
+		chain = detail.get("drilldown_chain") or []
+		if not chain:
+			continue
+		callsite = detail.get("callsite") or {}
+		# Skip representative SQL callsites — they're query hot spots,
+		# not function frames; re-targeting them would lose the query
+		# line they exist to point at.
+		if callsite.get("is_representative"):
+			continue
+		fname = callsite.get("filename") or ""
+		fn_name = callsite.get("function") or ""
+		if not fn_name:
+			continue
+		leaf = chain[-1] if isinstance(chain[-1], dict) else None
+		if not leaf:
+			continue
+		leaf_function = leaf.get("function") or ""
+		leaf_lineno = leaf.get("lineno")
+		leaf_filename = leaf.get("filename") or ""
+		if not leaf_function or leaf_lineno is None or not leaf_filename:
+			continue
+		# Single-frame chain (or leaf == wrapper) — nothing to relocate.
+		if leaf_function == fn_name:
+			continue
+
+		# Determine the leaf's caller in the chain: chain[-2] when the
+		# chain has an intermediate, else the wrapper (the finding's
+		# original callsite).
+		if len(chain) >= 2 and isinstance(chain[-2], dict):
+			parent_filename = chain[-2].get("filename") or ""
+			parent_lineno = int(chain[-2].get("lineno") or 0)
+			parent_function = chain[-2].get("function") or ""
+		else:
+			parent_filename = fname
+			parent_lineno = int(callsite.get("lineno") or 0)
+			parent_function = fn_name
+
+		call_lineno = _find_call_line_in_function_body(
+			parent_filename, parent_lineno, leaf_function,
+			file_cache=file_cache,
+		)
+
+		# Choose the anchor based on what we found:
+		#   - call site in the parent → ``(parent_filename, call_lineno, parent_function)``
+		#   - fallback: leaf's own def line ``(leaf_filename, leaf_lineno, leaf_function)``
+		if call_lineno is not None:
+			anchor_filename = parent_filename
+			anchor_lineno = call_lineno
+			anchor_function = parent_function
+		else:
+			anchor_filename = leaf_filename
+			anchor_lineno = leaf_lineno
+			anchor_function = leaf_function
+
+		snippet = _read_source_snippet(
+			anchor_filename, anchor_lineno, cache=file_cache,
+		)
+
+		display_filename = (
+			_bench_relative_display(anchor_filename)
+			if anchor_filename.startswith("/")
+			else anchor_filename
+		)
+		new_callsite = {
+			"filename": display_filename,
+			"_abs": (
+				anchor_filename
+				if anchor_filename.startswith("/")
+				else callsite.get("_abs")
+			),
+			"lineno": anchor_lineno,
+			"function": anchor_function,
+			"source_snippet": snippet,
+			"original_wrapper": {
+				"filename": fname,
+				"lineno": callsite.get("lineno"),
+				"function": fn_name,
+			},
+			# v0.7.x: the Phase-2 cross-link callout's lookup keys on
+			# ``(basename, function)`` — preserve the leaf's identity
+			# here so the template can target the leaf's phase-2 hot
+			# line even when the smoking-gun callsite was retargeted
+			# to the parent's call site (different function name).
+			"phase2_lookup_filename": leaf_filename,
+			"phase2_lookup_function": leaf_function,
+		}
+		detail["callsite"] = new_callsite
+
+
+# v0.7.x: severity rank for picking the dominant finding within a
+# root-cause group. Lower number = higher severity. Mirrors
+# ``SEVERITY_ORDER`` in ``analyzers.base`` but lives here so the
+# renderer doesn't drag an analyzer import into hot paths.
+_GROUPING_SEVERITY_RANK = {"High": 0, "Medium": 1, "Low": 2}
+
+
+def _root_cause_key(finding: dict) -> tuple | None:
+	"""Return a ``(filename_basename, function)`` tuple identifying the
+	deepest user-code anchor for this finding, or ``None`` if there's
+	nothing we can group on.
+
+	Resolution order:
+
+	1. If the finding has a non-empty ``drilldown_chain``, use the
+	   chain's last entry — that's the deepest user-code frame the
+	   drill-down walker found. Stable across all per-action analyzer
+	   findings (Slow Hot Path, Hook Bottleneck, ...).
+
+	2. Else use the callsite's own ``(filename, function)``. This is
+	   the path most analyzer findings (Hot Line, Redundant Call,
+	   N+1, etc.) take — their callsite already names the leaf.
+
+	Returns ``None`` only when the finding has no usable callsite at
+	all (e.g. infra/system observations) — those don't group.
+
+	Match is by ``(os.path.basename(filename), function)`` so
+	dev-vs-deploy absolute path differences don't fragment groups.
+	"""
+	import os as _os
+
+	detail = finding.get("technical_detail") or {}
+	if not isinstance(detail, dict):
+		return None
+
+	chain = detail.get("drilldown_chain") or []
+	if isinstance(chain, list) and chain:
+		leaf = chain[-1]
+		if isinstance(leaf, dict):
+			leaf_file = leaf.get("filename") or ""
+			leaf_fn = leaf.get("function") or ""
+			if leaf_file and leaf_fn:
+				return (_os.path.basename(leaf_file), leaf_fn)
+
+	callsite = detail.get("callsite") or {}
+	if not isinstance(callsite, dict):
+		return None
+	fname = callsite.get("filename") or ""
+	fn_name = callsite.get("function") or ""
+	if not fname or not fn_name:
+		return None
+	return (_os.path.basename(fname), fn_name)
+
+
+def _group_findings_by_root_cause(findings: list[dict]) -> list[dict]:
+	"""Collapse findings that share a ``(file, function)`` deepest-user-
+	code anchor into ONE primary card with the others attached as
+	``sub_findings``.
+
+	One root cause (e.g. a hot get_doc call inside ``_check_user_exists``)
+	commonly triggers several different finding types — a Slow Hot Path
+	at the wrapper, a Hot Line on the exact line, a Redundant Call for
+	the doc, a Redundant Permission Check for its read perm. Today each
+	renders as its own card; the dev only has ONE fix to make and the
+	five cards crowd the report. After grouping, the highest-severity /
+	highest-impact finding becomes the visible card; the others appear
+	as collapsible sub-rows beneath it.
+
+	Returns a NEW list — primaries kept (with ``sub_findings`` attached
+	when applicable), grouped non-primaries dropped, ungrouped findings
+	(no resolvable root cause) passed through as-is.
+
+	Within each group the primary is chosen by severity then by
+	``estimated_impact_ms`` (higher wins). Sub-findings are sorted the
+	same way so the most informative is first in the collapsed list.
+	"""
+	if not findings:
+		return findings
+
+	def _rank(f: dict) -> tuple:
+		sev_rank = _GROUPING_SEVERITY_RANK.get(f.get("severity") or "Low", 2)
+		impact = -(f.get("estimated_impact_ms") or 0)
+		return (sev_rank, impact)
+
+	# Bucket by root-cause key. None-key findings stream through as
+	# singletons (no grouping).
+	groups: dict[tuple, list[dict]] = {}
+	passthrough: list[dict] = []
+	for f in findings:
+		key = _root_cause_key(f)
+		if key is None:
+			passthrough.append(f)
+			continue
+		groups.setdefault(key, []).append(f)
+
+	result: list[dict] = []
+	# Walk the input list in order; emit the primary at the first
+	# position its key appears at. Skip already-emitted keys and the
+	# None-key findings (handled below).
+	seen_keys: set[tuple] = set()
+	for f in findings:
+		key = _root_cause_key(f)
+		if key is None:
+			continue
+		if key in seen_keys:
+			continue
+		seen_keys.add(key)
+		bucket = groups[key]
+		if len(bucket) <= 1:
+			result.append(bucket[0])
+			continue
+		ordered = sorted(bucket, key=_rank)
+		primary = ordered[0]
+		subs = ordered[1:]
+		# Attach a compact, render-time-only sub_findings list onto
+		# the primary. The template reads this to render the collapsed
+		# `<details>` rows; the sub findings are NOT re-emitted as
+		# standalone cards elsewhere in the bucket.
+		primary["sub_findings"] = [
+			{
+				"finding_type": s.get("finding_type") or "",
+				"severity": s.get("severity") or "Low",
+				"title": s.get("title") or "",
+				"customer_description": s.get("customer_description") or "",
+				"estimated_impact_ms": s.get("estimated_impact_ms") or 0,
+				"affected_count": s.get("affected_count") or 0,
+			}
+			for s in subs
+		]
+		result.append(primary)
+
+	result.extend(passthrough)
+	return result
 
 
 def _render_phase2_function_table(fn: dict) -> str:
@@ -682,10 +1210,15 @@ def _render_phase2_function_table(fn: dict) -> str:
 		'border-bottom: 1px solid #e5e7eb;">#</th>'
 		'<th style="text-align: right; padding: 4px 8px; '
 		'border-bottom: 1px solid #e5e7eb;">hits</th>'
+		# v0.7.x: unit suffixes ("total ms" / "per hit µs") dropped —
+		# the cells now flow through ``_format_duration_ms`` which
+		# emits the unit itself ("ms" or "s") and highlights values
+		# that cross the 1s threshold. The header just labels the
+		# field; the cell carries the unit.
 		'<th style="text-align: right; padding: 4px 8px; '
-		'border-bottom: 1px solid #e5e7eb;">total ms</th>'
+		'border-bottom: 1px solid #e5e7eb;">total</th>'
 		'<th style="text-align: right; padding: 4px 8px; '
-		'border-bottom: 1px solid #e5e7eb;">per hit µs</th>'
+		'border-bottom: 1px solid #e5e7eb;">per hit</th>'
 		'<th style="text-align: left; padding: 4px 8px; '
 		'border-bottom: 1px solid #e5e7eb;">source</th>'
 		'</tr></thead><tbody>'
@@ -705,12 +1238,18 @@ def _render_phase2_function_table(fn: dict) -> str:
 		source_cell = (
 			f'<code style="white-space: pre;">{_e(line.get("content", ""))}</code>'
 		)
+		# v0.7.x: honour the report-wide timing rule. ``_format_duration_ms``
+		# returns Markup with the ``<span class="time-high">…</span>``
+		# highlight when the value crosses the 1s threshold; sub-1s values
+		# render plain. ``per_hit_us`` is microseconds — convert to ms first
+		# so the same rule applies in the same unit-scale.
+		per_hit_ms = (line.get("per_hit_us") or 0) / 1000.0
 		html.append(
 			f'<tr style="{row_style}">'
 			f'<td style="text-align: right; padding: 2px 8px; color: #6b7280;">{line.get("lineno", "")}</td>'
 			f'<td style="text-align: right; padding: 2px 8px;">{line.get("hits", 0)}</td>'
-			f'<td style="text-align: right; padding: 2px 8px;">{ms:.2f}</td>'
-			f'<td style="text-align: right; padding: 2px 8px;">{(line.get("per_hit_us") or 0):.2f}</td>'
+			f'<td style="text-align: right; padding: 2px 8px;">{_format_duration_ms(ms, decimals=2)}</td>'
+			f'<td style="text-align: right; padding: 2px 8px;">{_format_duration_ms(per_hit_ms, decimals=2)}</td>'
 			f'<td style="padding: 2px 8px;">{source_cell}</td>'
 			'</tr>'
 		)
@@ -854,9 +1393,9 @@ def _render_phase2_panel(session_doc: Any) -> str:
 		}
 
 	html = [
-		'<section style="margin-top: 32px; padding: 16px; '
+		'<details class="section" style="margin-top: 32px; padding: 16px; '
 		'border: 1px solid #d1d5db; border-radius: 6px; background: #ffffff;">',
-		'<h2 style="margin: 0 0 8px 0;">Phase 2: Line-Level Drilldown</h2>',
+		'<summary><h2 style="margin: 0 0 8px 0;">Phase 2: Line-Level Drilldown</h2></summary>',
 		'<div style="background: #fef3c7; border-left: 4px solid #f59e0b; '
 		'padding: 8px 12px; margin-bottom: 16px; font-size: 13px;">'
 		'Phase 2 captures only the flow you ran during the line-profile '
@@ -916,7 +1455,7 @@ def _render_phase2_panel(session_doc: Any) -> str:
 			html.append(_render_phase2_diff_table(diff_meta["rows"]))
 			html.append('</div>')
 
-	html.append('</section>')
+	html.append('</details>')
 	return "".join(html)
 
 
@@ -1043,6 +1582,10 @@ def build_background_jobs(actions, recordings_by_uuid, findings=None) -> dict:
 			"top_queries": top_queries,
 			"recording_available": rec is not None,
 			"entry_callsite": a.get("entry_callsite"),  # pre-computed in render()
+			# v0.7.x: keep the original action index so render() can
+			# attach ``related_findings`` (the actual list of finding
+			# objects, not just the count) for embedding in the row.
+			"idx": idx,
 		})
 
 	jobs.sort(key=lambda j: -(j.get("duration_ms") or 0))
@@ -1148,7 +1691,9 @@ def _finding_to_dict(child: Any, file_cache: dict | None = None) -> dict:
 			if _cs:
 				detail["callsite"] = _cs
 		elif _ftype == "Function Not Invoked" and detail.get("dotted_path"):
-			_resolved = _resolve_dotted_to_code(detail["dotted_path"])
+			_resolved = _resolve_dotted_to_code(
+				detail["dotted_path"], file_cache=file_cache,
+			)
 			if _resolved:
 				_abs, _ln, _name = _resolved
 				detail["callsite"] = {
@@ -1394,9 +1939,13 @@ def _attach_drilldown_chains(findings, actions, tracked_apps: tuple[str, ...] = 
 		if not tree:
 			continue
 		chain = _walk_drilldown_chain(tree, callsite, tracked_apps=tracked_apps)
-		if chain:
-			detail["drilldown_chain"] = chain
-			finding["technical_detail"] = detail
+		# v0.7.x: always attach the chain — even empty. The template
+		# distinguishes "key absent" (no callsite/action/tree, never
+		# attempted) from "empty list" (attempted but no eligible
+		# user-code descendants) to decide whether to render a "no
+		# deeper user-code frame" placeholder in place of the chain.
+		detail["drilldown_chain"] = chain
+		finding["technical_detail"] = detail
 
 
 def _attach_representative_callsites(findings, recordings, *, file_cache: dict | None = None) -> None:
@@ -1984,7 +2533,65 @@ def _action_dotted_entry(action) -> str | None:
 	return None
 
 
-def _resolve_dotted_to_code(dotted) -> tuple[str, int, str] | None:
+def _skip_decorators_to_def(
+	abs_filename: str,
+	start_lineno: int,
+	fn_name: str,
+	*,
+	cache: dict | None = None,
+) -> int:
+	"""Return the lineno of ``def <fn_name>`` / ``async def <fn_name>``
+	at or after ``start_lineno`` in ``abs_filename``. Returns
+	``start_lineno`` unchanged when the line at ``start_lineno`` isn't
+	a decorator OR no matching def is found within 30 lines.
+
+	On CPython 3.11+, ``code.co_firstlineno`` for a decorated function
+	points at the first **decorator** line rather than the ``def``
+	line. Every Frappe API endpoint is ``@frappe.whitelist``-decorated,
+	so without this skip the Per-Action breakdown's entry-callsite
+	snippets all highlight ``@frappe.whitelist(...)`` instead of the
+	actual signature below it.
+
+	Reads through ``cache`` (the shared per-render file_cache) when
+	available so multiple decorated functions in the same file don't
+	each re-read the source.
+	"""
+	if not abs_filename or start_lineno <= 0 or not fn_name:
+		return start_lineno
+	# Read source (cache-aware).
+	if cache is not None and abs_filename in cache:
+		lines = cache[abs_filename]
+	else:
+		try:
+			with open(abs_filename, encoding="utf-8") as fh:
+				lines = fh.read().splitlines()
+		except Exception:
+			lines = None
+		if cache is not None:
+			cache[abs_filename] = lines
+	if not lines or start_lineno > len(lines):
+		return start_lineno
+	# Cheap early exit: the line at start_lineno isn't a decorator →
+	# nothing to skip.
+	first = lines[start_lineno - 1].lstrip()
+	if not first.startswith("@"):
+		return start_lineno
+	# Scan forward (≤ 30 lines) for the def line.
+	pat = re.compile(
+		r"^\s*(?:async\s+)?def\s+" + re.escape(fn_name) + r"\b"
+	)
+	last = min(len(lines), start_lineno + 30)
+	for i in range(start_lineno, last):
+		if pat.match(lines[i]):
+			return i + 1  # convert 0-indexed to 1-indexed lineno
+	return start_lineno  # no def found — fall back to original
+
+
+def _resolve_dotted_to_code(
+	dotted,
+	*,
+	file_cache: dict | None = None,
+) -> tuple[str, int, str] | None:
 	"""Resolve a dotted module path to ``(abs_filename, lineno, func_name)``.
 
 	Uses ``importlib`` directly — NOT ``frappe.get_attr`` — because the
@@ -1994,6 +2601,12 @@ def _resolve_dotted_to_code(dotted) -> tuple[str, int, str] | None:
 	rest), minus its eligibility checks. ``inspect.unwrap`` sees through
 	``functools.wraps`` decorators (e.g. ``@frappe.whitelist``). Returns
 	``None`` on any failure — never raises.
+
+	v0.7.x: when ``code.co_firstlineno`` points at a decorator line
+	(CPython 3.11+ behavior for decorated functions), the lineno is
+	advanced to the ``def`` line via ``_skip_decorators_to_def`` so
+	the callsite snippet anchors on the function signature rather
+	than ``@frappe.whitelist(...)``.
 	"""
 	if not dotted or "." not in str(dotted):
 		return None
@@ -2024,11 +2637,12 @@ def _resolve_dotted_to_code(dotted) -> tuple[str, int, str] | None:
 		lineno = code.co_firstlineno or 0
 		if not filename or filename.startswith("<") or lineno <= 0:
 			return None  # Server Script / eval'd code / bogus
-		return (
-			os.path.abspath(filename),
-			int(lineno),
-			getattr(obj, "__name__", "") or "",
+		abs_path = os.path.abspath(filename)
+		fn_name = getattr(obj, "__name__", "") or ""
+		lineno = _skip_decorators_to_def(
+			abs_path, int(lineno), fn_name, cache=file_cache,
 		)
+		return (abs_path, int(lineno), fn_name)
 	except Exception:
 		return None
 
@@ -2065,7 +2679,7 @@ def _action_entry_callsite(action, *, cache: dict | None = None) -> dict | None:
 	dotted = _action_dotted_entry(action)
 	if not dotted:
 		return None
-	resolved = _resolve_dotted_to_code(dotted)
+	resolved = _resolve_dotted_to_code(dotted, file_cache=cache)
 	if not resolved:
 		return None
 	abs_path, lineno, name = resolved
@@ -2117,7 +2731,7 @@ def _resolve_frame_key_to_callsite(function_key, *, cache: dict | None = None) -
 			norm = norm[:-3]
 		dotted = norm.replace("/", ".").strip(".")
 		if dotted:
-			resolved = _resolve_dotted_to_code(f"{dotted}.{func}")
+			resolved = _resolve_dotted_to_code(f"{dotted}.{func}", file_cache=cache)
 			if resolved:
 				abs_path, lineno, name = resolved
 				return {
@@ -2217,10 +2831,11 @@ def _build_executive_summary(
 	findings: list[dict],
 	session_doc: Any,
 	v5: dict,
+	large_duration_threshold_ms: float = 1000.0,
 ) -> dict:
 	"""Return a dict shaped for the template's exec-summary card.
 
-	Shape: ``{"headline": str, "bullets": list[str], "show": bool}``
+	Shape: ``{"headline": Markup, "bullets": list[str], "show": bool}``
 
 	``show`` is False when there's nothing meaningful to summarize —
 	e.g. a clean session with no findings. The template renders the
@@ -2241,10 +2856,22 @@ def _build_executive_summary(
 	queries_per_action = (
 		round(total_queries / total_actions, 1) if total_actions else 0
 	)
-	headline = (
-		f"This session took {int(total_ms)}ms across {total_actions} "
-		f"operation{'s' if total_actions != 1 else ''} "
-		f"— {int(total_queries)} database queries, ~{queries_per_action} per operation."
+	# v0.7.x: honour the timing rule for the headline duration. The
+	# helper returns Markup (always — for ms / s / "0ms" branches), so
+	# we build the headline as Markup.format(...) — that escapes the
+	# plain-string args while passing the Markup duration through
+	# unchanged, keeping the <span class="time-high">…</span> intact
+	# under Jinja autoescape.
+	duration_html = _format_duration_ms(total_ms, large_duration_threshold_ms)
+	headline = Markup(
+		"This session took {duration} across {actions} operation{plural} "
+		"— {queries} database queries, ~{qpa} per operation."
+	).format(
+		duration=duration_html,
+		actions=total_actions,
+		plural="s" if total_actions != 1 else "",
+		queries=int(total_queries),
+		qpa=queries_per_action,
 	)
 
 	# Pull the top 3 findings by estimated_impact_ms (already sorted
@@ -2489,12 +3116,16 @@ def _bucket_findings_by_app(
 	remainder.sort(key=lambda a: (-_impact(a), a))
 	ordered.extend(remainder)
 
-	# Tail buckets always last — user-app findings come first.
-	# Hotspots before Other because they're at least typed.
+	# Tail buckets — user-app findings come first.
+	# "Request hotspots" (hot-path findings that lost their callsite to
+	# pyinstrument's collapsing but are still typed) is kept; the
+	# generic "Other (no callsite)" bucket is suppressed entirely
+	# (v0.7.x). Findings binned into that label are typically the
+	# residue of analyzer paths that couldn't attach a representative
+	# callsite — surfacing them as a generic tail bucket added noise
+	# without an actionable file:line for the developer.
 	if _HOTPATH_BUCKET_LABEL in buckets:
 		ordered.append(_HOTPATH_BUCKET_LABEL)
-	if _OTHER_APP_LABEL in buckets:
-		ordered.append(_OTHER_APP_LABEL)
 
 	out = []
 	for app in ordered:
@@ -2518,7 +3149,7 @@ def _now_iso() -> str:
 	return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _format_duration_ms(ms, threshold_ms: float = 1000.0, decimals: int = 0) -> str:
+def _format_duration_ms(ms, threshold_ms: float = 1000.0, decimals: int = 0):
 	"""Render a duration as ``"<n>ms"`` (with ``decimals`` digits) — or, if it
 	crosses ``threshold_ms``, as ``"<n.nn>s"`` (always 2 decimals). The
 	``decimals`` arg controls only the ms branch so the existing ``%.1f`` /
@@ -2526,14 +3157,22 @@ def _format_duration_ms(ms, threshold_ms: float = 1000.0, decimals: int = 0) -> 
 	threshold. ``threshold_ms = 0`` disables the conversion.
 
 	Defensive on input: ``None`` / non-numeric → ``"0ms"``; honours sign.
+
+	v0.7.x: returns ``markupsafe.Markup`` so the seconds branch can
+	emit a ``<span class="time-high">`` wrapper without being escaped
+	when rendered via ``{{ fmt_ms(...) }}`` in Jinja. The wrapper draws
+	the reader's eye to values slow enough to roll over into seconds —
+	the timing rule itself is unchanged, just the visual emphasis is
+	new. ``Markup`` subclasses ``str`` so Python callers that compare /
+	concat the return value still work.
 	"""
 	try:
 		v = float(ms) if ms is not None else 0.0
 	except (TypeError, ValueError):
-		return "0ms"
+		return Markup("0ms")
 	if threshold_ms and abs(v) >= threshold_ms:
-		return f"{v / 1000:.2f}s"
-	return f"{v:.{decimals}f}ms"
+		return Markup(f'<span class="time-high">{v / 1000:.2f}s</span>')
+	return Markup(f"{v:.{decimals}f}ms")
 
 
 def _format_datetime_display(value) -> str:

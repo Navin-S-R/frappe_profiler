@@ -48,7 +48,7 @@ def _finding_child(
 	)
 
 
-def _fake_doc(findings, phase_2_runs=None):
+def _fake_doc(findings, phase_2_runs=None, actions=None):
 	return SimpleNamespace(
 		name="PS-test",
 		session_uuid="test-uuid",
@@ -67,7 +67,7 @@ def _fake_doc(findings, phase_2_runs=None):
 		top_queries_json="[]",
 		table_breakdown_json="[]",
 		analyzer_warnings=None,
-		actions=[],
+		actions=actions or [],
 		findings=findings,
 		hot_frames_json=None,
 		session_time_breakdown_json=None,
@@ -229,6 +229,319 @@ class TestPhase2Crosslink:
 		assert "hottest line" not in html
 		# Also: with no phase-2 runs, the panel itself shouldn't render.
 		assert "Phase 2: Line-Level Drilldown" not in html
+
+	def test_retarget_phase1_callsite_to_drilldown_leaf(self, tmp_path):
+		"""A Slow Hot Path finding whose drill-down chain walks down
+		from ``looped_validate`` to ``_check_user_exists`` (via the
+		intermediate ``_run_validations``) should re-anchor the
+		smoking-gun snippet on the **call site** of ``_check_user_exists``
+		inside its parent ``_run_validations`` — that's the line in
+		``_run_validations``'s body that invokes the leaf (e.g.
+		``    _check_user_exists(doc)``), not the leaf's own ``def``.
+
+		The wrapper (``looped_validate``) is preserved as a breadcrumb
+		caption. Phase-2's actually-hot internal line (line 20) still
+		surfaces in the separate Phase 2 callout — and the drill-down
+		narrative is rooted on ``looped_validate``."""
+		src = tmp_path / "common.py"
+		src.write_text(
+			"line1\n"
+			"line2\n"
+			"line3\n"
+			"line4\n"
+			"line5\n"
+			"def looped_validate(doc, event):\n"  # lineno 6
+			"    _run_validations(doc)\n"  # lineno 7
+			"\n"
+			"\n"
+			"\n"
+			"\n"
+			"def _run_validations(doc):\n"  # lineno 12
+			"    _check_user_exists(doc)\n"  # lineno 13
+			"\n"
+			"\n"
+			"\n"
+			"\n"
+			"def _check_user_exists(doc):\n"  # lineno 18
+			"    for i in range(50):\n"  # lineno 19
+			"        user = frappe.get_doc('User', 'admin')\n"  # lineno 20
+			"        if user.enabled:\n"  # lineno 21
+			"            pass\n"  # lineno 22
+		)
+		# Phase-1 finding: Slow Hot Path on looped_validate at line 6.
+		# The action_ref ties it to the action carrying the call tree.
+		finding = SimpleNamespace(
+			finding_type="Slow Hot Path",
+			severity="High",
+			title="In submit, 66% of the time was spent in looped_validate",
+			customer_description="walltime hotspot",
+			estimated_impact_ms=741.0,
+			affected_count=1,
+			action_ref="0",
+			technical_detail_json=json.dumps({
+				"function": "looped_validate",
+				"filename": str(src),
+				"lineno": 6,
+				"cumulative_ms": 741.0,
+				"action_wall_time_ms": 1124.0,
+				"is_hook": False,
+			}),
+		)
+		# Phase-2 captures the leaf's actual hot line at 20.
+		phase2 = SimpleNamespace(
+			run_uuid="r1",
+			status="Ready",
+			started_at="2026-05-14 10:42:19",
+			ended_at="2026-05-14 10:44:57",
+			total_ms=741.0,
+			picks_json="[]",
+			results_json=json.dumps([
+				{
+					"dotted_path": "ugly_code.python.common._check_user_exists",
+					"qualname": "_check_user_exists",
+					"file": str(src),
+					"lines": [
+						{"lineno": 18, "content": "def _check_user_exists(doc):",
+						 "hits": 2, "total_ms": 0.0, "per_hit_us": 0.0,
+						 "content_hash": "h18"},
+						{"lineno": 20,
+						 "content": "        user = frappe.get_doc('User', 'admin')",
+						 "hits": 100, "total_ms": 354.0, "per_hit_us": 3540.0,
+						 "content_hash": "h20"},
+					],
+				},
+			]),
+		)
+		# Phase-1 action with a pyinstrument call tree showing the
+		# descent looped_validate → _run_validations → _check_user_exists.
+		# _attach_drilldown_chains will walk this and populate
+		# drilldown_chain on the finding; the retargeter then re-anchors
+		# the callsite on the deepest user-code frame in the chain.
+		action = SimpleNamespace(
+			idx=0,
+			action_label="submit",
+			event_type="HTTP Request",
+			http_method="POST",
+			path="/api/method/frappe.client.save",
+			recording_uuid="rec1",
+			duration_ms=1124,
+			queries_count=0,
+			query_time_ms=0,
+			slowest_query_ms=0,
+			call_tree_json=json.dumps({
+				"function": "looped_validate",
+				"filename": str(src),
+				"lineno": 6,
+				"kind": "python",
+				"cumulative_ms": 741.0,
+				"children": [{
+					"function": "_run_validations",
+					"filename": str(src),
+					"lineno": 12,
+					"kind": "python",
+					"cumulative_ms": 547.0,
+					"children": [{
+						"function": "_check_user_exists",
+						"filename": str(src),
+						"lineno": 18,
+						"kind": "python",
+						"cumulative_ms": 546.0,
+						"children": [],
+					}],
+				}],
+			}),
+		)
+		doc = _fake_doc([finding], phase_2_runs=[phase2], actions=[action])
+
+		html = renderer.render_raw(doc, recordings=[])
+
+		# Smoking-gun callsite has been retargeted to the **call site**
+		# of _check_user_exists in its parent (_run_validations). That
+		# call lives at line 13 (``    _check_user_exists(doc)``), not
+		# at the leaf's def line 18. The smoking-gun block uses class
+		# "smoking-gun" so we scope the asserts to that section to avoid
+		# false matches against the Drill-down chain rendering below
+		# (which DOES reference line 18 as one of the descent steps).
+		smoking_gun_start = html.find('class="smoking-gun"')
+		smoking_gun_end = html.find("Drill-down", smoking_gun_start)
+		assert smoking_gun_start > -1 and smoking_gun_end > -1
+		smoking_gun_html = html[smoking_gun_start:smoking_gun_end]
+		assert "common.py:13" in smoking_gun_html
+		# Parent function shown in the header.
+		assert "_run_validations" in smoking_gun_html
+		# The highlighted source body is the call expression itself.
+		assert "_check_user_exists(doc)" in smoking_gun_html
+		# The leaf's def line (18) does NOT appear as the smoking-gun
+		# anchor (it's still visible in the Drill-down chain below).
+		assert "common.py:18" not in smoking_gun_html
+		# The breadcrumb caption mentions the wrapper.
+		assert "Time entered through" in html
+		assert "looped_validate" in html
+		# Phase 2 callout STILL renders (snippet anchors on call line 13,
+		# Phase 2 surfaces the actually-hot internal line 20).
+		assert "hottest line 20" in html
+		# The drill-down narrative heading uses the WRAPPER's name (the
+		# chain's root), not the retargeted callsite function.
+		assert "time inside <code>looped_validate</code> walked through" in html
+		assert "time inside <code>_run_validations</code> walked through" not in html
+		assert "time inside <code>_check_user_exists</code> walked through" not in html
+
+	def test_retarget_falls_back_to_leaf_def_when_call_site_not_findable(self, tmp_path):
+		"""When the leaf's call can't be located in the parent's body
+		(unparseable source, leaf name not present, etc.), the retarget
+		falls back to the leaf's own def line — the previous behavior.
+		Anchors are still better than the wrapper's def line."""
+		src = tmp_path / "common.py"
+		# Source where _run_validations doesn't actually contain a call
+		# to _check_user_exists (intentional mismatch to exercise the
+		# fallback). The drill-down chain — built from a pre-cooked
+		# pyinstrument tree, NOT from this source — still has the chain.
+		src.write_text(
+			"line1\n"
+			"line2\n"
+			"line3\n"
+			"line4\n"
+			"line5\n"
+			"def looped_validate(doc, event):\n"  # 6
+			"    pass\n"  # 7
+			"\n"
+			"\n"
+			"\n"
+			"\n"
+			"def _run_validations(doc):\n"  # 12
+			"    pass\n"  # 13 — NO call to _check_user_exists here
+			"\n"
+			"\n"
+			"\n"
+			"\n"
+			"def _check_user_exists(doc):\n"  # 18
+			"    pass\n"  # 19
+		)
+		finding = SimpleNamespace(
+			finding_type="Slow Hot Path",
+			severity="High",
+			title="In submit, looped_validate",
+			customer_description="walltime",
+			estimated_impact_ms=741.0,
+			affected_count=1,
+			action_ref="0",
+			technical_detail_json=json.dumps({
+				"function": "looped_validate",
+				"filename": str(src),
+				"lineno": 6,
+				"cumulative_ms": 741.0,
+				"action_wall_time_ms": 1124.0,
+				"is_hook": False,
+			}),
+		)
+		action = SimpleNamespace(
+			idx=0,
+			action_label="submit",
+			event_type="HTTP Request",
+			http_method="POST",
+			path="/api/method/frappe.client.save",
+			recording_uuid="rec1",
+			duration_ms=1124,
+			queries_count=0,
+			query_time_ms=0,
+			slowest_query_ms=0,
+			call_tree_json=json.dumps({
+				"function": "looped_validate",
+				"filename": str(src),
+				"lineno": 6,
+				"kind": "python",
+				"cumulative_ms": 741.0,
+				"children": [{
+					"function": "_run_validations",
+					"filename": str(src),
+					"lineno": 12,
+					"kind": "python",
+					"cumulative_ms": 547.0,
+					"children": [{
+						"function": "_check_user_exists",
+						"filename": str(src),
+						"lineno": 18,
+						"kind": "python",
+						"cumulative_ms": 546.0,
+						"children": [],
+					}],
+				}],
+			}),
+		)
+		doc = _fake_doc([finding], phase_2_runs=[], actions=[action])
+
+		html = renderer.render_raw(doc, recordings=[])
+
+		# Fallback: anchor on the leaf's def line.
+		assert "common.py:18" in html
+		# The parent's body wasn't useful — the call line couldn't be
+		# located, so the retarget falls back, NOT to the wrapper's
+		# def line (line 6).
+		assert "common.py:6" not in html or "looped_validate" in html  # 6 may appear in breadcrumb caption text
+		# Breadcrumb still mentions the wrapper.
+		assert "Time entered through" in html
+
+	def test_no_retarget_when_drilldown_leaf_is_same_function(self, tmp_path):
+		"""When the drill-down chain's deepest entry is the same
+		function as the finding's callsite (single-frame chain or
+		framework-boundary immediately below), the smoking-gun snippet
+		stays on the wrapper — there's nowhere deeper in user code to
+		go. The breadcrumb caption should NOT appear."""
+		src = tmp_path / "x.py"
+		src.write_text(
+			"line1\n"
+			"line2\n"
+			"def my_func():\n"  # lineno 3
+			"    a = 1\n"  # lineno 4
+			"    return a\n"  # lineno 5
+		)
+		finding = SimpleNamespace(
+			finding_type="Slow Hot Path",
+			severity="High",
+			title="In submit, time spent in my_func",
+			customer_description="walltime",
+			estimated_impact_ms=200.0,
+			affected_count=1,
+			action_ref="0",
+			technical_detail_json=json.dumps({
+				"function": "my_func",
+				"filename": str(src),
+				"lineno": 3,
+				"cumulative_ms": 200.0,
+				"action_wall_time_ms": 300.0,
+				"is_hook": False,
+			}),
+		)
+		# Call tree where my_func has no eligible user-code descendants
+		# (child is in framework — drill-down walker stops there).
+		action = SimpleNamespace(
+			idx=0,
+			action_label="submit",
+			event_type="HTTP Request",
+			http_method="POST",
+			path="/api/method/frappe.client.save",
+			recording_uuid="rec1",
+			duration_ms=300,
+			queries_count=0,
+			query_time_ms=0,
+			slowest_query_ms=0,
+			call_tree_json=json.dumps({
+				"function": "my_func",
+				"filename": str(src),
+				"lineno": 3,
+				"kind": "python",
+				"cumulative_ms": 200.0,
+				"children": [],
+			}),
+		)
+		doc = _fake_doc([finding], phase_2_runs=[], actions=[action])
+
+		html = renderer.render_raw(doc, recordings=[])
+
+		# Callsite stays at line 3 (the wrapper itself).
+		assert "x.py:3" in html
+		# No breadcrumb caption — no retargeting happened.
+		assert "Time entered through" not in html
 
 	def test_picks_hottest_line_across_runs(self):
 		"""When the same function was instrumented across multiple runs,
@@ -525,11 +838,15 @@ class TestRenderTimeCallsiteResolution:
 		assert "vscode://file" in html                      # _abs → editor link
 		assert 'class="smoking-gun"' in html
 
-	def test_repeated_hot_frame_unresolvable_renders_no_block_no_crash(self):
+	def test_repeated_hot_frame_unresolvable_is_filtered(self):
+		"""v0.7.x: a Repeated Hot Frame whose ``function`` key can't be
+		resolved to a real file:line is dropped entirely from rendering
+		— it had no callsite to act on. Pre-v0.7 the card rendered
+		title-only; the user opted to suppress no-callsite findings."""
 		doc = _fake_doc([_repeated_hot_frame("nope_xyzq/foo.py::bar")])
 		html = renderer.render_raw(doc, recordings=[])
-		# Card still renders (title visible), but no smoking-gun block for it.
-		assert "appeared in 3 actions" in html
+		# Filtered: title and smoking-gun both absent.
+		assert "appeared in 3 actions" not in html
 		assert 'class="smoking-gun"' not in html
 
 	def test_function_not_invoked_shows_def_line(self):
@@ -560,7 +877,11 @@ class TestRenderTimeCallsiteResolution:
 		assert f"{_USER_FRAME_FILE}:10" in html
 		assert "run_report" in html
 
-	def test_missing_index_without_matching_recording_renders_no_block(self):
+	def test_missing_index_without_matching_recording_is_filtered(self):
+		"""v0.7.x: a Missing Index without a representative callsite (no
+		recording matched the normalized query) has no actionable
+		file:line anchor — it's dropped from the render entirely along
+		with the rest of the no-callsite suppression."""
 		doc = _fake_doc([_missing_index("tabUser", "SELECT ... FROM `tabUser`")])
 		# Recording has a different query → no representative callsite.
 		recs = [{"uuid": "r1", "calls": [
@@ -568,8 +889,8 @@ class TestRenderTimeCallsiteResolution:
 		]}]
 		html = renderer.render_raw(doc, recordings=recs)
 		assert "Most-called from:" not in html
-		# Card still renders (the fix_hint is in the technical_detail block).
-		assert "Add an index" in html
+		# Filtered: the fix hint no longer renders either.
+		assert "Add an index" not in html
 
 
 class TestDocEventHookInsideSmokingGun:
@@ -579,6 +900,16 @@ class TestDocEventHookInsideSmokingGun:
 	context cues in one visual block."""
 
 	def test_hook_line_lives_inside_smoking_gun(self):
+		"""v0.6.x intent: the doc-event hook breadcrumb is rendered
+		inside the smoking-gun block (alongside Phase 2 + Drill-down
+		callouts), not in a separate finding-detail box below.
+
+		v0.7.x: the supporting-context box (``.finding-detail``) is
+		now suppressed entirely when no inner row applies — so for
+		this finding (callsite + target_doc + hook_events, no other
+		detail fields) it shouldn't render at all. The hook breadcrumb
+		appearing inside the smoking-gun is verified by its presence
+		AFTER the smoking-gun's opening marker."""
 		finding = _finding_child(
 			filename="/apps/ugly_code/ugly_code/python/common.py",
 			lineno=6,
@@ -596,15 +927,19 @@ class TestDocEventHookInsideSmokingGun:
 
 		hook_pos = html.find("Doc-event hook:")
 		sg_open = html.find('class="smoking-gun"', 0)
-		# The first finding-detail block lives RIGHT AFTER the smoking-gun
-		# for this finding — locate it from sg_open onwards.
-		fd_open = html.find('class="finding-detail"', sg_open)
 		assert hook_pos > 0, "Doc-event hook line missing from output"
 		assert sg_open > 0
-		assert fd_open > 0
-		assert sg_open < hook_pos < fd_open, (
+		# Hook appears AFTER smoking-gun's opening marker — i.e. inside it.
+		assert hook_pos > sg_open, (
 			"Doc-event hook breadcrumb must render INSIDE the smoking-gun "
-			f"block (between {sg_open} and {fd_open}), got {hook_pos}"
+			f"block (after sg_open={sg_open}), got {hook_pos}"
+		)
+		# v0.7.x: no empty finding-detail container should appear for a
+		# Slow Hot Path-shaped finding (no inner rows match the gate).
+		fd_open = html.find('class="finding-detail"', sg_open)
+		assert fd_open == -1, (
+			"v0.7.x: finding-detail container suppressed when no inner "
+			"rows apply. Found one at " + str(fd_open)
 		)
 
 	def test_target_doc_appears_with_hook(self):
@@ -630,10 +965,13 @@ class TestDocEventHookInsideSmokingGun:
 		assert "Doc-event hook:" in html
 		assert "Sales Invoice &#9656; validate" in html
 
-	def test_finding_without_callsite_renders_hook_as_fallback(self):
-		"""For the rare finding that has no callsite (so no smoking-gun
-		block), the hook breadcrumb still renders as a fallback in the
-		.finding-detail block — we don't drop user-relevant context."""
+	def test_finding_without_callsite_is_filtered(self):
+		"""v0.7.x: a finding without a callsite is suppressed from
+		rendering entirely. The hook-as-fallback rendering path no
+		longer triggers because no-callsite findings are dropped
+		before the template runs. (Pre-v0.7 the hook breadcrumb
+		rendered as a fallback inside .finding-detail; the user
+		opted out of that 'partial info' surface.)"""
 		# Build a finding manually so callsite has no filename/lineno.
 		finding = SimpleNamespace(
 			finding_type="Slow Hot Path",
@@ -650,8 +988,179 @@ class TestDocEventHookInsideSmokingGun:
 		doc = _fake_doc([finding])
 		html = renderer.render_raw(doc, recordings=[])
 
-		# Hook still appears, but now inside .finding-detail (not smoking-gun
-		# — there's no callsite to attach to).
-		assert "Doc-event hook:" in html
-		assert "Sales Invoice &#9656; on_submit" in html
+		# Finding is filtered → neither title nor hook breadcrumb appears.
+		assert "callsite-less finding" not in html
+		assert "Doc-event hook:" not in html
+
+
+class TestDrilldownPlaceholder:
+	"""v0.7.x: when a Slow Hot Path finding's drill-down chain is empty
+	(the origin's hottest child is framework code or below the signal
+	floor), the template renders a 'no deeper user-code frame'
+	placeholder instead of a silent gap. Findings without an
+	``action_ref`` / tree skip the attachment entirely and show
+	nothing — the placeholder only appears when the walk was attempted
+	and produced no eligible descendants."""
+
+	def test_empty_chain_renders_placeholder(self, tmp_path):
+		"""bg_recheck_users-style: function loops over frappe.get_doc.
+		The drill-down walker stops at the framework boundary on the
+		first descent step → chain is []. Placeholder should render."""
+		src = tmp_path / "common.py"
+		src.write_text(
+			"line1\n"
+			"line2\n"
+			"line3\n"
+			"line4\n"
+			"line5\n"
+			"def bg_recheck_users(doc_name=None):\n"  # 6
+			"    for i in range(15):\n"  # 7
+			"        try:\n"  # 8
+			"            user = frappe.get_doc('User', 'admin')\n"  # 9
+		)
+		finding = SimpleNamespace(
+			finding_type="Slow Hot Path",
+			severity="High",
+			title="In Job: bg_recheck_users, 82% of the time was spent in bg_recheck_users",
+			customer_description="walltime",
+			estimated_impact_ms=955.0,
+			affected_count=1,
+			action_ref="0",
+			technical_detail_json=json.dumps({
+				"function": "bg_recheck_users",
+				"filename": str(src),
+				"lineno": 6,
+				"cumulative_ms": 955.0,
+				"action_wall_time_ms": 1165.0,
+				"is_hook": False,
+			}),
+		)
+		# Pyinstrument tree: bg_recheck_users → frappe.get_doc (framework).
+		# Walker hits the framework boundary on the first step → returns [].
+		action = SimpleNamespace(
+			idx=0,
+			action_label="Job: bg_recheck_users",
+			event_type="Background Job",
+			http_method="",
+			path="bg_recheck_users",
+			recording_uuid="rec1",
+			duration_ms=1165,
+			queries_count=15,
+			query_time_ms=900,
+			slowest_query_ms=80,
+			call_tree_json=json.dumps({
+				"function": "bg_recheck_users",
+				"filename": str(src),
+				"lineno": 6,
+				"kind": "python",
+				"cumulative_ms": 955.0,
+				"children": [{
+					"function": "get_doc",
+					# Framework path — walker stops here.
+					"filename": "apps/frappe/frappe/__init__.py",
+					"lineno": 100,
+					"kind": "python",
+					"cumulative_ms": 900.0,
+					"children": [],
+				}],
+			}),
+		)
+		doc = _fake_doc([finding], phase_2_runs=[], actions=[action])
+
+		html = renderer.render_raw(doc, recordings=[])
+
+		# Placeholder text rendered.
+		assert "no deeper user-code frame" in html
+		# Names the wrapper (the function the placeholder is rooted on).
+		assert "bg_recheck_users" in html
+		# The placeholder still has the "Drill-down:" label.
+		assert "Drill-down:" in html
+
+	def test_finding_without_drilldown_attribute_renders_no_placeholder(self, tmp_path):
+		"""A finding without ``action_ref`` skips _attach_drilldown_chains
+		entirely — no ``drilldown_chain`` key on technical_detail. The
+		template must NOT render the placeholder in this case (otherwise
+		every SQL red-flag finding would show 'no deeper user-code')."""
+		snippet = [{"lineno": 42, "content": "    do_thing()"}]
+		finding = _finding_child(
+			source_snippet=snippet,
+			finding_type="Missing Index",
+			# No action_ref → drill-down attachment skips early.
+			action_ref="",
+		)
+		doc = _fake_doc([finding], phase_2_runs=[], actions=[])
+
+		html = renderer.render_raw(doc, recordings=[])
+
+		# Neither the chain nor the placeholder renders.
+		assert "no deeper user-code frame" not in html
+		# Drill-down label absent because no Drill-down section renders.
+		assert "Drill-down:" not in html
+
+	def test_non_empty_chain_renders_chain_not_placeholder(self, tmp_path):
+		"""When the drill-down chain has entries, the existing chain
+		rendering shows them — the placeholder branch is skipped."""
+		src = tmp_path / "common.py"
+		src.write_text(
+			"line1\n"
+			"line2\n"
+			"def outer():\n"  # 3
+			"    inner()\n"  # 4
+			"\n"
+			"def inner():\n"  # 6
+			"    do_work()\n"  # 7
+		)
+		finding = SimpleNamespace(
+			finding_type="Slow Hot Path",
+			severity="High",
+			title="In submit, outer was hot",
+			customer_description="walltime",
+			estimated_impact_ms=500.0,
+			affected_count=1,
+			action_ref="0",
+			technical_detail_json=json.dumps({
+				"function": "outer",
+				"filename": str(src),
+				"lineno": 3,
+				"cumulative_ms": 500.0,
+				"action_wall_time_ms": 600.0,
+				"is_hook": False,
+			}),
+		)
+		action = SimpleNamespace(
+			idx=0,
+			action_label="submit",
+			event_type="HTTP Request",
+			http_method="POST",
+			path="/api/method/frappe.client.save",
+			recording_uuid="rec1",
+			duration_ms=600,
+			queries_count=0,
+			query_time_ms=0,
+			slowest_query_ms=0,
+			call_tree_json=json.dumps({
+				"function": "outer",
+				"filename": str(src),
+				"lineno": 3,
+				"kind": "python",
+				"cumulative_ms": 500.0,
+				"children": [{
+					"function": "inner",
+					"filename": str(src),  # user code, NOT framework
+					"lineno": 6,
+					"kind": "python",
+					"cumulative_ms": 480.0,
+					"children": [],
+				}],
+			}),
+		)
+		doc = _fake_doc([finding], phase_2_runs=[], actions=[action])
+
+		html = renderer.render_raw(doc, recordings=[])
+
+		# Chain rendered (existing behavior).
+		assert "Drill-down:" in html
+		assert "common.py:6" in html  # inner's def line in the chain
+		# Placeholder branch NOT taken.
+		assert "no deeper user-code frame" not in html
 

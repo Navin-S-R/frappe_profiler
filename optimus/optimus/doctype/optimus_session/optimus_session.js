@@ -15,7 +15,6 @@ frappe.ui.form.on("Optimus Session", {
 		render_retry_button(frm);
 		render_regenerate_report_button(frm);
 		render_findings_summary(frm);
-		render_analyzer_warnings(frm);
 		render_phase2_button(frm);
 		render_ai_buttons(frm);
 		subscribe_phase2_events(frm);
@@ -1055,12 +1054,6 @@ function render_regenerate_report_button(frm) {
 			},
 		);
 	});
-}
-
-function render_analyzer_warnings(frm) {
-	if (frm.is_new()) return;
-	if (!frm.doc.analyzer_warnings) return;
-	frm.set_intro(frm.doc.analyzer_warnings, "orange");
 }
 
 function render_status_indicator(frm) {

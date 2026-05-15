@@ -1,16 +1,21 @@
 # Copyright (c) 2026, Optimus contributors
 # For license information, please see license.txt
 
-"""Tests for v0.5.2 round 3 callsite-level N+1 dedup.
+"""Tests for v0.5.2 round 3 callsite-level N+1 dedup, refined in v0.7.x.
 
-Before: n_plus_one grouped by (normalized_query, filename, lineno).
-A callsite that generated 10 different queries in the same loop
-emitted 10 separate N+1 findings. Report had "Same query ran 74×"
-ten times — same fix, same line.
+Before v0.5.2: n_plus_one grouped by (normalized_query, filename,
+lineno). A callsite that generated 10 different queries in the same
+loop emitted 10 separate N+1 findings. Report had "Same query ran
+74×" ten times — same fix, same line.
 
-After: grouped by (filename, lineno). A callsite with N query
-variants emits ONE finding titled "Callsite ran X queries (N
-variants) at file:line" with sample queries in the detail.
+v0.5.2: regrouped by (filename, lineno). A multi-variant callsite
+emitted ONE collapsed finding titled "Callsite ran X queries (N
+variants) at file:line".
+
+v0.7.x: the multi-variant "Callsite ran …" finding type is dropped
+— the wording reads as jargon, the fix hint is generic, and the
+dominant variant is already surfaced elsewhere. Only the
+single-variant classic "Same query ran N× at …" remains.
 """
 
 import json
@@ -44,10 +49,14 @@ def _make_recording(stack, queries_per_variant, variants, per_query_ms=2.0):
 	}
 
 
-def test_same_callsite_ten_query_variants_collapses_to_one_finding():
-	"""Production report had 10 separate 'Same query ran 74× at
-	query_builder/utils.py:131' findings — one per SQL shape. User
-	sees it as ONE loop to fix; we should emit ONE finding."""
+def test_multi_variant_callsite_emits_no_finding():
+	"""v0.7.x: a callsite emitting 10 different SQL shapes ×30 each (300
+	total queries) used to collapse into one 'Callsite ran 300 queries
+	(10 variants)' finding. That wording wasn't actionable — drop the
+	multi-variant case entirely. The dominant variant is still visible
+	in the top-queries / table-breakdown sections; truly hot loops with
+	a single repeated SQL shape are still flagged by the classic
+	'Same query ran N× at …' path."""
 	stack = [
 		{"filename": "apps/myapp/controllers/bulk.py", "lineno": 42, "function": "f"},
 	]
@@ -55,24 +64,11 @@ def test_same_callsite_ten_query_variants_collapses_to_one_finding():
 	ctx = AnalyzeContext(session_uuid="t", docname="t")
 	result = n_plus_one.analyze([recording], ctx)
 
-	# 10 variants × 30 queries = 300 total, at the same callsite.
-	# Must emit EXACTLY ONE finding.
-	assert len(result.findings) == 1, (
-		f"Expected 1 finding for 10 variants at same callsite, "
-		f"got {len(result.findings)}: {[f['title'] for f in result.findings]}"
+	# Multi-variant case: no N+1 finding emitted.
+	assert result.findings == [], (
+		"Multi-variant callsite must NOT emit an N+1 finding. "
+		f"Got: {[f['title'] for f in result.findings]}"
 	)
-
-	f = result.findings[0]
-	assert f["affected_count"] == 300
-	# Title reflects the multi-variant shape.
-	assert "10 variants" in f["title"], (
-		f"Multi-variant title expected; got: {f['title']!r}"
-	)
-
-	# Detail carries sample queries.
-	detail = json.loads(f["technical_detail_json"])
-	assert detail["variant_count"] == 10
-	assert len(detail["sample_queries"]) == 5  # capped at 5
 
 
 def test_single_variant_keeps_classic_title():

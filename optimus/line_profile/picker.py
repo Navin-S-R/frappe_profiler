@@ -327,6 +327,65 @@ def expand_hot_chain(
 	return chain
 
 
+def deepest_instrumented_descendant(
+	tree: dict,
+	ancestor_qualname: str,
+	instrumented_qualnames: set,
+) -> str | None:
+	"""Walk a phase-1 pyinstrument tree, find ``ancestor_qualname``'s
+	frame, then DFS-walk its descendants and return the **deepest**
+	qualname in ``instrumented_qualnames`` (other than
+	``ancestor_qualname`` itself). ``None`` when no eligible descendant
+	exists.
+
+	Used by analyzer + renderer to detect transitive ancestry between
+	instrumented functions: when auto_expand instrumented A and C but
+	NOT the intermediate B (B was below ``min_ms`` or out of
+	``max_depth``), regex on A's hot line content sees ``B(...)`` and
+	finds no match in the instrumented set — but the phase-1 call tree
+	records A → B → C, so this helper walks down from A and reports C
+	as the deepest instrumented descendant.
+	"""
+	if not isinstance(tree, dict) or not ancestor_qualname:
+		return None
+
+	def find_frame(node: dict) -> dict | None:
+		if not isinstance(node, dict):
+			return None
+		if (node.get("function") or "") == ancestor_qualname:
+			return node
+		for child in node.get("children") or []:
+			hit = find_frame(child)
+			if hit is not None:
+				return hit
+		return None
+
+	root = find_frame(tree)
+	if root is None:
+		return None
+
+	best: tuple[int, str] | None = None  # (depth, qualname)
+
+	def walk(node: dict, depth: int) -> None:
+		nonlocal best
+		if not isinstance(node, dict):
+			return
+		fn_name = node.get("function") or ""
+		if (
+			depth > 0
+			and fn_name
+			and fn_name != ancestor_qualname
+			and fn_name in instrumented_qualnames
+			and (best is None or depth > best[0])
+		):
+			best = (depth, fn_name)
+		for child in node.get("children") or []:
+			walk(child, depth + 1)
+
+	walk(root, 0)
+	return best[1] if best else None
+
+
 def _check_eligibility(obj) -> tuple[bool, str | None]:
 	"""Return (eligible, reason). line_profiler can attach to functions
 	with a real ``__code__`` object that aren't lambdas or runtime-eval'd

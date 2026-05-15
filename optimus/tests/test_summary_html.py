@@ -105,3 +105,46 @@ class TestSummaryProse:
 		ctx = _ctx(actions=[{"action_label": "GET /app", "recording_uuid": "r0", "duration_ms": 5}], findings=[])
 		text = _strip(analyze._build_summary_html(ctx, 1, [{"uuid": "r0"}]))
 		assert "1 operation " in text and "1 operations" not in text
+
+
+class TestSummaryBulletShape:
+	"""v0.7.x: Summary section renders as a <ul>/<li> list (was a stack
+	of <p> paragraphs). The TestSummaryProse class above pins the text
+	content via _strip; these tests pin the structural shape so a
+	future refactor doesn't quietly regress back to paragraphs."""
+
+	def test_summary_wraps_in_ul(self):
+		"""Both the bullet wrapper AND at least one bullet item must be
+		present in the rendered HTML."""
+		ctx = _ctx(
+			actions=[{"action_label": "x", "recording_uuid": "r0", "duration_ms": 10}],
+			findings=[{"severity": "High", "title": "a", "estimated_impact_ms": 5}],
+		)
+		html = analyze._build_summary_html(ctx, 5, [{"uuid": "r0"}])
+		assert "<ul" in html
+		assert "<li>" in html
+		assert "</ul>" in html
+		# And there are no leftover <p> wrappers from the pre-v0.7.x
+		# shape — those would render as paragraphs interleaved with the
+		# bullet list, looking broken.
+		assert "<p>" not in html
+
+	def test_bullet_count_happy_path(self):
+		"""Standard fixture: actions + findings → exactly 3 bullets
+		(scope, slowest, findings-count)."""
+		ctx = _ctx(
+			actions=[{"action_label": "x", "recording_uuid": "r0", "duration_ms": 10}],
+			findings=[{"severity": "High", "title": "a", "estimated_impact_ms": 5}],
+		)
+		html = analyze._build_summary_html(ctx, 5, [{"uuid": "r0"}])
+		assert html.count("<li>") == 3
+
+	def test_bullet_count_no_findings_with_actions(self):
+		"""Actions + no findings → 4 bullets (scope + slowest + the
+		two-bullet reassurance)."""
+		ctx = _ctx(
+			actions=[{"action_label": "GET /app", "recording_uuid": "r0", "duration_ms": 50}],
+			findings=[],
+		)
+		html = analyze._build_summary_html(ctx, 3, [{"uuid": "r0"}])
+		assert html.count("<li>") == 4

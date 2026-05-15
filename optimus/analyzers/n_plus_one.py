@@ -125,6 +125,16 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 		action_idx = canonical_occurrences[0]["action_idx"]
 		variant_count = len(variants)
 
+		# v0.7.x: multi-variant N+1 ("Callsite ran X queries (N
+		# variants) at …") is suppressed. The wording reads as jargon
+		# (developers don't think in terms of "variants"), the fix
+		# hint is generic, and the dominant variant of the loop is
+		# already surfaced elsewhere (top queries, table breakdown).
+		# Single-variant N+1 ("Same query ran N× at …") still fires
+		# and is the actionable shape.
+		if variant_count > 1:
+			continue
+
 		short_fn = short_filename(filename)
 		is_framework = is_framework_callsite(filename, tracked_apps=tracked_apps)
 		builder = _build_framework_finding if is_framework else _build_user_finding

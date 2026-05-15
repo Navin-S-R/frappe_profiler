@@ -348,3 +348,123 @@ class TestAttachRepresentativeCallsites:
 		])]
 		renderer._attach_representative_callsites(findings, recs, file_cache={})
 		assert "callsite" not in findings[0]["technical_detail"]
+
+
+class TestSkipDecoratorsToDef:
+	"""v0.7.x: on CPython 3.11+ ``code.co_firstlineno`` for a decorated
+	function points at the first decorator line. The renderer advances
+	to the ``def`` line so the per-action entry-callsite snippet lands
+	on the signature rather than ``@frappe.whitelist(...)``."""
+
+	def test_single_decorator_is_skipped_to_def(self, tmp_path):
+		src = tmp_path / "fake_module.py"
+		src.write_text(
+			"line1\n"
+			"line2\n"
+			"@my_decorator(arg=1)\n"  # 3
+			"def target_fn(x):\n"  # 4
+			"    return x\n"
+		)
+		new_lineno = renderer._skip_decorators_to_def(
+			str(src), 3, "target_fn",
+		)
+		assert new_lineno == 4
+
+	def test_multi_line_decorator_args_walked_over(self, tmp_path):
+		src = tmp_path / "fake_module.py"
+		src.write_text(
+			"line1\n"
+			"@my_decorator(\n"  # 2
+			"    arg1=1,\n"  # 3
+			"    arg2=2,\n"  # 4
+			")\n"  # 5
+			"def target_fn(x):\n"  # 6
+			"    return x\n"
+		)
+		new_lineno = renderer._skip_decorators_to_def(
+			str(src), 2, "target_fn",
+		)
+		assert new_lineno == 6
+
+	def test_stacked_decorators_walked_over(self, tmp_path):
+		src = tmp_path / "fake_module.py"
+		src.write_text(
+			"@a\n"  # 1
+			"@b\n"  # 2
+			"@c\n"  # 3
+			"def target_fn():\n"  # 4
+			"    pass\n"
+		)
+		new_lineno = renderer._skip_decorators_to_def(
+			str(src), 1, "target_fn",
+		)
+		assert new_lineno == 4
+
+	def test_async_def_recognised(self, tmp_path):
+		src = tmp_path / "fake_module.py"
+		src.write_text(
+			"@my_decorator\n"  # 1
+			"async def target_fn():\n"  # 2
+			"    pass\n"
+		)
+		new_lineno = renderer._skip_decorators_to_def(
+			str(src), 1, "target_fn",
+		)
+		assert new_lineno == 2
+
+	def test_non_decorated_lineno_unchanged(self, tmp_path):
+		"""When the line at start_lineno doesn't start with ``@``, the
+		early exit returns it unchanged — no scan, no false advance."""
+		src = tmp_path / "fake_module.py"
+		src.write_text(
+			"line1\n"
+			"def target_fn():\n"  # 2 — already the def line
+			"    pass\n"
+		)
+		assert renderer._skip_decorators_to_def(
+			str(src), 2, "target_fn",
+		) == 2
+
+	def test_no_def_found_falls_back_to_start_lineno(self, tmp_path):
+		"""When the start line IS a decorator but no matching def is
+		found within the scan window (mangled source, generated code),
+		fall back to the original lineno."""
+		src = tmp_path / "fake_module.py"
+		src.write_text(
+			"@my_decorator\n"  # 1
+			"def different_name():\n"  # 2 — name mismatch
+			"    pass\n"
+		)
+		assert renderer._skip_decorators_to_def(
+			str(src), 1, "target_fn",
+		) == 1
+
+	def test_missing_file_falls_back(self, tmp_path):
+		"""Unreadable file → returns start_lineno (no crash)."""
+		assert renderer._skip_decorators_to_def(
+			str(tmp_path / "does_not_exist.py"), 5, "target_fn",
+		) == 5
+
+	def test_cache_reused_across_calls(self, tmp_path):
+		"""Two resolutions on the same file should share the cache."""
+		src = tmp_path / "fake_module.py"
+		src.write_text(
+			"@a\n"
+			"def fn_one():\n"
+			"    pass\n"
+			"@b\n"
+			"def fn_two():\n"
+			"    pass\n"
+		)
+		cache: dict = {}
+		assert renderer._skip_decorators_to_def(str(src), 1, "fn_one", cache=cache) == 2
+		# Same file path is now in the cache.
+		assert str(src) in cache
+		# Second call resolves the next function using the cached file.
+		assert renderer._skip_decorators_to_def(str(src), 4, "fn_two", cache=cache) == 5
+
+	def test_zero_or_negative_lineno_is_passthrough(self, tmp_path):
+		src = tmp_path / "fake_module.py"
+		src.write_text("@d\ndef target_fn():\n    pass\n")
+		assert renderer._skip_decorators_to_def(str(src), 0, "target_fn") == 0
+		assert renderer._skip_decorators_to_def(str(src), -1, "target_fn") == -1

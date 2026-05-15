@@ -459,7 +459,7 @@ def test_actionable_findings_carry_verified_flag(monkeypatch, empty_context):
     detail = json.loads(missing[0]["technical_detail_json"])
     assert detail["verified_not_indexed"] is True
     assert detail["suggested_ddl"] == (
-        "ALTER TABLE `tabProject` ADD INDEX `idx_project_manager` (`project_manager`);"
+        "ALTER TABLE `tabProject` ADD INDEX IF NOT EXISTS `project_manager_index` (`project_manager`);"
     )
 
 

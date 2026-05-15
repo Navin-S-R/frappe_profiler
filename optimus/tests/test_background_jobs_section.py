@@ -174,8 +174,9 @@ class TestRenderedBackgroundJobsSection:
 		# the pieces rather than an exact phrase).
 		assert "1 background job" in html
 		assert "ran during this flow" in html
-		# 1200ms > default threshold (1000ms) → renders as 1.20s.
-		assert "1.20s total" in html
+		# 1200ms > default threshold (1000ms) → renders as 1.20s wrapped
+		# in the v0.7.x highlight span.
+		assert '<span class="time-high">1.20s</span> total' in html
 		# caveat about jobs that ran too late / no worker
 		assert "Retry Analyze" in html
 		# its query made it into the drill-down
@@ -207,19 +208,64 @@ class TestRenderedBackgroundJobsSection:
 	def test_findings_column_only_when_mappable(self):
 		# With a finding carrying an action_ref that points at the job's
 		# original index, the Findings column appears.
+		# v0.7.x: the finding must also have a callsite — no-callsite
+		# findings are filtered before render, so they wouldn't trigger
+		# the Findings column either.
 		doc = _doc(
 			actions=[self._job_action(action_label="Job: a", path="a", recording_uuid="r1", duration_ms=10)],
 			findings=[
 				types.SimpleNamespace(
 					finding_type="N+1 Query", severity="Medium", title="x",
 					customer_description="", estimated_impact_ms=0, affected_count=0,
-					action_ref="0", technical_detail_json="{}", llm_fix_json=None,
+					action_ref="0",
+					technical_detail_json=json.dumps({
+						"callsite": {"filename": "apps/myapp/x.py", "lineno": 1, "function": "f"},
+					}),
+					llm_fix_json=None,
 				)
 			],
 		)
 		html = renderer.render_raw(doc, recordings=[])
 		assert "<h2>Background jobs</h2>" in html
 		assert "<th class=\"num\">Findings</th>" in html
+
+	def test_smoking_gun_block_not_duplicated_into_bg_job_embed(self):
+		"""v0.7.x: the styled smoking-gun panel (file:line header + source
+		snippet + drill-down callout) is hidden when ``finding_card`` is
+		embedded inside a BG-job row — the row already shows the entry
+		callsite as a compact inline link under the method name, so the
+		full panel would just duplicate that anchor inside a blue-bordered
+		box. The canonical Findings section keeps it.
+
+		Pin: ``class="smoking-gun"`` appears exactly once across the
+		whole report (the Findings-section card), never twice (Findings
+		card + BG-job embed)."""
+		doc = _doc(
+			actions=[self._job_action(action_label="Job: a", path="a",
+			                          recording_uuid="r1", duration_ms=10)],
+			findings=[
+				types.SimpleNamespace(
+					finding_type="N+1 Query", severity="Medium", title="x",
+					customer_description="", estimated_impact_ms=0, affected_count=0,
+					action_ref="0",
+					technical_detail_json=json.dumps({
+						"callsite": {
+							"filename": "apps/myapp/x.py", "lineno": 1, "function": "f",
+						},
+					}),
+					llm_fix_json=None,
+				)
+			],
+		)
+		html = renderer.render_raw(doc, recordings=[])
+		# Exactly one smoking-gun panel — the one in the Findings section.
+		assert html.count('class="smoking-gun"') == 1
+		# Sanity: the BG-jobs section is rendered, and the related-finding
+		# card was embedded under the job (title travels with the card).
+		assert "<h2>Background jobs</h2>" in html
+		# Two card-titles for "x": one in Findings section, one in BG embed.
+		# (If embedding broke, the title count would drop to 1.)
+		assert html.count(">x<") >= 2
 
 
 # --------------------------------------------------------------------------
@@ -230,29 +276,89 @@ class TestEntryCallsiteInReport:
 	# Resolve a real function in this app so there's source to read.
 	_DOTTED = "optimus.renderer.render"
 
-	def test_background_job_row_shows_entry_callsite_and_snippet(self):
+	def test_background_job_row_does_not_show_entry_callsite_snippet(self):
+		"""v0.7.x: the multi-line entry-callsite snippet PANEL is dropped
+		from BG job rows. A compact inline ``file:line (function)`` line
+		remains under the job method as a navigation affordance (added
+		in a later iteration). The snippet panel — multi-line table,
+		the def line itself rendered as a yellow-highlighted row — is
+		what's absent."""
 		doc = _doc([
 			_action(action_label="Job: " + self._DOTTED, event_type="Background Job",
 			        path=self._DOTTED, recording_uuid="r1", duration_ms=500, queries_count=2),
 		])
 		html = renderer.render_raw(doc, recordings=[])
 		assert "<h2>Background jobs</h2>" in html
-		# bench-relative file:line under the job row
+		# Inline path IS present (compact, useful).
 		assert "optimus/renderer.py:" in html
-		# the highlighted def line made it into the snippet table
-		assert "def render(" in html
-		# editor deep-link (same scheme the finding smoking-gun block uses) —
-		# no findings in this doc, so this can only come from the new block
-		assert "vscode://file" in html
+		# But the multi-line snippet PANEL's content is absent: the def
+		# line body itself doesn't render anywhere in the row.
+		assert "def render(" not in html
+		# The "Slowest queries" affordance still renders.
+		assert "Slowest queries for this job" in html
 
-	def test_http_api_action_shows_entry_callsite_in_per_action_table(self):
+	def test_http_api_action_renders_no_entry_callsite_snippet_in_per_action_table(self):
+		"""v0.7.x: the per-action table no longer renders the multi-line
+		entry-callsite snippet panel under action rows. A compact inline
+		file:line line remains under the action label as a navigation
+		anchor; the multi-line snippet itself (def body line, yellow-
+		highlighted snippet row) is absent."""
 		doc = _doc([
 			_action(action_label=self._DOTTED, event_type="HTTP Request", http_method="POST",
 			        path="/api/method/" + self._DOTTED, recording_uuid="r0", duration_ms=900),
 		])
 		html = renderer.render_raw(doc, recordings=[])
+		# Action label and inline path both present.
+		assert self._DOTTED in html
 		assert "optimus/renderer.py:" in html
-		assert "def render(" in html
+		# But the multi-line snippet panel's body (def line) isn't.
+		assert "def render(" not in html
+
+	def test_smoking_gun_block_not_duplicated_into_per_action_embed(self):
+		"""Mirror of the BG-job test above, scoped to the per-action
+		breakdown's HTTP API row. With a finding carrying ``action_ref``
+		pointing at the action's idx, the related finding card embeds
+		under the action row. The smoking-gun panel must NOT render
+		there — only inside the Findings section."""
+		import json
+		doc = _doc(
+			actions=[_action(action_label=self._DOTTED, event_type="HTTP Request",
+			                 http_method="POST", path="/api/method/" + self._DOTTED,
+			                 recording_uuid="r0", duration_ms=900)],
+			findings=[
+				types.SimpleNamespace(
+					finding_type="N+1 Query", severity="High", title="duplicated-anchor probe",
+					customer_description="", estimated_impact_ms=0, affected_count=0,
+					action_ref="0",
+					technical_detail_json=json.dumps({
+						"callsite": {
+							"filename": "apps/myapp/x.py", "lineno": 1, "function": "f",
+						},
+					}),
+					llm_fix_json=None,
+				)
+			],
+		)
+		html = renderer.render_raw(doc, recordings=[])
+		# Exactly one smoking-gun panel — the canonical Findings section card.
+		assert html.count('class="smoking-gun"') == 1
+		# Sanity: the embed actually happened — the title travels with the
+		# card, so it should appear at least twice (Findings + per-action).
+		assert html.count("duplicated-anchor probe") >= 2
+
+	def test_action_row_shows_inline_entry_path(self):
+		"""Positive: the inline ``file:line (function)`` line is present
+		in the action label cell with a vscode deep-link when the entry
+		callsite resolves to an absolute path."""
+		doc = _doc([
+			_action(action_label=self._DOTTED, event_type="HTTP Request", http_method="POST",
+			        path="/api/method/" + self._DOTTED, recording_uuid="r0", duration_ms=900),
+		])
+		html = renderer.render_raw(doc, recordings=[])
+		# Inline path with the function-name parenthetical.
+		assert "optimus/renderer.py:" in html
+		assert "(render)" in html
+		# vscode deep-link present (absolute path was resolved).
 		assert "vscode://file" in html
 
 	def test_unresolvable_action_path_renders_no_sub_row(self):
@@ -318,7 +424,11 @@ class TestActionContextInReport:
 		doc = _doc([action], findings=[])
 		recs = [{"uuid": "r0", "calls": [], "form_dict": {"fieldname": "name", "filters": "{}"}}]
 		html = renderer.render_raw(doc, recordings=recs)
-		assert "&rarr;" not in html
+		# Anchor on the breadcrumb's structural form, not the bare arrow —
+		# v0.7.x added a Lens promo line in the header that also uses
+		# &rarr;, so the previous unanchored assertion no longer
+		# distinguishes "no target doc" from "any arrow anywhere".
+		assert '<span class="small muted">&rarr;' not in html
 
 	def test_doc_action_without_recording_does_not_crash(self):
 		# Recording expired from Redis → no form_dict to read → no target_doc, no crash.

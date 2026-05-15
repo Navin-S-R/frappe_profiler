@@ -103,12 +103,19 @@ def test_form_js_has_retry_button():
 	assert 'status !== "Failed"' in src or "Failed" in src
 
 
-def test_form_js_has_analyzer_warnings_intro():
-	"""Fix #15: analyzer_warnings should be surfaced as a form intro banner."""
+def test_form_js_does_not_render_analyzer_warnings_intro():
+	"""v0.7.x: the analyzer_warnings orange intro banner was removed
+	from the Optimus Session form view. The warning text (about
+	suppressed framework callsites, skipped non-SELECT statements,
+	below-threshold suggestions, etc.) was diagnostic noise that the
+	developer doesn't need to act on — it pushed the actionable
+	findings count below the fold. The data is still stored on the
+	hidden ``analyzer_warnings`` field for offline inspection."""
 	with open(FORM_JS) as f:
 		src = f.read()
-	assert "analyzer_warnings" in src
-	assert "set_intro" in src
+	# No render call, no helper definition, no set_intro of warnings.
+	assert "render_analyzer_warnings" not in src
+	assert "set_intro(frm.doc.analyzer_warnings" not in src
 
 
 def test_form_js_has_download_button():

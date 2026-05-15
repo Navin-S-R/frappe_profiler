@@ -4,9 +4,20 @@
 """Pure-Python unit tests for ``_format_duration_ms`` — the threshold-aware
 duration formatter that powers the ``fmt_ms`` Jinja-callable. Below the
 threshold, render as ms (with caller-controlled decimals); at or above,
-render as seconds with 2 decimals."""
+render as seconds with 2 decimals.
+
+v0.7.x: the formatter returns ``markupsafe.Markup`` so the seconds
+branch can wrap the output in a ``<span class="time-high">`` for visual
+emphasis when rendered by Jinja. ``Markup`` subclasses ``str`` so
+equality comparisons against plain strings still work — we just have
+to match against the wrapped form when ≥1000ms."""
 
 from optimus.renderer import _format_duration_ms
+
+
+def _seconds(text: str) -> str:
+	"""Wrap a seconds-formatted value in the highlight span."""
+	return f'<span class="time-high">{text}</span>'
 
 
 class TestBelowThreshold:
@@ -32,25 +43,25 @@ class TestBelowThreshold:
 
 class TestAboveThreshold:
 	def test_exact_threshold_converts(self):
-		assert _format_duration_ms(1000) == "1.00s"
+		assert _format_duration_ms(1000) == _seconds("1.00s")
 
 	def test_typical_slow_action(self):
-		assert _format_duration_ms(5234) == "5.23s"
+		assert _format_duration_ms(5234) == _seconds("5.23s")
 
 	def test_decimals_arg_ignored_in_seconds(self):
 		# seconds always show 2 decimals regardless of the decimals arg.
-		assert _format_duration_ms(5234, decimals=0) == "5.23s"
-		assert _format_duration_ms(5234, decimals=1) == "5.23s"
-		assert _format_duration_ms(5234, decimals=2) == "5.23s"
+		assert _format_duration_ms(5234, decimals=0) == _seconds("5.23s")
+		assert _format_duration_ms(5234, decimals=1) == _seconds("5.23s")
+		assert _format_duration_ms(5234, decimals=2) == _seconds("5.23s")
 
 	def test_large_value(self):
 		# Python's banker's rounding: 62.345 → 62.34 (not 62.35).
-		assert _format_duration_ms(62345) == "62.34s"
+		assert _format_duration_ms(62345) == _seconds("62.34s")
 
 	def test_custom_threshold_above_default(self):
 		# threshold raised to 5000 → 4234ms still renders as ms.
 		assert _format_duration_ms(4234, threshold_ms=5000) == "4234ms"
-		assert _format_duration_ms(5234, threshold_ms=5000) == "5.23s"
+		assert _format_duration_ms(5234, threshold_ms=5000) == _seconds("5.23s")
 
 
 class TestDisabled:
@@ -64,7 +75,7 @@ class TestDisabled:
 		# Actual behaviour: threshold=-1 is truthy and abs(v) >= -1 is
 		# always true, so 5234 → "5.23s". Documenting actual semantics —
 		# admins should never set a negative threshold.
-		assert _format_duration_ms(5234, threshold_ms=-1) == "5.23s"
+		assert _format_duration_ms(5234, threshold_ms=-1) == _seconds("5.23s")
 
 
 class TestDefensive:
@@ -80,4 +91,4 @@ class TestDefensive:
 
 	def test_negative_value_above_threshold_absolute(self):
 		# abs(-5234) >= 1000 → converts.
-		assert _format_duration_ms(-5234) == "-5.23s"
+		assert _format_duration_ms(-5234) == _seconds("-5.23s")
