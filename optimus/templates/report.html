@@ -414,6 +414,11 @@
   .severity-badge.high   { background: #dc2626; color: white; }
   .severity-badge.medium { background: #d97706; color: white; }
   .severity-badge.low    { background: #2563eb; color: white; }
+  /* v0.7.x: emphasise timing values that cross the 1s threshold —
+     fmt_ms emits this span around the seconds-formatted output. The
+     amber + bold draws the eye to slow rows without screaming. Same
+     palette as the existing severity-medium / warning indicators. */
+  .time-high { color: #b45309; font-weight: 600; }
   .finding-title { font-weight: 600; font-size: 1rem; color: #111827; flex: 1; }
   .finding-impact { font-size: 0.85rem; color: #6b7280; font-variant-numeric: tabular-nums; }
   .finding-description { color: #374151; margin: 6px 0 10px 0; }
@@ -557,7 +562,7 @@
    Observations sections. DRYs out the ~40-line card markup so the
    per-app bucket loop stays readable. `show_fix_hint_label` toggles
    "How to fix" (actionable Findings) vs "Context" (Observations). #}
-{% macro finding_card(f, show_fix_hint_label="How to fix") %}
+{% macro finding_card(f, show_fix_hint_label="How to fix", hide_ai_fix=False, hide_source_snippet=False) %}
   <div class="finding severity-{{ f.severity | lower }}">
     <div class="finding-header">
       <span class="severity-badge {{ f.severity | lower }}">{{ f.severity }}</span>
@@ -580,8 +585,16 @@
        callsite's absolute path (``_abs``) when we have one. For SQL red-flag
        findings (Missing Index, Full Table Scan, …) the callsite is a
        *representative* one — the hottest user-app frame that ran the query —
-       flagged with ``is_representative``. #}
-    {% if callsite.filename and callsite.lineno %}
+       flagged with ``is_representative``.
+
+       v0.7.x: callers that embed finding_card in narrow contexts (per-action
+       row, BG-job row) pass ``hide_source_snippet=True`` to drop the entire
+       smoking-gun block — the row itself already shows the file:line as an
+       inline anchor under the action/job label, making this styled panel
+       redundant clutter. The canonical Findings section keeps the default
+       (False) so the full smoking-gun (header + source snippet + drill-down)
+       still renders there. #}
+    {% if callsite.filename and callsite.lineno and not hide_source_snippet %}
     {% set _link = callsite._abs or (callsite.filename if callsite.filename and callsite.filename.startswith("/") else None) %}
     <div class="smoking-gun" style="margin: 8px 0; padding: 8px 10px; background: #f9fafb; border-left: 3px solid #2563eb; border-radius: 0 4px 4px 0;">
       <div style="margin-bottom: 6px;">
@@ -596,6 +609,14 @@
           <code>{{ callsite.filename }}:{{ callsite.lineno }}{% if callsite.function %} <span class="muted">({{ callsite.function }})</span>{% endif %}</code>
         {% endif %}
         {% if callsite.is_representative %}<div class="small muted" style="margin-top: 3px;">Representative callsite &mdash; this query runs from several places; this is the hottest one.</div>{% endif %}
+        {# v0.7.x: when phase-2 re-targeted this callsite from a wrapper
+           onto its actual hot leaf, show the original wrapper as a
+           breadcrumb so the reader sees the entry point too. #}
+        {% if callsite.original_wrapper %}
+        <div class="small muted" style="margin-top: 3px;">
+          Time entered through <code>{{ callsite.original_wrapper.function }}</code>{% if callsite.original_wrapper.lineno %} at line {{ callsite.original_wrapper.lineno }}{% endif %} &mdash; pinned here to the actual hot line.
+        </div>
+        {% endif %}
       </div>
 
       {% if callsite.source_snippet %}
@@ -611,9 +632,24 @@
 
       {# Hot Line findings ARE the phase-2 hot line — re-stating
          "Phase 2: hottest line N" inside their own card would read as
-         self-referential. Suppress for that finding type only. #}
+         self-referential. Suppress for that finding type only.
+
+         For other finding types (including those whose callsite was
+         retargeted to the drill-down's deepest user-code frame via
+         ``original_wrapper``), the Phase 2 callout adds value: the
+         smoking-gun snippet now anchors on the deepest function's
+         ``def`` line, while this callout pinpoints the actually-hot
+         line *inside* that function (a different lineno). #}
       {% if f.finding_type != "Hot Line" %}
-        {% set p2_hot = phase2_for_callsite(callsite.filename, callsite.function) %}
+        {# v0.7.x: when the smoking-gun was retargeted to the call site
+           of a deeper leaf, callsite.function is the PARENT (where the
+           call line lives) but the Phase 2 hot line belongs to the
+           LEAF. Use phase2_lookup_filename / phase2_lookup_function
+           when present so the cross-link still resolves; otherwise
+           fall back to the callsite itself. #}
+        {% set _p2_file = callsite.phase2_lookup_filename or callsite.filename %}
+        {% set _p2_fn = callsite.phase2_lookup_function or callsite.function %}
+        {% set p2_hot = phase2_for_callsite(_p2_file, _p2_fn) %}
         {% if p2_hot %}
         <div style="margin-top: 6px; font-size: 12px; padding-top: 6px; border-top: 1px dashed #d1d5db;">
           <strong style="color: #1d4ed8;">Phase 2:</strong>
@@ -624,16 +660,56 @@
         </div>
         {% endif %}
       {% endif %}
+      {# v0.7.x: Phase-2 call-chain breadcrumb. Present on a Hot Line
+         finding when auto_expand instrumented a chain of functions and
+         the deepest leaf is what's being shown. The chain reads outer →
+         leaf (last step is the leaf finding's own location), so a reader
+         can see at a glance which wrapper(s) the time entered through. #}
+      {% set _phase2_chain = (f.technical_detail or {}).get("call_chain") if f.technical_detail else None %}
+      {% if _phase2_chain and _phase2_chain | length > 1 %}
+      <div style="margin-top: 6px; font-size: 12px; padding-top: 6px; border-top: 1px dashed #d1d5db;">
+        <strong style="color: #1d4ed8;">Call chain:</strong>
+        <span style="color: #374151;">
+        {% for step in _phase2_chain %}<code>{{ step.qualname }}:{{ step.lineno }}</code>{% if not loop.last %} <span class="muted">&rarr;</span> {% endif %}{% endfor %}
+        </span>
+        <span class="muted">&middot; deepest line is where the cost is incurred</span>
+      </div>
+      {% endif %}
+      {# v0.7.x: Phase-1 fallback hint. Present on a Hot Line finding
+         when the leaf's hot line still looks like a call into code we
+         didn't instrument; points the developer at the next user-code
+         descendant from phase-1's tree so they can re-pick it. #}
+      {% set _phase1_hint = (f.technical_detail or {}).get("phase1_hint") if f.technical_detail else None %}
+      {% if _phase1_hint %}
+      <div style="margin-top: 6px; font-size: 12px; padding-top: 6px; border-top: 1px dashed #d1d5db; color: #374151;">
+        <strong style="color: #1d4ed8;">Hint:</strong>
+        time flows into <code>{{ _phase1_hint.next_hot_callee }}</code>
+        ({{ fmt_ms(_phase1_hint.phase1_cumulative_ms) }} in phase&nbsp;1).
+        <span class="muted">Pick this function for a line-level breakdown.</span>
+      </div>
+      {% endif %}
       {# v0.6.x: deterministic call-tree drill-down. Walks from the finding's
-         origin function down to the deepest user-code frame. Hidden when the
-         chain is empty (origin is already a leaf, or the next frame is
-         framework code). Complements the AI fix block below — gives non-LLM
-         users the same actionable trail. #}
+         origin function down to the deepest user-code frame. Complements the
+         AI fix block below — gives non-LLM users the same actionable trail.
+
+         v0.7.x: when the chain is empty (key present but list is []), render
+         a placeholder explaining why — the origin function calls framework
+         code directly, so there's no deeper user-code frame to descend into.
+         When the key is absent entirely (no callsite/action/tree, e.g. SQL
+         red-flag findings), render nothing at all. #}
       {% set _drilldown = (f.technical_detail or {}).get("drilldown_chain") if f.technical_detail else None %}
+      {# v0.7.x: the drill-down chain is rooted at the **original**
+         wrapper frame (the finding's entry point), so the narrative
+         heading must name that wrapper — not the retargeted callsite
+         function. When the smoking gun was relocated to a deeper user-
+         code frame, ``callsite.original_wrapper.function`` holds the
+         wrapper's name; otherwise the current ``callsite.function`` is
+         the wrapper. #}
+      {% set _drill_root_fn = callsite.original_wrapper.function if callsite.original_wrapper else callsite.function %}
       {% if _drilldown %}
       <div style="margin-top: 6px; font-size: 12px; padding-top: 6px; border-top: 1px dashed #d1d5db;">
         <strong style="color: #1d4ed8;">Drill-down:</strong>
-        time inside <code>{{ callsite.function }}</code> walked through &mdash;
+        time inside <code>{{ _drill_root_fn }}</code> walked through &mdash;
         <div style="margin-top: 4px;">
         {% for level in _drilldown %}
           <div style="padding: 1px 0 1px {{ (loop.index0 + 1) * 12 }}px; color: #374151;">
@@ -644,6 +720,11 @@
           </div>
         {% endfor %}
         </div>
+      </div>
+      {% elif _drilldown is not none %}
+      <div style="margin-top: 6px; font-size: 12px; padding-top: 6px; border-top: 1px dashed #d1d5db; color: #6b7280;">
+        <strong style="color: #1d4ed8;">Drill-down:</strong>
+        no deeper user-code frame &mdash; <code>{{ _drill_root_fn }}</code> calls framework code directly. Check the N+1 Query or related findings for inner-loop details.
       </div>
       {% endif %}
       {# v0.6.x: hoisted from .finding-detail — the target document + the
@@ -658,7 +739,25 @@
     </div>
     {% endif %}
 
-    {% if f.technical_detail %}
+    {# v0.7.x: keep this OR list in sync with the inner {% if %} branches
+       below — it's a conservative early exit so the styled ``.finding-detail``
+       container (white background + border + padding) doesn't render as an
+       empty box for finding types whose technical_detail carries no rows
+       that this block displays (Slow Hot Path / Hook Bottleneck / Hot Line
+       / Function Not Invoked — their meaningful content lives in the
+       smoking-gun block above, not here). #}
+    {% set _has_detail_rows = (
+         detail.normalized_query
+      or detail.suggested_ddl
+      or detail.example_queries
+      or detail.explain_row
+      or detail.fix_hint
+      or detail.validation_note
+      or detail.occurrences
+      or (detail.projected_avg_time_ms is defined and detail.projected_avg_time_ms)
+      or ((not callsite.filename or not callsite.lineno) and (detail.target_doc or detail.hook_events))
+    ) %}
+    {% if f.technical_detail and _has_detail_rows %}
     <div class="finding-detail">
       {# Callsite was hoisted above into the smoking-gun block. The
          remaining detail rows (query, DDL, fix hint, etc.) live here as
@@ -735,7 +834,7 @@
        Markdown-rendered + bleach-sanitized by renderer._finding_to_dict,
        so |safe is valid here (and there are no external assets in it, so
        the offline-report guarantee holds). #}
-    {% if f.llm_fix and f.llm_fix.suggestion_html %}
+    {% if f.llm_fix and f.llm_fix.suggestion_html and not hide_ai_fix %}
     <div class="ai-fix">
       <div class="ai-fix-header">Suggested fix (AI{% if f.llm_fix.model %} &mdash; {{ f.llm_fix.model }}{% endif %})</div>
       {% if not f.llm_fix.source_available %}
@@ -743,6 +842,34 @@
       {% endif %}
       <div class="ai-fix-body">{{ f.llm_fix.suggestion_html | safe }}</div>
       <div class="ai-fix-foot">Machine-generated{% if f.llm_fix.generated_at %} &middot; {{ fmt_dt(f.llm_fix.generated_at) }}{% endif %} &mdash; review before applying.</div>
+    </div>
+    {% endif %}
+
+    {# v0.7.x: related findings grouped by root cause. When several
+       analyzers flag the same deepest user-code anchor — e.g. a Hot
+       Line, a Redundant doc fetch, and a Redundant permission check
+       all landing on the same get_doc-in-a-loop site — they collapse
+       into THIS card and appear as small collapsible rows beneath the
+       primary card's AI fix block. One fix at the top resolves all
+       of them; the sub-rows preserve the per-angle context for
+       readers who want to verify each. #}
+    {% if f.sub_findings %}
+    <div class="grouped-findings" style="margin-top: 12px; border-top: 1px solid #e5e7eb; padding-top: 10px;">
+      <div class="small muted" style="margin-bottom: 6px;">
+        Related on the same root cause &mdash; {{ f.sub_findings | length }} other finding{{ "s" if f.sub_findings | length != 1 else "" }}, one fix resolves all of them.
+      </div>
+      {% for s in f.sub_findings %}
+      <details style="margin: 4px 0; padding: 6px 10px; background: #f9fafb; border-left: 3px solid #d1d5db; border-radius: 0 4px 4px 0;">
+        <summary style="cursor: pointer; display: flex; gap: 8px; align-items: center;">
+          <span class="severity-badge {{ s.severity | lower }}">{{ s.severity }}</span>
+          <span style="flex: 1; font-weight: 500; font-size: 0.92rem;">{{ s.title }}</span>
+          {% if s.estimated_impact_ms %}<span class="small muted">~{{ fmt_ms(s.estimated_impact_ms) }}{% if s.affected_count %} &middot; {{ s.affected_count }}{% endif %}</span>{% endif %}
+        </summary>
+        {% if s.customer_description %}
+        <div class="small" style="margin-top: 6px; color: #374151; white-space: pre-wrap;">{{ s.customer_description }}</div>
+        {% endif %}
+      </details>
+      {% endfor %}
     </div>
     {% endif %}
   </div>
@@ -805,6 +932,21 @@
       {% if action.target_doc %}
         <br><span class="small muted">&rarr; {{ action.target_doc.doctype }}{% if action.target_doc.name %} <code>{{ action.target_doc.name }}</code>{% endif %}</span>
       {% endif %}
+      {# v0.7.x: inline entry-callsite line — the bench-relative file path
+         + lineno + function. Replaces the (already-dropped) full source
+         snippet panel. Compact, navigable, vscode-clickable. #}
+      {% if action.entry_callsite and action.entry_callsite.filename %}
+        {% set _cs = action.entry_callsite %}
+        <br>
+        <span class="small muted">
+          {% if _cs._abs %}
+            <a class="callsite-link" href="vscode://file{{ _cs._abs }}:{{ _cs.lineno }}" title="Open in VS Code / Cursor"><code>{{ _cs.filename }}:{{ _cs.lineno }}</code></a>
+          {% else %}
+            <code>{{ _cs.filename }}:{{ _cs.lineno }}</code>
+          {% endif %}
+          {% if _cs.function %} <span class="muted">({{ _cs.function }})</span>{% endif %}
+        </span>
+      {% endif %}
     </td>
     <td><span class="small">{{ action.event_type }}</span></td>
     <td class="num">{{ fmt_ms(action.duration_ms) }}</td>
@@ -812,10 +954,23 @@
     <td class="num">{{ fmt_ms(action.query_time_ms) }}</td>
     <td class="num">{{ fmt_ms(action.slowest_query_ms) }}</td>
   </tr>
-  {% if action.entry_callsite %}
+  {# v0.7.x: when this action has linked findings (action_ref matches
+     its idx), embed the finding cards inline — same structure as the
+     Findings section, scoped to this action. The AI fix block is
+     suppressed here (it's noise in the per-action surface and lives
+     in the canonical Findings section anyway). Actions without
+     findings render no sub-row — the previous entry-callsite
+     fallback was dropped because the ``def function_name``
+     snippet wasn't actionable. #}
+  {% if action.related_findings %}
   <tr>
-    <td colspan="7" style="background:#f9fafb;border-top:none;padding:4px 12px 8px 28px;">
-      {{ entry_callsite_block(action.entry_callsite) }}
+    <td colspan="7" style="background:#f9fafb;border-top:none;padding:8px 12px 12px 28px;">
+      <div style="margin: 0 0 8px; font-size: 12px; color: #6b7280;">
+        {{ action.related_findings | length }} finding{{ "s" if action.related_findings | length != 1 else "" }} linked to this action
+      </div>
+      {% for f in action.related_findings %}
+        {{ finding_card(f, hide_ai_fix=True, hide_source_snippet=True) }}
+      {% endfor %}
     </td>
   </tr>
   {% endif %}
@@ -824,7 +979,23 @@
 {% macro bg_job_row(job, idx, cols, any_findings_counted) %}
   <tr>
     <td>{{ idx }}</td>
-    <td><code>{{ job.method }}</code></td>
+    <td>
+      <code>{{ job.method }}</code>
+      {# v0.7.x: inline entry-callsite line under the job method — same
+         compact treatment as the per-action row. #}
+      {% if job.entry_callsite and job.entry_callsite.filename %}
+        {% set _cs = job.entry_callsite %}
+        <br>
+        <span class="small muted">
+          {% if _cs._abs %}
+            <a class="callsite-link" href="vscode://file{{ _cs._abs }}:{{ _cs.lineno }}" title="Open in VS Code / Cursor"><code>{{ _cs.filename }}:{{ _cs.lineno }}</code></a>
+          {% else %}
+            <code>{{ _cs.filename }}:{{ _cs.lineno }}</code>
+          {% endif %}
+          {% if _cs.function %} <span class="muted">({{ _cs.function }})</span>{% endif %}
+        </span>
+      {% endif %}
+    </td>
     <td class="num">{{ fmt_ms(job.duration_ms) }}</td>
     <td class="num">{{ job.queries_count }}</td>
     <td class="num">{{ fmt_ms(job.query_time_ms) }}</td>
@@ -835,7 +1006,20 @@
   </tr>
   <tr>
     <td colspan="{{ cols }}" style="background:#f9fafb;border-top:none;padding:4px 12px 10px 28px;">
-      {% if job.entry_callsite %}{{ entry_callsite_block(job.entry_callsite) }}{% endif %}
+      {# v0.7.x: mirror the action_row trim — drop the entry-callsite
+         snippet (the bare ``def function_name`` line was noise) and
+         embed finding cards in its place when this job has linked
+         findings. AI fix is suppressed here (it lives in the
+         canonical Findings section). The "Slowest queries for this
+         job" details block stays — it's job-specific. #}
+      {% if job.related_findings %}
+      <div class="small muted" style="margin: 0 0 8px;">
+        {{ job.related_findings | length }} finding{{ "s" if job.related_findings | length != 1 else "" }} linked to this job
+      </div>
+      {% for f in job.related_findings %}
+        {{ finding_card(f, hide_ai_fix=True, hide_source_snippet=True) }}
+      {% endfor %}
+      {% endif %}
       <details>
         <summary class="small muted">Slowest queries for this job</summary>
         {% if job.top_queries %}
@@ -1352,21 +1536,15 @@
       </div>
       <div class="stat">
         <div class="label">Browser wall time</div>
-        <div class="value">
-          {{ (frontend_summary.total_xhr_ms or 0) | int }}<span class="sub" style="font-size: 1rem">ms</span>
-        </div>
+        <div class="value">{{ fmt_ms(frontend_summary.total_xhr_ms or 0) }}</div>
       </div>
       <div class="stat">
         <div class="label">Backend time</div>
-        <div class="value">
-          {{ (frontend_summary.total_backend_ms or 0) | int }}<span class="sub" style="font-size: 1rem">ms</span>
-        </div>
+        <div class="value">{{ fmt_ms(frontend_summary.total_backend_ms or 0) }}</div>
       </div>
       <div class="stat">
         <div class="label">Network overhead</div>
-        <div class="value">
-          {{ (frontend_summary.network_overhead_ms or 0) | int }}<span class="sub" style="font-size: 1rem">ms</span>
-        </div>
+        <div class="value">{{ fmt_ms(frontend_summary.network_overhead_ms or 0) }}</div>
       </div>
     </div>
 

@@ -5,6 +5,8 @@
 function that turns aggregated line-profile results into findings + per-
 function aggregate."""
 
+import json as _json
+
 from optimus.line_profile import analyzer
 
 
@@ -19,11 +21,11 @@ def _line(lineno, content, hits, total_ms):
 	}
 
 
-def _function(dotted_path, lines):
+def _function(dotted_path, lines, file="/fake/path.py"):
 	return {
 		"dotted_path": dotted_path,
 		"qualname": dotted_path.rsplit(".", 1)[-1],
-		"file": "/fake/path.py",
+		"file": file,
 		"lines": lines,
 	}
 
@@ -176,3 +178,172 @@ class TestAggregate:
 		assert summary["dotted_path"] == "my_app.nope"
 		assert summary["total_ms"] == 0
 		assert summary["hot_lines"] == []
+
+
+class TestLeafPickAndChain:
+	"""When auto_expand instruments a chain of functions and the outer
+	function's hot line is just a call into a deeper instrumented one,
+	the outer finding should be suppressed and the deeper (leaf) finding
+	should carry a ``call_chain`` breadcrumb."""
+
+	def test_pass_through_finding_is_suppressed_when_callee_is_instrumented(self):
+		# Outer: hot line at lineno 7 is a call into _check_user_exists.
+		# Inner: hot line at lineno 20 is the real leaf (the get_doc call).
+		outer = _function("my_app.common.looped_validate", [
+			_line(1, "def looped_validate(doc):", 1, 0.0),
+			_line(7, "    _check_user_exists(doc)", 2, 370.0),  # pass-through
+		])
+		inner = _function("my_app.common._check_user_exists", [
+			_line(15, "def _check_user_exists(doc):", 2, 0.0),
+			_line(20, "        user = frappe.get_doc('User', frappe.session.user)", 100, 340.0),
+			_line(21, "        if user.enabled:", 100, 5.0),
+		])
+
+		result = analyzer.analyze([outer, inner])
+
+		hot = [f for f in result.findings if f["finding_type"] == "Hot Line"]
+		# Only one finding — the leaf.
+		assert len(hot) == 1
+		td = _json.loads(hot[0]["technical_detail_json"])
+		assert td["dotted_path"] == "my_app.common._check_user_exists"
+		assert td["lineno"] == 20
+		# Chain present, outer → leaf.
+		chain = td["call_chain"]
+		assert len(chain) == 2
+		assert chain[0]["qualname"] == "looped_validate"
+		assert chain[0]["lineno"] == 7
+		assert chain[-1]["qualname"] == "_check_user_exists"
+		assert chain[-1]["lineno"] == 20
+		# Customer description prefixed with breadcrumb.
+		assert "Time enters through" in hot[0]["customer_description"]
+		assert "looped_validate:7" in hot[0]["customer_description"]
+		assert "_check_user_exists:20" in hot[0]["customer_description"]
+
+	def test_three_level_chain_breadcrumb(self):
+		# A → B → C, leaf is C with a real hot line at 100.
+		a = _function("my_app.x.a", [
+			_line(1, "def a():", 1, 0.0),
+			_line(2, "    b()", 1, 500.0),  # pass-through to b
+		])
+		b = _function("my_app.x.b", [
+			_line(10, "def b():", 1, 0.0),
+			_line(11, "    c()", 1, 490.0),  # pass-through to c
+		])
+		c = _function("my_app.x.c", [
+			_line(20, "def c():", 1, 0.0),
+			_line(21, "    for x in range(1000): expensive_op(x)", 1000, 480.0),
+		])
+
+		result = analyzer.analyze([a, b, c])
+
+		hot = [f for f in result.findings if f["finding_type"] == "Hot Line"]
+		assert len(hot) == 1
+		td = _json.loads(hot[0]["technical_detail_json"])
+		assert td["dotted_path"] == "my_app.x.c"
+		chain = td["call_chain"]
+		assert [step["qualname"] for step in chain] == ["a", "b", "c"]
+		assert [step["lineno"] for step in chain] == [2, 11, 21]
+
+	def test_leaf_only_function_finding_unchanged(self):
+		# Single function with a real leaf hot line — no chain, no hint.
+		fn = _function("my_app.x", [
+			_line(1, "for x in items:", 1000, 10.0),
+			_line(2, "    cache[x] = expensive(x)", 1000, 800.0),
+		])
+
+		result = analyzer.analyze([fn])
+
+		hot = [f for f in result.findings if f["finding_type"] == "Hot Line"]
+		assert len(hot) == 1
+		td = _json.loads(hot[0]["technical_detail_json"])
+		assert "call_chain" not in td
+		assert "phase1_hint" not in td
+
+	def test_recursive_self_call_is_not_suppressed(self):
+		# A function that calls itself recursively — hot line is the
+		# recursive call. Self-recursion shouldn't trigger pass-through
+		# suppression; the finding stands.
+		fn = _function("my_app.recur", [
+			_line(1, "def recur(n):", 1, 0.0),
+			_line(2, "    if n <= 0: return", 100, 5.0),
+			_line(3, "    recur(n - 1)", 100, 600.0),  # self-call, NOT pass-through
+		])
+
+		result = analyzer.analyze([fn])
+
+		hot = [f for f in result.findings if f["finding_type"] == "Hot Line"]
+		assert len(hot) == 1
+		td = _json.loads(hot[0]["technical_detail_json"])
+		assert td["dotted_path"] == "my_app.recur"
+		assert td["lineno"] == 3
+		assert "call_chain" not in td
+
+	def test_phase1_hint_attached_when_callee_not_instrumented(self):
+		# Single function whose hot line calls into something we DIDN'T
+		# instrument. Provide a phase-1 tree containing that callee with
+		# cumulative_ms above the 50ms floor. Expect: phase1_hint
+		# populated on the finding.
+		# File path is chosen so _derive_module_path yields "my_app.common".
+		fn = _function(
+			"my_app.common.looped_validate",
+			[
+				_line(1, "def looped_validate(doc):", 1, 0.0),
+				_line(7, "    _check_user_exists(doc)", 2, 370.0),
+			],
+			file="my_app/common.py",
+		)
+		# Minimal pyinstrument-shaped tree: the looped_validate frame
+		# with one user-code child _check_user_exists at 340ms.
+		tree = {
+			"function": "looped_validate",
+			"filename": "my_app/common.py",
+			"lineno": 1,
+			"kind": "python",
+			"cumulative_ms": 370.0,
+			"children": [
+				{
+					"function": "_check_user_exists",
+					"filename": "my_app/common.py",
+					"lineno": 15,
+					"kind": "python",
+					"cumulative_ms": 340.0,
+					"children": [],
+				},
+			],
+		}
+
+		result = analyzer.analyze([fn], call_trees=[tree])
+
+		hot = [f for f in result.findings if f["finding_type"] == "Hot Line"]
+		assert len(hot) == 1
+		td = _json.loads(hot[0]["technical_detail_json"])
+		hint = td.get("phase1_hint")
+		assert hint is not None
+		assert "_check_user_exists" in hint["next_hot_callee"]
+		assert hint["phase1_cumulative_ms"] == 340.0
+		# Customer description appended with the hint sentence.
+		assert "Time also flows into" in hot[0]["customer_description"]
+		assert "_check_user_exists" in hot[0]["customer_description"]
+
+	def test_no_phase1_hint_when_no_eligible_descendant(self):
+		# Hot line content doesn't look like a call site — no hint.
+		fn = _function("my_app.common.heavy_arith", [
+			_line(1, "def heavy_arith(n):", 1, 0.0),
+			_line(2, "    return sum(i*i for i in range(n))", 1, 600.0),  # not a call site
+		])
+		tree = {
+			"function": "heavy_arith",
+			"filename": "/fake/path.py",
+			"lineno": 1,
+			"kind": "python",
+			"cumulative_ms": 600.0,
+			"children": [],
+		}
+
+		result = analyzer.analyze([fn], call_trees=[tree])
+
+		hot = [f for f in result.findings if f["finding_type"] == "Hot Line"]
+		assert len(hot) == 1
+		td = _json.loads(hot[0]["technical_detail_json"])
+		# Content doesn't match the call-site shape, so no hint attempt.
+		assert "phase1_hint" not in td

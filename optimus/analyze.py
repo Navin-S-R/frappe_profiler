@@ -1072,6 +1072,11 @@ def _persist(
 	# the whole persist with CharacterLengthExceededError. We clamp
 	# here so a single too-long title never destroys the entire
 	# analyze run.
+	# v0.7.x: collapse per-action duplicates of the same code path
+	# (Slow Hot Path / Hook Bottleneck / Self-Time Hot Path / Repeated
+	# Hot Frame). Runs BEFORE truncation so the dominant title is what
+	# gets trimmed.
+	_dedupe_findings_across_actions(context.findings, context.actions)
 	_truncate_finding_titles(context.findings)
 
 	doc.set("findings", [])
@@ -1080,6 +1085,158 @@ def _persist(
 
 	doc.save(ignore_permissions=True)
 	safe_commit()
+
+
+# v0.7.x: per-action analyzers can emit the same (code-path) finding
+# once per action that exercises it. A recording with N actions
+# touching the same hot function used to produce N near-identical
+# cards (same drill-down, same Phase 2 callout, same AI fix). We
+# collapse them into a single card here.
+_DEDUPE_FINDING_TYPES = frozenset({
+	"Slow Hot Path",
+	"Hook Bottleneck",
+	"Self-Time Hot Path",
+	"Repeated Hot Frame",
+})
+
+
+def _dedupe_findings_across_actions(
+	findings: list[dict],
+	actions: list[dict] | None,
+) -> None:
+	"""Collapse per-action duplicates of the same code path in place.
+
+	Groups findings by ``(finding_type, filename, lineno, function)``
+	for the types listed in ``_DEDUPE_FINDING_TYPES``. When a group has
+	2+ findings, the highest-impact one becomes the "dominant"; the
+	others are dropped after their action context is folded into the
+	dominant's ``technical_detail_json`` (under ``merged_action_refs``
+	and friends) and a one-sentence "Also affects …" note is appended
+	to the dominant's ``customer_description``.
+
+	The dominant's ``estimated_impact_ms`` becomes the SUM across the
+	group, ``affected_count`` becomes the number of merged findings.
+	Its severity / title / action_ref / drilldown_chain stay
+	unchanged so downstream renderers resolve the same way they did
+	before dedup.
+
+	Findings outside the dedup-eligible types pass through untouched
+	(N+1 / SQL red flags / Hot Line have their own dedup logic or
+	aren't per-action by construction).
+	"""
+	if not findings:
+		return
+
+	# Build action_ref → label lookup for the "Also affects" sentence.
+	action_label_by_ref: dict[str, str] = {}
+	for a in (actions or []):
+		if not isinstance(a, dict):
+			continue
+		idx = a.get("idx")
+		label = a.get("action_label") or a.get("path") or ""
+		if idx is not None and label:
+			action_label_by_ref[str(idx)] = label
+
+	# Bucket by dedup key. Findings outside the dedupe set get a
+	# unique passthrough key so they never collide.
+	buckets: dict[tuple, list[int]] = {}
+	passthrough_counter = 0
+	keyed_indices: list[tuple[tuple, int]] = []
+
+	for i, f in enumerate(findings):
+		ftype = f.get("finding_type") or ""
+		if ftype not in _DEDUPE_FINDING_TYPES:
+			# Stable unique key so this finding passes through unchanged.
+			passthrough_counter += 1
+			key = ("__passthrough__", passthrough_counter)
+			keyed_indices.append((key, i))
+			continue
+		try:
+			detail = json.loads(f.get("technical_detail_json") or "{}")
+		except (TypeError, ValueError):
+			detail = {}
+		filename = detail.get("filename") or ""
+		lineno = detail.get("lineno")
+		function = detail.get("function") or ""
+		# Findings missing any of the key parts pass through (can't
+		# group what we can't identify).
+		if not filename or lineno is None or not function:
+			passthrough_counter += 1
+			key = ("__passthrough__", passthrough_counter)
+		else:
+			key = (ftype, filename, int(lineno) if isinstance(lineno, int | float) else lineno, function)
+		keyed_indices.append((key, i))
+
+	for key, i in keyed_indices:
+		buckets.setdefault(key, []).append(i)
+
+	# For each group with 2+ entries: pick dominant, fold others in,
+	# remove dropped indices from `findings` at the end.
+	to_drop: set[int] = set()
+	for _key, indices in buckets.items():
+		if len(indices) < 2:
+			continue
+		# Sort by impact desc; the head is the dominant.
+		indices_sorted = sorted(
+			indices,
+			key=lambda i: -(findings[i].get("estimated_impact_ms") or 0),
+		)
+		dom_idx = indices_sorted[0]
+		dom = findings[dom_idx]
+		merged_impacts: list[dict] = []
+		merged_refs: list[str] = []
+		merged_labels: list[str] = []
+		total_impact = 0.0
+		for i in indices_sorted:
+			f = findings[i]
+			ms = float(f.get("estimated_impact_ms") or 0)
+			total_impact += ms
+			ref = str(f.get("action_ref") or "")
+			label = action_label_by_ref.get(ref, "")
+			merged_refs.append(ref)
+			merged_labels.append(label)
+			merged_impacts.append({"action_ref": ref, "label": label, "ms": round(ms, 2)})
+			if i != dom_idx:
+				to_drop.add(i)
+
+		# Mutate dominant in place.
+		dom["estimated_impact_ms"] = round(total_impact, 2)
+		dom["affected_count"] = len(indices_sorted)
+		try:
+			dom_detail = json.loads(dom.get("technical_detail_json") or "{}")
+		except (TypeError, ValueError):
+			dom_detail = {}
+		dom_detail["merged_count"] = len(indices_sorted)
+		dom_detail["merged_action_refs"] = merged_refs
+		dom_detail["merged_action_labels"] = merged_labels
+		dom_detail["merged_impact_ms"] = merged_impacts
+		dom["technical_detail_json"] = json.dumps(dom_detail, default=str)
+
+		# Append "Also affects …" note to customer_description.
+		other_entries = [e for e in merged_impacts[1:] if e.get("label") or e.get("ms")]
+		if other_entries:
+			if all(e.get("label") for e in other_entries):
+				bits = ", ".join(
+					f"**{e['label']}** ({e['ms']:.0f}ms)" for e in other_entries
+				)
+				suffix = (
+					f" Also affects {len(other_entries)} other "
+					f"action{'s' if len(other_entries) != 1 else ''}: {bits}."
+				)
+			else:
+				# Labels missing — generic count.
+				suffix = (
+					f" Also affects {len(other_entries)} other "
+					f"action{'s' if len(other_entries) != 1 else ''}."
+				)
+			existing = dom.get("customer_description") or ""
+			dom["customer_description"] = existing.rstrip() + "\n\n" + suffix.lstrip()
+
+	if to_drop:
+		# Compact the list in place. Iterating backwards so we don't
+		# shift indices we still need to drop.
+		for i in sorted(to_drop, reverse=True):
+			findings.pop(i)
 
 
 # Optimus Finding.title is a Frappe Data field — VARCHAR(140). Titles

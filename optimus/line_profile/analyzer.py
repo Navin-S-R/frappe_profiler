@@ -18,6 +18,7 @@ split:
 """
 
 import json
+import re
 import traceback
 
 from optimus import safe_commit
@@ -92,6 +93,120 @@ def _function_invoked(fn: dict) -> bool:
 	if not lines:
 		return False
 	return any((line.get("hits") or 0) > 0 or (line.get("total_ms") or 0) > 0 for line in lines)
+
+
+def _strip_line_comment(content: str) -> str:
+	"""Drop a trailing ``# …`` comment from a single Python source line.
+
+	Naively tracks single/double-quoted string state so a ``#`` inside a
+	literal doesn't get treated as a comment boundary. Triple-quoted
+	strings aren't recognised — line_profiler's per-line ``content``
+	carries one source line, so multi-line literals shouldn't appear
+	here in practice. A miss only costs a false negative (regex sees
+	the commented call and we don't suppress); never drops a real leaf.
+	"""
+	in_s: str | None = None
+	for i, ch in enumerate(content):
+		if in_s is not None:
+			if ch == in_s and content[i - 1 : i] != "\\":
+				in_s = None
+			continue
+		if ch in ("'", '"'):
+			in_s = ch
+		elif ch == "#":
+			return content[:i]
+	return content
+
+
+def _detect_pass_through_callee(
+	content: str,
+	self_qualname: str,
+	instrumented: set[str],
+) -> str | None:
+	"""If the hot line is a call into another **instrumented** function,
+	return that callee's qualname; otherwise None.
+
+	The hot line content is matched against ``\\bQ\\s*\\(`` for each
+	other instrumented qualname Q (self-recursion is excluded so a
+	function that calls itself isn't treated as pass-through to itself).
+	Line comments are stripped before matching to avoid false positives
+	on commented-out code like ``# helper(x)``.
+
+	When multiple instrumented qualnames appear on the same source line
+	(e.g. ``a(b(c()))``), the **last** one in the iteration order is
+	returned. The caller resolves chains by walking the per-function
+	classifications transitively, so picking any one of the present
+	qualnames suffices to anchor the chain — the leaf is found by
+	following ``passthrough_to`` until ``None``.
+	"""
+	stripped = _strip_line_comment(content or "")
+	if not stripped:
+		return None
+	last_match: str | None = None
+	for q in instrumented:
+		if q == self_qualname or not q:
+			continue
+		if re.search(r"\b" + re.escape(q) + r"\s*\(", stripped):
+			last_match = q
+	return last_match
+
+
+def _looks_like_call_site(content: str) -> bool:
+	"""True if ``content`` begins with an identifier-call shape like
+	``foo(`` or ``module.attr(``. Used to decide whether to attempt a
+	phase-1 fallback hint for a leaf finding whose hot line is still
+	a call into uninstrumented code.
+	"""
+	stripped = _strip_line_comment(content or "").lstrip()
+	return bool(re.match(r"^[\w.]+\s*\(", stripped))
+
+
+def _compute_phase1_hint(
+	leaf_fn: dict,
+	leaf_line: dict,
+	call_trees: list[dict] | None,
+) -> dict | None:
+	"""When the leaf's hot line still looks like a call but no instrumented
+	callee matched, look up the leaf frame in phase-1's pyinstrument
+	trees and surface the hottest user-code descendant as a hint.
+
+	Returns ``{next_hot_callee, phase1_cumulative_ms, suggested_action}``
+	or None when there's no eligible descendant. Reuses
+	``picker._find_hottest_match`` / ``_eligible_descent_children`` so
+	the framework-boundary stop matches auto_expand's behavior.
+	"""
+	if not call_trees:
+		return None
+	content = leaf_line.get("content") or ""
+	if not _looks_like_call_site(content):
+		return None
+	try:
+		from optimus.line_profile import picker
+	except ImportError:
+		return None
+
+	dotted_path = leaf_fn.get("dotted_path") or ""
+	if not dotted_path:
+		return None
+	root = picker._find_hottest_match(call_trees, dotted_path)
+	if root is None:
+		return None
+	children = picker._eligible_descent_children(root, min_ms=50.0)
+	if not children:
+		return None
+	hottest = max(children, key=lambda c: float(c.get("cumulative_ms") or 0))
+	callee_qualname = hottest.get("function") or ""
+	callee_file = hottest.get("filename") or ""
+	callee_dotted = picker._build_dotted_path(callee_file, callee_qualname)
+	if not callee_dotted:
+		return None
+	return {
+		"next_hot_callee": callee_dotted,
+		"phase1_cumulative_ms": round(float(hottest.get("cumulative_ms") or 0), 2),
+		"suggested_action": (
+			f"Re-run Phase 2 with {callee_dotted} picked for line-level breakdown."
+		),
+	}
 
 
 def _hot_line_finding(fn: dict, line: dict, severity: str) -> dict:
@@ -173,7 +288,119 @@ def _summary_for_function(fn: dict, invoked: bool) -> dict:
 	}
 
 
-def analyze(results_json: list[dict]) -> AnalyzerResult:
+def _qualname_of(fn: dict) -> str:
+	"""Resolve fn's qualname, falling back to the last segment of its
+	dotted_path. Used to key the per-function classification map."""
+	return fn.get("qualname") or fn["dotted_path"].rsplit(".", 1)[-1]
+
+
+def _build_call_chain(
+	leaf_qualname: str,
+	classifications: dict,
+	callers_to: dict,
+) -> list[dict]:
+	"""Walk upward from a leaf qualname to assemble its call chain.
+
+	Returns an ordered list (outermost → leaf) of step dicts shaped like:
+	``{dotted_path, qualname, file, lineno, content, total_ms, hits}``.
+	Each step is the *hottest line* of the function at that level of
+	the chain (which is the call into the next-deeper instrumented
+	function for every non-leaf step, and the actual leaf hot line at
+	the end).
+
+	Empty chain (length 0) is returned when the leaf has no upstream
+	pass-through caller — i.e. it's a standalone function with no
+	wrapper finding to merge into. Single-step "chain" makes no sense
+	to render either, so we return [] in that case.
+
+	When the leaf has multiple callers (two functions whose hot lines
+	both call into this leaf), the chain follows the **hottest** caller
+	at each step — measured by the caller's function-total ``total_ms``.
+	"""
+	seen: set[str] = {leaf_qualname}
+	chain_qualnames: list[str] = [leaf_qualname]
+	cursor = leaf_qualname
+	while True:
+		callers = [q for q in callers_to.get(cursor, []) if q not in seen]
+		if not callers:
+			break
+
+		def _caller_total_ms(q: str) -> float:
+			lines = classifications[q]["fn"].get("lines") or []
+			return sum((line.get("total_ms") or 0) for line in lines)
+
+		chosen = max(callers, key=_caller_total_ms)
+		chain_qualnames.append(chosen)
+		seen.add(chosen)
+		cursor = chosen
+
+	if len(chain_qualnames) == 1:
+		return []
+
+	# Reverse to outer→leaf order.
+	chain_qualnames.reverse()
+	chain: list[dict] = []
+	for q in chain_qualnames:
+		entry = classifications[q]
+		fn = entry["fn"]
+		hottest = entry.get("hottest") or {}
+		chain.append({
+			"qualname": q,
+			"dotted_path": fn.get("dotted_path") or "",
+			"file": fn.get("file"),
+			"lineno": hottest.get("lineno"),
+			"content": hottest.get("content", ""),
+			"total_ms": round(hottest.get("total_ms") or 0, 2),
+			"hits": hottest.get("hits") or 0,
+		})
+	return chain
+
+
+def _attach_call_chain(finding: dict, chain: list[dict]) -> None:
+	"""Inject ``chain`` into the finding's technical_detail_json and
+	prepend a one-line breadcrumb to its customer_description."""
+	if not chain:
+		return
+	try:
+		td = json.loads(finding["technical_detail_json"])
+	except (json.JSONDecodeError, TypeError):
+		td = {}
+	td["call_chain"] = chain
+	finding["technical_detail_json"] = json.dumps(td, default=str)
+
+	breadcrumb = " → ".join(
+		f"{step['qualname']}:{step['lineno']}" for step in chain
+	)
+	prefix = (
+		f"Time enters through {breadcrumb}. The deepest line below is "
+		"where the cost is actually incurred."
+	)
+	finding["customer_description"] = prefix + "\n\n" + finding["customer_description"]
+
+
+def _attach_phase1_hint(finding: dict, hint: dict) -> None:
+	"""Inject ``hint`` into the finding's technical_detail_json and append
+	a one-line note to its customer_description."""
+	if not hint:
+		return
+	try:
+		td = json.loads(finding["technical_detail_json"])
+	except (json.JSONDecodeError, TypeError):
+		td = {}
+	td["phase1_hint"] = hint
+	finding["technical_detail_json"] = json.dumps(td, default=str)
+
+	finding["customer_description"] = finding["customer_description"] + (
+		f"\n\nTime also flows into **{hint['next_hot_callee']}** "
+		f"({hint['phase1_cumulative_ms']:.0f}ms in phase 1). "
+		f"{hint['suggested_action']}"
+	)
+
+
+def analyze(
+	results_json: list[dict],
+	call_trees: list[dict] | None = None,
+) -> AnalyzerResult:
 	"""Pure: turn the merged phase-2 ``results_json`` into an AnalyzerResult.
 
 	Input shape (one entry per picked function)::
@@ -186,9 +413,19 @@ def analyze(results_json: list[dict]) -> AnalyzerResult:
 	                   "total_ms", "per_hit_us"}, ...],
 	    }, ...]
 
+	``call_trees`` is the optional list of phase-1 pyinstrument trees
+	for the parent session (one per recorded action). When provided, a
+	leaf finding whose hot line still looks like a call into
+	uninstrumented code receives a ``phase1_hint`` pointing at the
+	hottest user-code descendant in phase-1's tree, so the developer
+	knows which function to re-pick for a deeper drill-in.
+
 	Output:
-	  - findings: ``Hot Line`` (High/Medium) per function with a dominant
-	    line, ``Function Not Invoked`` (Low) per pick that recorded nothing.
+	  - findings: ``Hot Line`` (High/Medium) per **leaf** function whose
+	    hot line is the real cost driver. Functions whose hot line is
+	    just a call into another instrumented function are suppressed —
+	    their position is preserved as a breadcrumb on the deeper finding.
+	    ``Function Not Invoked`` (Low) per pick that recorded nothing.
 	  - aggregate: ``{phase2_functions: [per-function summary, ...]}`` —
 	    each summary carries top-5 lines by ``total_ms``.
 	  - warnings: human-readable strings for the report's warnings panel.
@@ -197,23 +434,88 @@ def analyze(results_json: list[dict]) -> AnalyzerResult:
 	summaries: list[dict] = []
 	warnings: list[str] = []
 
+	instrumented_qualnames = {_qualname_of(fn) for fn in results_json}
+
+	# Phase A: classify each function's hot line as leaf or pass-through.
+	classifications: dict[str, dict] = {}
 	for fn in results_json:
+		qualname = _qualname_of(fn)
 		invoked = _function_invoked(fn)
 		summaries.append(_summary_for_function(fn, invoked))
-
 		if not invoked:
-			findings.append(_not_invoked_finding(fn))
+			classifications[qualname] = {"invoked": False, "fn": fn}
+			continue
+		lines = fn["lines"]
+		hottest = max(lines, key=lambda l: l.get("total_ms") or 0)
+		passthrough_to = _detect_pass_through_callee(
+			hottest.get("content") or "",
+			qualname,
+			instrumented_qualnames,
+		)
+		# Phase-1 ancestry fallback: the wrapper's hot line might call
+		# an uninstrumented intermediate (regex misses it) whose own
+		# descendant IS instrumented. Walking phase-1's call tree
+		# bridges that gap.
+		if passthrough_to is None and call_trees:
+			try:
+				from optimus.line_profile.picker import (
+					deepest_instrumented_descendant,
+				)
+			except ImportError:
+				deepest_instrumented_descendant = None  # type: ignore[assignment]
+			if deepest_instrumented_descendant is not None:
+				for tree in call_trees:
+					candidate = deepest_instrumented_descendant(
+						tree, qualname, instrumented_qualnames,
+					)
+					if candidate and candidate != qualname:
+						passthrough_to = candidate
+						break
+		classifications[qualname] = {
+			"invoked": True,
+			"fn": fn,
+			"hottest": hottest,
+			"passthrough_to": passthrough_to,
+		}
+
+	# Reverse map: callee qualname → list of caller qualnames whose hot
+	# line passes through to it. Drives chain-building from the leaf up.
+	callers_to: dict[str, list[str]] = {}
+	for caller_q, c in classifications.items():
+		callee = c.get("passthrough_to") if c.get("invoked") else None
+		if callee:
+			callers_to.setdefault(callee, []).append(caller_q)
+
+	# Phase B: emit findings.
+	for qualname, c in classifications.items():
+		if not c["invoked"]:
+			findings.append(_not_invoked_finding(c["fn"]))
 			warnings.append(
-				f"Function {fn['dotted_path']} was picked but never invoked"
+				f"Function {c['fn']['dotted_path']} was picked but never invoked"
 			)
 			continue
-
-		lines = fn["lines"]
-		total_ms = sum((line.get("total_ms") or 0) for line in lines)
-		hottest = max(lines, key=lambda l: l.get("total_ms") or 0)
+		if c["passthrough_to"]:
+			# Suppress — defer to the deeper leaf's finding. The chain is
+			# rebuilt when we visit that leaf below.
+			continue
+		fn = c["fn"]
+		hottest = c["hottest"]
+		total_ms = sum((line.get("total_ms") or 0) for line in fn["lines"])
 		severity = _classify_hot_line(hottest.get("total_ms") or 0, total_ms)
-		if severity:
-			findings.append(_hot_line_finding(fn, hottest, severity))
+		if not severity:
+			continue
+		finding = _hot_line_finding(fn, hottest, severity)
+		chain = _build_call_chain(qualname, classifications, callers_to)
+		if chain:
+			_attach_call_chain(finding, chain)
+		else:
+			# No upstream pass-through caller — try the phase-1 fallback
+			# hint for the rarer case where this finding's hot line is
+			# itself a call into uninstrumented code.
+			hint = _compute_phase1_hint(fn, hottest, call_trees)
+			if hint:
+				_attach_phase1_hint(finding, hint)
+		findings.append(finding)
 
 	return AnalyzerResult(
 		findings=findings,
@@ -267,9 +569,31 @@ def run_analyze(session_uuid: str, run_uuid: str) -> None:
 		picks = capture.read_picks_meta(run_uuid)
 
 		# Aggregate raw samples into the analyzer's input shape, then run
-		# the pure classifier.
+		# the pure classifier. Phase-1's pyinstrument call trees feed the
+		# ancestry-based pass-through detection so wrappers/leaves
+		# instrumented across a thin uninstrumented intermediate still
+		# merge into a single deepest finding.
 		results_json = capture.aggregate_samples(samples, picks)
-		result = analyze(results_json)
+		call_trees: list[dict] = []
+		try:
+			parent_session = frappe.get_doc("Optimus Session", parent_docname)
+			for action in (parent_session.actions or []):
+				raw_tree = getattr(action, "call_tree_json", None)
+				if not raw_tree:
+					continue
+				try:
+					tree = json.loads(raw_tree)
+				except (TypeError, ValueError):
+					continue
+				if isinstance(tree, dict) and "root" in tree:
+					tree = tree["root"]
+				if isinstance(tree, dict):
+					call_trees.append(tree)
+		except Exception:
+			# Loading phase-1 trees is best-effort — without them we
+			# fall back to regex-only pass-through detection.
+			call_trees = []
+		result = analyze(results_json, call_trees=call_trees or None)
 		total_ms = sum(s.get("total_ms") or 0 for s in result.aggregate.get("phase2_functions", []))
 
 		# Persist to the run row + propagate findings to the parent session.

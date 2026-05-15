@@ -236,10 +236,12 @@ def _extract_app_segment(norm: str) -> str | None:
 	- ``apps/<app>/<app>/foo.py`` (bench-relative)
 	- ``<app>/foo.py`` (pyinstrument short form after path strip)
 	- ``/abs/path/to/apps/<app>/<app>/foo.py`` (absolute)
+	- ``/abs/path/<arbitrary>/foo.py`` (absolute without ``apps/``)
 
 	For the short form we treat the first path segment as the app.
 	For the bench-relative / absolute forms we return the segment
-	that follows ``apps/``.
+	that follows ``apps/``. When neither ``apps/`` is found nor the
+	path has any non-slash segment, return ``None``.
 	"""
 	if not norm:
 		return None
@@ -251,8 +253,16 @@ def _extract_app_segment(norm: str) -> str | None:
 		first = tail.split("/", 1)[0]
 		if first:
 			return first
-	# Short form — first segment.
-	first = norm.split("/", 1)[0]
+	# v0.7.x: strip any leading slashes so absolute paths without
+	# ``apps/`` (e.g. ``/Users/.../foo.py`` test fixtures) still
+	# produce a non-empty segment instead of falling through to
+	# ``_OTHER_APP_LABEL``. The first non-slash segment is a
+	# reasonable best-effort app label; if the segment ends up
+	# being a meaningless prefix (``Users``, ``tmp``), the row
+	# still buckets under that label rather than disappearing
+	# from the rendered Findings section.
+	stripped = norm.lstrip("/")
+	first = stripped.split("/", 1)[0]
 	return first or None
 
 

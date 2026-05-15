@@ -338,7 +338,7 @@ def _classify_column(
 	# keeps the suggestion as-is using the legacy plain-index DDL.
 	if not types and not indexed:
 		return "unknown", (
-			f"ALTER TABLE `{table}` ADD INDEX `idx_{column}` (`{column}`);"
+			f"ALTER TABLE `{table}` ADD INDEX IF NOT EXISTS `{column}_index` (`{column}`);"
 		)
 
 	# Column doesn't exist on the table.
@@ -367,7 +367,7 @@ def _classify_column(
 
 	if dtype in _PREFIX_REQUIRED_TYPES:
 		return "actionable", (
-			f"ALTER TABLE `{table}` ADD INDEX `idx_{column}` "
+			f"ALTER TABLE `{table}` ADD INDEX IF NOT EXISTS `{column}_index` "
 			f"(`{column}`({TEXT_INDEX_PREFIX_LENGTH}));"
 		)
 
@@ -376,7 +376,7 @@ def _classify_column(
 	# information_schema lookup returned no row), fall through to
 	# plain DDL rather than silently drop.
 	return "actionable", (
-		f"ALTER TABLE `{table}` ADD INDEX `idx_{column}` (`{column}`);"
+		f"ALTER TABLE `{table}` ADD INDEX IF NOT EXISTS `{column}_index` (`{column}`);"
 	)
 
 

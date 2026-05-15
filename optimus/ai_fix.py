@@ -43,6 +43,15 @@ class AiFixError(Exception):
 # Findings that carry enough code / SQL context for the LLM to reason about
 # a concrete fix. Infra / frontend / "function not invoked" findings are
 # excluded — the LLM would only get a title + a couple of numbers.
+#
+# v0.7.x: Slow Hot Path / Hook Bottleneck / Repeated Hot Frame removed.
+# Their AI suggestions are structurally generic (the LLM only sees a
+# function name + percentage + line range) and the actionable insight
+# already lives on the embedded N+1 / Hot Line / Redundant Call that
+# shares the same chain leaf. Skipping these types saves tokens without
+# losing diagnostic signal — the broader hot-path findings still appear
+# in the Findings section with their smoking-gun + drill-down; they
+# just no longer carry an LLM-rendered "Suggested fix" block.
 AI_ELIGIBLE_FINDING_TYPES: frozenset[str] = frozenset({
 	"N+1 Query",
 	"Framework N+1",
@@ -53,9 +62,6 @@ AI_ELIGIBLE_FINDING_TYPES: frozenset[str] = frozenset({
 	"Temporary Table",
 	"Low Filter Ratio",
 	"Redundant Call",
-	"Slow Hot Path",
-	"Hook Bottleneck",
-	"Repeated Hot Frame",
 	"Hot Line",
 })
 

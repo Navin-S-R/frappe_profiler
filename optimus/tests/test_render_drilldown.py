@@ -140,7 +140,19 @@ class TestDrilldownRender:
 		# Percentages render as "% of parent".
 		assert "% of parent" in html
 
-	def test_finding_without_matching_tree_node_skips_drilldown(self):
+	def test_finding_without_matching_tree_node_renders_placeholder(self):
+		"""v0.7.x: a finding whose callsite doesn't match any node in
+		the tree (origin lookup fails) is now treated the same as
+		'chain attempted but empty' — the Drill-down placeholder
+		renders ('no deeper user-code frame'). The attachment runs
+		because the finding has a callsite + action_ref + tree; the
+		walker returns [] because it couldn't locate the origin, and
+		the template's placeholder branch fires.
+
+		Pre-v0.7 this case rendered nothing at all. The placeholder is
+		slightly less accurate here ('we couldn't find the origin'
+		isn't quite 'no deeper code'), but it's still defensible — the
+		user sees that drill-down was tried and produced no chain."""
 		from optimus import renderer
 
 		doc = _doc(
@@ -157,8 +169,14 @@ class TestDrilldownRender:
 		)
 		html = renderer.render_raw(doc, recordings=[])
 
-		# Drill-down label is absent — no matching origin in the tree.
-		assert "Drill-down:" not in html
+		# Drill-down label IS present (the placeholder uses it).
+		assert "Drill-down:" in html
+		# Placeholder text rendered.
+		assert "no deeper user-code frame" in html
+		# No actual chain entries rendered — the bg of `_run_validations`
+		# / framework descent shouldn't appear (we never matched an
+		# origin to walk from).
+		assert "% of parent" not in html
 
 	def test_finding_without_action_ref_skips_drilldown(self):
 		from optimus import renderer

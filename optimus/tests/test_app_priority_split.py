@@ -134,10 +134,11 @@ def _doc(*, actions=None, top_queries=None, hot_frames=None):
 
 
 class TestPerActionSplit:
-	def test_custom_actions_above_framework_collapsed_block(self):
-		# 1 custom action + 2 framework actions. Custom should render in the
-		# primary <table>; the two framework rows should sit inside a
-		# <details class="subsection">.
+	def test_custom_actions_above_framework_collapsed_block_with_tracked_apps(self):
+		"""v0.7.x: per-action split only kicks in when the admin has
+		configured Tracked Apps. With tracked_apps=("myapp",):
+		1 myapp action in main + 2 frappe actions in the framework
+		subsection."""
 		doc = _doc(actions=[
 			_action_ns(action_label="POST /api/method/myapp.handlers.recompute",
 			           event_type="HTTP Request", http_method="POST",
@@ -152,7 +153,11 @@ class TestPerActionSplit:
 			           path="/api/method/frappe.client.get_value",
 			           recording_uuid="r2", duration_ms=120),
 		])
-		html = renderer.render_raw(doc, recordings=[])
+		with patch(
+			"optimus.settings.get_config",
+			return_value=OptimusConfig(tracked_apps=("myapp",)),
+		):
+			html = renderer.render_raw(doc, recordings=[])
 
 		# Section heading still renders.
 		assert "<h2>Per-action breakdown</h2>" in html
@@ -167,13 +172,46 @@ class TestPerActionSplit:
 		# they're buried).
 		assert "the developer can't easily patch these" in html
 
+	def test_no_split_when_tracked_apps_empty(self):
+		"""v0.7.x: when Tracked Apps is empty (default), the per-action
+		breakdown does NOT split — all actions, including those hitting
+		Frappe endpoints, stay in the main table. Pre-v0.7 every
+		HTTP request to ``/api/method/frappe.*`` was hidden in the
+		collapsed framework subsection, leaving Background Jobs as the
+		only visible rows in the main table."""
+		doc = _doc(actions=[
+			_action_ns(action_label="POST /api/method/myapp.handlers.recompute",
+			           event_type="HTTP Request", http_method="POST",
+			           path="/api/method/myapp.handlers.recompute",
+			           recording_uuid="r0", duration_ms=300),
+			_action_ns(action_label="POST /api/method/frappe.desk.form.save.savedocs",
+			           event_type="HTTP Request", http_method="POST",
+			           path="/api/method/frappe.desk.form.save.savedocs",
+			           recording_uuid="r1", duration_ms=900),
+		])
+		# Default: get_config returns OptimusConfig with tracked_apps=().
+		html = renderer.render_raw(doc, recordings=[])
+
+		# No subsection summary phrase — no split happened.
+		assert "framework actions (click to expand)" not in html
+		assert "framework action (click to expand)" not in html
+		# Both actions appear in the main table.
+		assert "myapp.handlers.recompute" in html
+		assert "frappe.desk.form.save.savedocs" in html
+
 	def test_no_framework_actions_no_collapsed_block(self):
+		"""When tracked_apps IS configured but every action is in a
+		tracked app, the collapsed framework subsection doesn't render."""
 		doc = _doc(actions=[
 			_action_ns(action_label="POST /api/method/myapp.handlers.x",
 			           event_type="HTTP Request", path="/api/method/myapp.handlers.x",
 			           recording_uuid="r0", duration_ms=200),
 		])
-		html = renderer.render_raw(doc, recordings=[])
+		with patch(
+			"optimus.settings.get_config",
+			return_value=OptimusConfig(tracked_apps=("myapp",)),
+		):
+			html = renderer.render_raw(doc, recordings=[])
 		# No subsection summary phrase for a section with 0 framework rows.
 		assert "framework actions (click to expand)" not in html
 		assert "framework action (click to expand)" not in html

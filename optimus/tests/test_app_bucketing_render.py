@@ -169,9 +169,11 @@ def test_finding_without_callsite_goes_to_other_bucket():
 	)
 	html = renderer.render(doc, recordings=[])
 
-	# "CPU saturated" is observational, so it's in Observations, not Findings.
-	# Test that the "Other" bucket exists in the Observations area.
-	assert "CPU saturated" in html
+	# v0.7.x: the 'Other (no callsite)' bucket is suppressed from
+	# rendering for both actionable AND observational findings.
+	# A Resource Contention with no callsite no longer appears in
+	# the Observations section (pre-v0.7 it did).
+	assert "CPU saturated" not in html
 
 
 def test_observations_also_bucketed_by_app():
@@ -274,9 +276,14 @@ class TestIgnoredAppsFilter:
 		assert "FrappeFinding" in html and "ErpnextFinding" in html and "MyappFinding" in html
 		assert "hidden from ignored apps" not in html
 
-	def test_findings_with_no_callsite_are_kept_regardless(self):
-		# Findings whose blame app is _OTHER_APP_LABEL ("Other (no callsite)")
-		# never match any real app name, so they survive any Ignored Apps list.
+	def test_findings_with_no_callsite_are_suppressed_in_render(self):
+		"""v0.7.x: findings whose blame app resolves to ``_OTHER_APP_LABEL``
+		(no resolvable callsite) are suppressed from the rendered Findings
+		section. The 'Other (no callsite)' bucket as a whole is dropped,
+		so even unfiltered no-callsite rows don't appear in the HTML.
+		Pre-v0.7 they survived as a tail bucket because the renderer
+		treated 'no callsite' as still-useful; the user feedback was
+		that those rows added noise without a file:line to act on."""
 		from optimus import renderer
 
 		uncallsite = types.SimpleNamespace()
@@ -296,7 +303,8 @@ class TestIgnoredAppsFilter:
 			html = renderer.render(doc, recordings=[])
 
 		assert "FrappeFinding" not in html
-		assert "NoCallsiteFinding" in html  # no callsite → survives
+		# v0.7.x: dropped along with the 'Other (no callsite)' bucket.
+		assert "NoCallsiteFinding" not in html
 
 	def test_severity_counts_reflect_the_kept_set(self):
 		# The "Issues found" stat card sums to the kept count, not the total.
