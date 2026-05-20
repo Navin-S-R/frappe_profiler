@@ -160,6 +160,55 @@ class TestEnrichFindingsWithSourceSnippets:
 		# Function should not crash on malformed JSON.
 		assert f["technical_detail_json"] == "{not valid json"
 
+	def test_non_dict_finding_skipped_cleanly(self, tmp_path):
+		# The function is typed as ``list[dict]`` but defence-in-depth:
+		# a corrupted upstream payload could plant a non-dict entry
+		# (None, scalar, list, string). The whole analyze job must not
+		# crash because of one bad row — silent skip per the function's
+		# best-effort contract, valid neighbours still get enriched.
+		src = tmp_path / "fake.py"
+		src.write_text("a\nb\nc\n")
+		good = _finding(str(src), 2)
+		findings = [None, "garbage", 42, [1, 2], good]
+
+		# Must not raise on any non-dict entry.
+		analyze._enrich_findings_with_source_snippets(findings)
+
+		# The valid neighbour still got its snippet attached.
+		snippet = _read_snippet(good)
+		assert snippet == [
+			{"lineno": 1, "content": "a"},
+			{"lineno": 2, "content": "b"},
+			{"lineno": 3, "content": "c"},
+		]
+
+	def test_non_dict_detail_skipped_cleanly(self, tmp_path):
+		# ``json.loads("null") -> None``, ``json.loads('"x"') -> "x"``,
+		# ``json.loads("[1,2]") -> [1, 2]`` — all valid JSON, none are
+		# the dict shape the rest of the loop assumes. Each must silent-
+		# skip; the valid neighbour still gets enriched.
+		src = tmp_path / "fake.py"
+		src.write_text("a\nb\nc\n")
+		good = _finding(str(src), 2)
+		findings = [
+			{"technical_detail_json": "null"},
+			{"technical_detail_json": '"a string"'},
+			{"technical_detail_json": "[1, 2, 3]"},
+			{"technical_detail_json": "42"},
+			good,
+		]
+
+		# Must not raise on any non-dict detail shape.
+		analyze._enrich_findings_with_source_snippets(findings)
+
+		# The valid neighbour still got its snippet attached.
+		snippet = _read_snippet(good)
+		assert snippet == [
+			{"lineno": 1, "content": "a"},
+			{"lineno": 2, "content": "b"},
+			{"lineno": 3, "content": "c"},
+		]
+
 	def test_string_form_callsite_skipped_cleanly(self, tmp_path):
 		# Slow Query findings (optimus/analyzers/top_queries.py:129) store
 		# callsite as a "path:lineno" string, not the canonical
