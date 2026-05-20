@@ -79,7 +79,15 @@ jobs:
           python -m pip install pytest pytest-github-actions-annotate-failures hypothesis Faker pdfplumber pypdf sql_metadata
 
       - name: Run pytest
+        # ``set -eo pipefail`` is required: without it, the ``| tee`` at the
+        # end of the pipeline returns 0 (tee always succeeds) and pytest's
+        # non-zero exit code is silently discarded — the step would report
+        # green even when tests fail. GitHub Actions' default Linux shell
+        # is ``bash`` invoked via ``sh -c`` and does NOT include pipefail
+        # (only explicit ``shell: bash`` opts in to ``--noprofile --norc
+        # -eo pipefail``).
         run: |
+          set -eo pipefail
           python -m pytest optimus/tests/ -v --tb=long -rA 2>&1 | tee pytest-${{ matrix.python-version }}.log
 
       - name: Publish pytest summary
