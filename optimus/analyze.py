@@ -1388,6 +1388,14 @@ def _enrich_findings_with_source_snippets(findings: list[dict]) -> None:
 		except Exception:
 			continue
 		callsite = detail.get("callsite") or {}
+		if not isinstance(callsite, dict):
+			# Slow Query findings (optimus/analyzers/top_queries.py) store
+			# callsite as a "path:lineno" string, not the canonical dict
+			# shape every other finding type uses. Skip analyze-time
+			# enrichment here — renderer._normalize_callsite converts the
+			# string at render time and renderer._finding_to_dict attaches
+			# the snippet lazily, so no functionality is lost.
+			continue
 		if not callsite.get("filename"):
 			# call_tree (Slow Hot Path / Hook Bottleneck / Repeated Hot Frame)
 			# and line_profile (Hot Line) store the location at the top level —
