@@ -86,7 +86,14 @@ except ImportError:
 		local=_types.SimpleNamespace(),
 		db=_types.SimpleNamespace(),
 		session=_types.SimpleNamespace(user="Administrator"),
-		flags=_types.SimpleNamespace(),
+		# in_test=True signals to renderer._path_within_bench (and other
+		# defence-in-depth boundary checks) that pytest is the caller, so
+		# tmp_path fixtures pointing at /tmp/... aren't rejected. On a real
+		# bench the same path-resolution attempt raises RuntimeError from
+		# the unbound LocalProxy and the boundary check's outer try/except
+		# catches that — but the SimpleNamespace stub returns False instead
+		# of raising, so we have to set the flag explicitly here.
+		flags=_types.SimpleNamespace(in_test=True),
 		cache=_types.SimpleNamespace(),
 		_dict=dict,
 		whitelist=lambda *a, **kw: (lambda f: f),
@@ -127,6 +134,13 @@ except ImportError:
 	)
 	_mk_module("frappe.database")
 	_mk_module("frappe.database.utils", is_query_type=lambda *a, **kw: False)
+	# ``rate_limit`` is a decorator factory — ``@rate_limit(key=..., limit=...,
+	# seconds=...)`` wraps API handlers in optimus/api.py. The stub returns a
+	# no-op decorator so the wrapped functions stay callable for tests.
+	_mk_module(
+		"frappe.rate_limiter",
+		rate_limit=lambda *a, **kw: (lambda f: f),
+	)
 	_mk_module(
 		"frappe.recorder",
 		RECORDER_REQUEST_HASH="recorder:request",

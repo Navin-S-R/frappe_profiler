@@ -76,7 +76,7 @@ jobs:
         # contained.
         run: |
           python -m pip install -e .
-          python -m pip install pytest pytest-github-actions-annotate-failures hypothesis Faker pdfplumber pypdf sql_metadata
+          python -m pip install pytest pytest-github-actions-annotate-failures hypothesis Faker pdfplumber pypdf sql_metadata jsonschema
 
       - name: Run pytest
         # ``set -eo pipefail`` is required: without it, the ``| tee`` at the
