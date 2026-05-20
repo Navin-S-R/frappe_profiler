@@ -1380,12 +1380,23 @@ def _enrich_findings_with_source_snippets(findings: list[dict]) -> None:
 	file_cache: dict[str, list[str] | None] = {}
 
 	for finding in findings:
+		if not isinstance(finding, dict):
+			# Defence-in-depth: the public surface is typed as list[dict]
+			# but a corrupted upstream payload (legacy session, partial
+			# migration) could plant a non-dict entry. Silent skip matches
+			# the function's best-effort contract.
+			continue
 		raw = finding.get("technical_detail_json")
 		if not raw:
 			continue
 		try:
 			detail = json.loads(raw)
 		except Exception:
+			continue
+		if not isinstance(detail, dict):
+			# Valid JSON that isn't an object — e.g. a stray "string", a
+			# bare ``null``, or a top-level list left by a stale persistence
+			# path. ``.get()`` below would AttributeError; silent skip.
 			continue
 		callsite = detail.get("callsite") or {}
 		if not isinstance(callsite, dict):
