@@ -5,8 +5,18 @@ name: Tests
 on:
   push:
     branches: ['**']
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   pull_request:
     branches: ['**']
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 # Cancel any in-flight run for the same branch/PR when a new commit lands —
@@ -28,8 +38,10 @@ jobs:
       fail-fast: false
       matrix:
         # 3.12: the broad-compat baseline most production benches run.
+        # 3.13: current stable release; the upgrade target for benches
+        #       moving off 3.12.
         # 3.14: matches the dev bench's interpreter (Python 3.14.2 locally).
-        python-version: ['3.12', '3.14']
+        python-version: ['3.12', '3.13', '3.14']
 
     steps:
       - name: Checkout
@@ -64,11 +76,27 @@ jobs:
         # contained.
         run: |
           python -m pip install -e .
-          python -m pip install pytest hypothesis Faker pdfplumber pypdf sql_metadata
+          python -m pip install pytest pytest-github-actions-annotate-failures hypothesis Faker pdfplumber pypdf sql_metadata
 
       - name: Run pytest
         run: |
           python -m pytest optimus/tests/ -v --tb=long -rA 2>&1 | tee pytest-${{ matrix.python-version }}.log
+
+      - name: Publish pytest summary
+        # Surface the -rA short summary on the run page's "Summary" tab so
+        # readers don't have to click into the log to see pass/fail counts.
+        # ``if: always()`` so the summary still appears when pytest exits
+        # non-zero; the ``|| true`` on grep keeps the step green even when
+        # no lines match (e.g. catastrophic collection error).
+        if: always()
+        run: |
+          {
+            echo "## pytest summary (Python ${{ matrix.python-version }})"
+            echo '```'
+            grep -E '^(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS|=+ .* =+|short test summary)' \
+              pytest-${{ matrix.python-version }}.log | tail -200 || true
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
 
       - name: Upload pytest log on failure
         if: failure()
@@ -104,3 +132,32 @@ jobs:
       # Format-check is deferred — the codebase predates the [tool.ruff.format]
       # config and a large reformat is its own piece of work. Add a
       # ``ruff format --check optimus/`` step here once that lands.
+
+  audit:
+    name: pip-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install project + pip-audit
+        # ``-e .`` installs the same runtime deps the test job uses, so
+        # the audit reports against the same resolved tree CI actually
+        # runs against.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pip-audit
+
+      - name: Run pip-audit on installed env
+        # --strict turns warnings into failures. If a known-not-applicable
+        # CVE blocks CI later, add ``--ignore-vuln <GHSA-ID>`` here rather
+        # than dropping --strict wholesale — that preserves the gate while
+        # documenting the carve-out.
+        run: pip-audit --strict
