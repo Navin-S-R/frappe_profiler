@@ -174,7 +174,14 @@ def _identify_args(fn_name: str, args: tuple, kwargs: dict):
 # Maximum entries per recording's sidecar list. Above this, additional
 # wraps drop their entries silently and set a truncation flag on the
 # request-local context. The analyze pipeline surfaces this as a warning.
-SIDECAR_CAP_PER_RECORDING = 50_000
+# Phase K hardening: lowered from 50_000 to 10_000. At ~500B per
+# sidecar entry, 50K entries = ~25MB per recording, which compounds
+# on busy multi-recording sessions. 10K still captures the dedup
+# signal for 99%+ of real workloads (the most-repeated call patterns
+# saturate within the first few thousand entries); rare deep-loop
+# pathologies that need >10K entries get a truncation banner and a
+# clear hint to refactor the loop.
+SIDECAR_CAP_PER_RECORDING = 10_000
 
 
 def _make_wrap(orig, fn_name: str, local_proxy=None):

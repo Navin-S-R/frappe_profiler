@@ -81,14 +81,18 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 			all_queries.append(
 				{
 					"normalized_query": (call.get("normalized_query") or call.get("query") or "")[:500],
-					"duration_ms": round(call.get("duration", 0), 2),
+					# v0.7.x M5: renamed from ``duration_ms`` to disambiguate
+				# from action.duration_ms (per-request wall) and
+				# t.duration_ms (consolidated per-table). This is the
+				# per-call duration of a single query execution.
+				"query_duration_ms": round(call.get("duration", 0), 2),
 					"action_idx": action_idx,
 					"recording_uuid": recording.get("uuid"),
 					"callsite": walk_callsite_str(call.get("stack")),
 				}
 			)
 
-	all_queries.sort(key=lambda q: q["duration_ms"], reverse=True)
+	all_queries.sort(key=lambda q: q["query_duration_ms"], reverse=True)
 
 	# Scope the leaderboard to the user's own app code — framework /
 	# third-party queries are dropped here, BEFORE truncating to top N,
@@ -101,21 +105,21 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 	# empty rather than listing noise.
 	top = [
 		q for q in all_queries
-		if q["duration_ms"] >= TOP_QUERY_FLOOR_MS
+		if q["query_duration_ms"] >= TOP_QUERY_FLOOR_MS
 		and not is_framework_callsite_str(q["callsite"], tracked_apps)
 	][:DEFAULT_TOP_N]
 
 	findings = []
 	for q in top[:MAX_FINDINGS]:
-		if q["duration_ms"] <= slow_threshold:
+		if q["query_duration_ms"] <= slow_threshold:
 			break  # the rest are below threshold; sorted desc so we can break
 		findings.append(
 			{
 				"finding_type": "Slow Query",
-				"severity": "High" if q["duration_ms"] > high_threshold else "Medium",
-				"title": f"Slow query: {q['duration_ms']:.0f}ms",
+				"severity": "High" if q["query_duration_ms"] > high_threshold else "Medium",
+				"title": f"Slow query: {q['query_duration_ms']:.0f}ms",
 				"customer_description": (
-					f"A single query took {q['duration_ms']:.0f}ms to run. "
+					f"A single query took {q['query_duration_ms']:.0f}ms to run. "
 					"This is one of the slowest queries in the session and is "
 					"a likely candidate for optimization."
 				),
@@ -133,13 +137,27 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 					},
 					default=str,
 				),
-				"estimated_impact_ms": q["duration_ms"],
+				"estimated_impact_ms": q["query_duration_ms"],
 				"affected_count": 1,
 				"action_ref": str(q["action_idx"]),
 			}
 		)
 
 	return AnalyzerResult(findings=findings, aggregate={"top_queries": top})
+
+
+def count_suppressed_findings(top_queries: list[dict], slow_threshold_ms: float) -> int:
+	"""B.DI4 — how many user-app slow queries the findings cap dropped.
+
+	Computed at render time (not at analyze time) so adding a new
+	disclosure doesn't require a DocType migration: ``top_queries_json``
+	persists the full top-N list, and any change to the slow threshold
+	(Optimus Settings) re-applies on the next render.
+	"""
+	if not top_queries or not slow_threshold_ms:
+		return 0
+	n_above = sum(1 for q in top_queries if (q.get("query_duration_ms") or 0) > slow_threshold_ms)
+	return max(0, n_above - MAX_FINDINGS)
 
 
 # Callsite walking is shared across analyzers via base.walk_callsite_str.

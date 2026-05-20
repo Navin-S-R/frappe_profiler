@@ -1,0 +1,18 @@
+# Pre-commit hooks for Optimus.
+#
+# Run `pre-commit install` once in your local clone to wire these
+# into `git commit`. The hooks mirror the lint gate that
+# `.github/workflows/tests.yml` runs on push - catching style /
+# import issues before they reach CI.
+#
+# Format-checking (`ruff format --check`) is intentionally NOT here:
+# the codebase carries pre-existing style differences that a one-shot
+# reformat would surface as noise. Add a `ruff-format` hook in a
+# separate, single-commit reformat once the team agrees.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^optimus/.*\.py$

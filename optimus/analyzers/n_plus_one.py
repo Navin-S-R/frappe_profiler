@@ -25,9 +25,15 @@ from optimus.analyzers.base import (
 	SEVERITY_ORDER,
 	AnalyzerResult,
 	is_framework_callsite,
+	percentile,
 	short_filename,
 	walk_callsite,
 )
+
+# v0.7.x M4: surface a P95 readout next to the consolidated total
+# when the sample is large enough to be meaningful. P95 of 3 hits
+# is statistically meaningless and would mislead more than help.
+P95_MIN_SAMPLES = 10
 
 # A group is also required to spend at least this much total time before
 # being flagged. Prevents tiny (<1ms each) queries from generating noisy
@@ -107,11 +113,12 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 		if max_variant_count < min_occurrences:
 			continue
 
-		total_time = sum(
+		per_hit_durations = [
 			o["duration"]
 			for occ in variants.values()
 			for o in occ
-		)
+		]
+		total_time = sum(per_hit_durations)
 		# Minimum total time so we don't flag 10 × 0.1 ms queries as
 		# an N+1 — those are not worth reporting.
 		if total_time < min_total_time:
@@ -146,6 +153,7 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 			normalized=canonical_query,
 			count=total_count,
 			total_time=total_time,
+			per_hit_durations=per_hit_durations,
 			action_idx=action_idx,
 			# v0.5.2 round 3: expose variant list so the detail can
 			# show "10 query variants observed" with sample queries.
@@ -192,6 +200,7 @@ def _build_user_finding(
 	normalized: str,
 	count: int,
 	total_time: float,
+	per_hit_durations: list[float] | None = None,
 	action_idx: int,
 	all_variants: list[str] | None = None,
 	variant_count: int = 1,
@@ -216,6 +225,15 @@ def _build_user_finding(
 		"data into a single query."
 	)
 
+	# v0.7.x M4: P95 of the per-hit duration distribution, when the
+	# sample is large enough to be meaningful. Gives the user a sense
+	# of the tail beyond the average and consolidated total.
+	p95_ms = (
+		percentile(per_hit_durations, 95)
+		if per_hit_durations and len(per_hit_durations) >= P95_MIN_SAMPLES
+		else None
+	)
+
 	return {
 		"finding_type": "N+1 Query",
 		"severity": _severity(count, total_time),
@@ -231,6 +249,7 @@ def _build_user_finding(
 				"normalized_query": normalized,
 				"occurrences": count,
 				"variant_count": variant_count,
+				"p95_ms": round(p95_ms, 2) if p95_ms is not None else None,
 				# Up to 5 sample variants for the detail block —
 				# enough to identify the loop, capped so we don't
 				# blow out the 140-char title limit / DocType blob.
@@ -281,6 +300,7 @@ def _build_framework_finding(
 	normalized: str,
 	count: int,
 	total_time: float,
+	per_hit_durations: list[float] | None = None,
 	action_idx: int,
 	all_variants: list[str] | None = None,
 	variant_count: int = 1,
@@ -296,6 +316,12 @@ def _build_framework_finding(
 		f"Framework query repeated {count}× at {short_fn}:{lineno}"
 		if variant_count <= 1
 		else f"Framework callsite ran {count} queries ({variant_count} variants) at {short_fn}:{lineno}"
+	)
+
+	p95_ms = (
+		percentile(per_hit_durations, 95)
+		if per_hit_durations and len(per_hit_durations) >= P95_MIN_SAMPLES
+		else None
 	)
 
 	return {
@@ -322,6 +348,7 @@ def _build_framework_finding(
 				"normalized_query": normalized,
 				"occurrences": count,
 				"variant_count": variant_count,
+				"p95_ms": round(p95_ms, 2) if p95_ms is not None else None,
 				"sample_queries": all_variants[:5],
 				"total_time_ms": round(total_time, 2),
 				"average_time_ms": round(total_time / count, 2) if count else 0,

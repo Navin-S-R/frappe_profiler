@@ -11,7 +11,7 @@ def test_top_queries_sorted_by_duration_desc(full_scan_recording, empty_context)
 	top = result.aggregate["top_queries"]
 	assert len(top) == 3
 	# Sorted desc
-	assert top[0]["duration_ms"] >= top[1]["duration_ms"] >= top[2]["duration_ms"]
+	assert top[0]["query_duration_ms"] >= top[1]["query_duration_ms"] >= top[2]["query_duration_ms"]
 
 
 def test_slow_query_finding_for_long_queries(full_scan_recording, empty_context):
@@ -80,7 +80,7 @@ def test_framework_callsite_queries_excluded_from_leaderboard(empty_context):
 	result = top_queries.analyze([recording], empty_context)
 	top = result.aggregate["top_queries"]
 	assert len(top) == 1
-	assert top[0]["duration_ms"] == 120.0
+	assert top[0]["query_duration_ms"] == 120.0
 	assert "acme_app/" in (top[0]["callsite"] or "")
 	# The only query that survived the user-app filter is under the
 	# 200ms slow-query threshold → no Slow Query finding either.
@@ -102,7 +102,7 @@ def test_query_without_callsite_excluded_from_leaderboard(empty_context):
 	result = top_queries.analyze([recording], empty_context)
 	top = result.aggregate["top_queries"]
 	assert len(top) == 1
-	assert top[0]["duration_ms"] == 80.0
+	assert top[0]["query_duration_ms"] == 80.0
 
 
 def test_trivially_fast_queries_excluded_from_leaderboard(empty_context):
@@ -136,4 +136,4 @@ def test_floor_keeps_queries_at_or_above_threshold(empty_context):
 	result = top_queries.analyze([recording], empty_context)
 	top = result.aggregate["top_queries"]
 	assert len(top) == 1
-	assert top[0]["duration_ms"] == 10.0
+	assert top[0]["query_duration_ms"] == 10.0

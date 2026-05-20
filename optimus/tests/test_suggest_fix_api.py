@@ -33,7 +33,12 @@ def _fn_body(name: str) -> str:
 class TestSuggestFixSurface:
 	def test_whitelisted(self):
 		src = _read_api_source()
-		assert re.search(r"@frappe\.whitelist\(\)\s*\ndef suggest_fix", src)
+		# Allow optional intermediate decorators (e.g. @rate_limit) between
+		# @frappe.whitelist() and the def line.
+		assert re.search(
+			r"@frappe\.whitelist\(\)\s*\n(?:@\w+(?:\.\w+)*\([^)]*\)\s*\n)*def suggest_fix",
+			src,
+		)
 
 	def test_signature(self):
 		src = _read_api_source()

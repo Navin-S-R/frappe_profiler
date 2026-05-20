@@ -21,6 +21,7 @@ developer can manually retry the analyze.
 import html
 import json
 import time
+from collections import OrderedDict
 
 import frappe
 import sqlparse
@@ -77,7 +78,7 @@ AI_BACKFILL_TIME_BUDGET_SECONDS = 60
 # v0.3.0: persistence size limits for call_tree_json on Optimus Action.
 CALL_TREE_OVERFLOW_THRESHOLD_BYTES = 200_000   # write to file above this
 CALL_TREE_HARD_MAX_BYTES = 16_000_000          # last-line sanity guard
-CALL_TREE_HARD_TRUNCATE_KEEP_FRAMES = 100      # frames kept on fallback
+CALL_TREE_HARD_TRUNCATE_KEEP_FRAMES = 300      # frames kept on fallback (Phase K: 100 was too aggressive for typical Frappe + middleware stacks)
 
 
 # per_action is first because it builds the Optimus Action rows that the
@@ -593,12 +594,82 @@ def _fetch_recordings(recording_uuids: list[str]):
 		if not rec:
 			continue
 
-		# Load the pyinstrument tree pickle (best-effort)
+		# Load the pyinstrument tree pickle (best-effort). Phase K
+		# hardening: every blob is HMAC-prefixed by
+		# ``hooks_callbacks._dump_capture_state_to_redis`` -
+		# ``session.unsign_blob`` rejects any tree whose signature
+		# doesn't match the site's encryption_key, so a Redis-
+		# poisoning attacker can't slip a malicious pickle in.
+		#
+		# Transition fallback: blobs written by code that predates the
+		# HMAC rollout lack the signature; ``unsign_blob`` returns
+		# ``None`` for them. To avoid silently degrading every
+		# in-flight session at deploy time, we fall back to raw
+		# ``pickle.loads`` on unsigned blobs when
+		# ``optimus_allow_unsigned_pickles`` is truthy in
+		# site_config.json (default True, since the Redis TTL is 10
+		# minutes - admin flips it to False once the keyspace has
+		# rolled over post-deploy). See SECURITY.md for the
+		# post-deploy hardening note.
 		pyi_session = None
 		try:
+			from optimus.session import unsign_blob
 			tree_blob = frappe.cache.get_value(f"profiler:tree:{uuid}")
 			if tree_blob:
-				pyi_session = pickle.loads(tree_blob)
+				verified = unsign_blob(tree_blob)
+				if verified is not None:
+					pyi_session = pickle.loads(verified)
+				else:
+					# Either (a) blob predates HMAC rollout (raw
+					# pickle, no prefix), or (b) the HMAC secret
+					# drifted across processes so signed blobs land
+					# here as ``32-byte sig + pickle``. Try BOTH
+					# shapes - the first ``pickle.loads`` that
+					# succeeds wins.
+					allow_unsigned = True
+					try:
+						allow_unsigned = bool(
+							frappe.conf.get("optimus_allow_unsigned_pickles", True)
+						)
+					except Exception:
+						pass
+					if allow_unsigned and isinstance(tree_blob, (bytes, bytearray)):
+						attempts = [bytes(tree_blob)]
+						if len(tree_blob) > 32:
+							attempts.append(bytes(tree_blob[32:]))
+						for payload in attempts:
+							try:
+								pyi_session = pickle.loads(payload)
+								break
+							except Exception:
+								continue
+						if pyi_session is None:
+							frappe.log_error(
+								title="optimus analyze",
+								message=(
+									f"Pyi tree load failed under both raw "
+									f"and stripped-sig paths for {uuid}"
+								),
+							)
+						else:
+							try:
+								frappe.logger().warning(
+									f"optimus analyze: loaded pyi tree for "
+									f"{uuid} via unsigned-fallback path "
+									f"(encryption_key missing in site_config "
+									f"or HMAC secret drifted across "
+									f"processes)."
+								)
+							except Exception:
+								pass
+					else:
+						frappe.log_error(
+							title="optimus analyze",
+							message=(
+								f"Pyi tree signature mismatch for {uuid}; "
+								f"unsigned fallback disabled by site_config."
+							),
+						)
 		except Exception:
 			frappe.log_error(
 				title="optimus analyze",
@@ -644,6 +715,21 @@ MAX_QUERIES_ENRICHED_PER_RECORDING = 2000
 # per-session dedup only).
 DEFAULT_EXPLAIN_CACHE_TTL = 3600
 
+# Hard cap on the in-memory EXPLAIN cache per analyze run. At ~500B per
+# EXPLAIN row × N rows per query, 1000 entries is roughly 5-50 MB - a
+# safe ceiling that still hits ~99% of duplicate-shape queries on a
+# normal session. Overflow evicts the oldest entry (FIFO).
+_EXPLAIN_CACHE_MAX_PER_ANALYZE = 1000
+
+
+def _cap_explain_cache(cache: OrderedDict, key: str, value):
+	"""Insert into the ordered EXPLAIN cache; evict the oldest entry
+	once we cross the cap so a session with 10K+ unique queries doesn't
+	balloon memory."""
+	cache[key] = value
+	if len(cache) > _EXPLAIN_CACHE_MAX_PER_ANALYZE:
+		cache.popitem(last=False)
+
 
 def _enrich_recordings(recordings: list[dict]) -> list[str]:
 	"""Mirror frappe.recorder.post_process for our recordings only.
@@ -676,8 +762,10 @@ def _enrich_recordings(recordings: list[dict]) -> list[str]:
 	# Cache EXPLAIN results by normalized query shape so we don't re-run
 	# EXPLAIN on the same query hundreds of times within a single session.
 	# This is the in-memory first tier; the second tier is the
-	# cross-session frappe.cache lookup below.
-	explain_cache: dict[str, list] = {}
+	# cross-session frappe.cache lookup below. Bounded with FIFO
+	# eviction at _EXPLAIN_CACHE_MAX_PER_ANALYZE to keep a 10K-unique-
+	# query session from balloning memory.
+	explain_cache: OrderedDict[str, list] = OrderedDict()
 
 	# Cross-session EXPLAIN cache config
 	cache_ttl = int(
@@ -747,7 +835,7 @@ def _enrich_recordings(recordings: list[dict]) -> list[str]:
 				cached = frappe.cache.get_value(shared_key)
 				if cached is not None:
 					call["explain_result"] = cached
-					explain_cache[cache_key] = cached
+					_cap_explain_cache(explain_cache, cache_key, cached)
 					continue
 
 			try:
@@ -755,7 +843,7 @@ def _enrich_recordings(recordings: list[dict]) -> list[str]:
 					f"EXPLAIN {call['query']}", as_dict=True
 				)
 				call["explain_result"] = result
-				explain_cache[cache_key] = result
+				_cap_explain_cache(explain_cache, cache_key, result)
 				if use_shared_cache:
 					try:
 						frappe.cache.set_value(
@@ -765,7 +853,7 @@ def _enrich_recordings(recordings: list[dict]) -> list[str]:
 						pass  # shared cache is best-effort
 			except Exception:
 				call["explain_result"] = []
-				explain_cache[cache_key] = []
+				_cap_explain_cache(explain_cache, cache_key, [])
 
 			if "explain_result" not in call:
 				call["explain_result"] = []
@@ -918,6 +1006,11 @@ def _hard_truncate_tree(tree_json: str) -> str:
 	]
 	out = {
 		"_truncated": True,
+		# B.DI2 — preserve the original frame count so the renderer can
+		# show a "captured X frames, only top N shown" banner. Without
+		# these, the truncation is invisible after persistence.
+		"_captured_frames": len(all_nodes),
+		"_kept_frames": len(kept),
 		"function": "<root>",
 		"filename": "",
 		"lineno": 0,
@@ -1274,7 +1367,7 @@ _FINDING_SNIPPET_TRUNCATE_CHARS = 200
 
 
 def _enrich_findings_with_source_snippets(findings: list[dict]) -> None:
-	"""Mutate findings in-place: attach a ±1-line source snippet to each
+	"""Mutate findings in-place: attach a ±2-line source snippet to each
 	finding whose technical_detail.callsite resolves to a readable file.
 
 	Best-effort: missing files, decoding errors, out-of-range linenos,

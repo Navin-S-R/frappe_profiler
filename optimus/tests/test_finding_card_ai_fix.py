@@ -167,7 +167,10 @@ class TestAiFixBlockRendering:
 	def test_no_block_when_llm_fix_absent(self):
 		doc = _doc([_finding(llm_fix=None)])
 		html = renderer.render_raw(doc, recordings=[])
-		assert "Suggested fix" not in html
+		# The AI-fix block uses class="fix-box" — check that specifically
+		# instead of "Suggested fix" prose, which is also used by the
+		# Performance Gap Analysis section's `.gap-fix-label`.
+		assert 'class="fix-box"' not in html
 		assert "review before applying" not in html
 
 	def test_no_block_when_findings_section_toggle_off(self):
@@ -185,23 +188,28 @@ class TestAiFixBlockRendering:
 		with patch("optimus.settings.get_config",
 		           return_value=settings.OptimusConfig(ai_suggest_findings=False)):
 			html = renderer.render_raw(doc, recordings=[])
-		assert "Suggested fix" not in html
+		# Use the AI-fix box's distinctive `class="fix-box"` marker
+		# rather than "Suggested fix" prose (also used by the
+		# Gap Analysis section).
+		assert 'class="fix-box"' not in html
 		assert "review before applying" not in html
 		# Sanity: with the toggle back on, the block IS there.
 		with patch("optimus.settings.get_config",
 		           return_value=settings.OptimusConfig(ai_suggest_findings=True)):
 			html2 = renderer.render_raw(doc, recordings=[])
-		assert "Suggested fix" in html2
+		assert 'class="fix-box"' in html2
 
 	def test_no_block_when_llm_fix_json_is_empty_object(self):
 		doc = _doc([_finding(llm_fix={})])
 		html = renderer.render_raw(doc, recordings=[])
-		assert "Suggested fix" not in html
+		# Check for the AI-fix box marker specifically — the
+		# Gap Analysis section also emits a "Suggested fix" label.
+		assert 'class="fix-box"' not in html
 
 	def test_no_block_when_suggestion_blank(self):
 		doc = _doc([_finding(llm_fix={"suggestion": "   ", "model": "m"})])
 		html = renderer.render_raw(doc, recordings=[])
-		assert "Suggested fix" not in html
+		assert 'class="fix-box"' not in html
 
 	def test_script_in_suggestion_is_stripped(self):
 		doc = _doc([_finding(llm_fix={

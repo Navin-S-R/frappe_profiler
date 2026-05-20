@@ -15,8 +15,35 @@ from optimus import safe_commit
 PROFILER_USER_ROLE = "Optimus User"
 
 
+def _refuse_legacy_install():
+	"""Phase K hardening: refuse to install on top of the legacy
+	``frappe_profiler`` module. v0.7.0 is fresh-deploy-only per the
+	CHANGELOG; silently coexisting with the old module would leave
+	stale ``Profiler Session`` rows + duplicate DocType definitions
+	in an unpredictable hybrid state.
+	"""
+	try:
+		has_module = bool(frappe.db.exists("Module Def", "Frappe Profiler"))
+	except Exception:
+		has_module = False
+	try:
+		has_doctype = bool(frappe.db.exists("DocType", "Profiler Session"))
+	except Exception:
+		has_doctype = False
+	if has_module or has_doctype:
+		frappe.throw(
+			"Optimus 0.7.x is a fresh-deploy-only release and cannot run "
+			"alongside the legacy ``frappe_profiler`` install. Uninstall "
+			"the old app first: ``bench --site <site> uninstall-app frappe_profiler``, "
+			"then re-run ``bench --site <site> install-app optimus``. "
+			"See CHANGELOG.md for migration notes.",
+			frappe.ValidationError,
+		)
+
+
 def after_install():
 	"""Create the Optimus User role and auto-assign it to System Managers."""
+	_refuse_legacy_install()
 	if not frappe.db.exists("Role", PROFILER_USER_ROLE):
 		frappe.get_doc(
 			{

@@ -118,19 +118,29 @@ def test_form_js_does_not_render_analyzer_warnings_intro():
 	assert "set_intro(frm.doc.analyzer_warnings" not in src
 
 
-def test_form_js_has_download_button():
-	"""Form JS must wire up the report download button.
+def test_form_js_has_report_buttons():
+	"""Form JS must wire up BOTH report buttons.
 
-	v0.6.0 Round 7: safe-mode reports were removed. The form now has a
-	single "Download Report" button — the role-based UX gate moved
-	server-side (permissions.py file_has_permission). The client just
-	exposes the button and lets Frappe's File permission hook deny the
-	actual download for unauthorized users.
+	v0.6.0 Round 7: safe-mode reports were removed. v0.7.x: the
+	"Download Report (PDF)" button was dropped; "Download Report"
+	stays (programmatic anchor click → real download) and
+	"Open Report" was added (window.open → inline in new tab).
+
+	The role-based UX gate is still server-side (permissions.py
+	file_has_permission); the client just exposes the buttons
+	and lets Frappe's File permission hook deny access for
+	unauthorized users.
 	"""
 	with open(FORM_JS) as f:
 		src = f.read()
+	# Both report buttons present.
 	assert "Download Report" in src
+	assert "Open Report" in src
 	assert "raw_report_file" in src
+	# The PDF button is gone — confirm no stale reference leaked
+	# into the form JS.
+	assert "Download Report (PDF)" not in src
+	assert "optimus.api.download_pdf" not in src
 
 
 def test_list_js_severity_indicators():

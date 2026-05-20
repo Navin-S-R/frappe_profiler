@@ -22,10 +22,13 @@ frappe.ui.form.on("Optimus Session", {
 	},
 });
 
-// The AI buttons are gated on the per-section LLM toggles in Profiler
-// Settings (api.ai_capabilities). Off section → its button(s) don't render
-// (the server enforces the same — this just keeps the form honest). The
-// capabilities read is async, so the button renders happen in the callback.
+// Single AI button: "Refresh AI suggestions". Replaces five legacy
+// buttons (Suggest a fix / Generate AI fixes / Re-evaluate AI fixes /
+// Humanize Steps / Suggest an index). One server endpoint
+// (api.refill_ai_suggestions) runs all three operations per-section
+// and re-renders the report once. The master AI switch still gates
+// whether the button appears at all; per-section toggles are honored
+// inside the server endpoint (a toggle-off section is skipped silently).
 function render_ai_buttons(frm) {
 	if (frm.is_new()) return;
 	if (frm.doc.status !== "Ready") return;
@@ -33,14 +36,8 @@ function render_ai_buttons(frm) {
 		method: "optimus.api.ai_capabilities",
 		callback: (r) => {
 			const c = (r && r.message) || {};
-			if (!c.enabled) return; // master switch off → no AI buttons at all
-			if (c.findings) {
-				render_ai_fix_button(frm);
-				render_ai_backfill_button(frm);
-				render_ai_reevaluate_button(frm);
-			}
-			if (c.humanize) render_humanize_steps_button(frm);
-			if (c.indexes) render_suggest_index_button(frm);
+			if (!c.enabled) return; // master switch off → no AI button
+			render_ai_refill_button(frm);
 		},
 		// Read failed (e.g. not configured / no perm) → render nothing.
 		error: () => {},
@@ -83,476 +80,78 @@ function subscribe_session_progress(frm) {
 	});
 }
 
-// v0.6.0: AI "suggest a fix" — on-demand only.
-//
-// Adds a "Suggest a fix (AI)" custom button when the session is Ready and
-// has at least one eligible finding. Clicking opens a dialog: pick a
-// finding, hit Generate, the server (api.suggest_fix) calls the configured
-// LLM and stores the suggestion on the Optimus Finding row (so it's cached
-// and shows up in the regenerated HTML report). Re-opening shows the cached
-// suggestion with a "Regenerate" option.
-//
-// Mirrors AI_ELIGIBLE_FINDING_TYPES in optimus/ai_fix.py.
-const AI_ELIGIBLE_FINDING_TYPES = new Set([
-	"N+1 Query",
-	"Framework N+1",
-	"Slow Query",
-	"Missing Index",
-	"Full Table Scan",
-	"Filesort",
-	"Temporary Table",
-	"Low Filter Ratio",
-	"Redundant Call",
-	"Slow Hot Path",
-	"Hook Bottleneck",
-	"Repeated Hot Frame",
-	"Hot Line",
-]);
-
-function render_ai_fix_button(frm) {
+// Single AI button: "Refresh AI suggestions" — replaces five legacy
+// buttons (Suggest a fix / Generate AI fixes / Re-evaluate AI fixes /
+// Humanize Steps / Suggest an index). One server endpoint runs all
+// three AI operations server-side and re-renders the report once at
+// the end. The per-section toggles still gate which operations run
+// inside the endpoint — a toggle-off section is skipped silently.
+function render_ai_refill_button(frm) {
 	if (frm.is_new()) return;
 	if (frm.doc.status !== "Ready") return;
-	const eligible = (frm.doc.findings || []).filter((f) =>
-		AI_ELIGIBLE_FINDING_TYPES.has(f.finding_type)
-	);
-	if (!eligible.length) return;
-
 	frm.add_custom_button(
-		__("Suggest a fix (AI)"),
-		() => open_ai_fix_dialog(frm, eligible),
+		__("Refresh AI suggestions"),
+		() => {
+			frappe.confirm(
+				__(
+					"Refresh every AI-generated section of the report? " +
+						"This re-runs fix suggestions on findings, the " +
+						"humanized Steps to Reproduce, and index advice " +
+						"for tables with a candidate — then re-renders " +
+						"the report once. Calls the configured LLM for " +
+						"each, so it can take a bit. If it doesn't " +
+						"finish in one pass, run it again."
+				),
+				() => _refill_ai_call(frm)
+			);
+		},
 		__("AI")
 	);
 }
 
-// Shared call: api.backfill_ai_fixes with the right freeze message + toast.
-// `mode` is "generate" (fill missing only) or "reevaluate" (overwrite all).
-function _ai_backfill_call(frm, mode) {
-	const regenerate_all = mode === "reevaluate";
+function _refill_ai_call(frm) {
 	frappe.call({
-		method: "optimus.api.backfill_ai_fixes",
-		args: { session_uuid: frm.doc.session_uuid, regenerate_all: regenerate_all ? 1 : 0 },
+		method: "optimus.api.refill_ai_suggestions",
+		args: { session_uuid: frm.doc.session_uuid },
 		freeze: true,
-		freeze_message: regenerate_all
-			? __("Re-evaluating AI fixes & re-rendering the report…")
-			: __("Generating AI fixes & re-rendering the report…"),
+		freeze_message: __("Refreshing AI suggestions & re-rendering the report…"),
 		callback: (r) => {
 			const m = (r && r.message) || {};
-			let msg = regenerate_all
-				? __("Re-evaluated {0} AI fix(es).", [m.added || 0])
-				: __("Added {0} AI fix(es).", [m.added || 0]);
-			if (m.failed) {
-				msg += " " + __("{0} failed — old suggestion kept (see Error Log).", [m.failed]);
+			const fx = m.fixes || {};
+			const ix = m.indexes || {};
+			const st = m.steps || {};
+			const parts = [];
+			if (fx.added) parts.push(__("{0} fix(es)", [fx.added]));
+			if (st.updated) parts.push(__("steps rewritten"));
+			if (ix.added) parts.push(__("{0} index suggestion(s)", [ix.added]));
+			const msg = parts.length
+				? __("Refreshed: {0}.", [parts.join(", ")])
+				: __("Nothing to refresh.");
+			const failed = (fx.failed || 0) + (ix.failed || 0);
+			const skipped = (fx.skipped_time || 0) + (ix.skipped || 0);
+			const indicator = failed ? "red" : parts.length ? "green" : "orange";
+			frappe.show_alert({ message: msg, indicator: indicator });
+			if (failed) {
+				frappe.show_alert({
+					message: __("{0} call(s) failed — old suggestions kept (see Error Log).", [failed]),
+					indicator: "red",
+				});
 			}
-			if (m.skipped_time) {
-				msg +=
-					" " +
-					__("{0} skipped (hit the time budget) — run it again for the rest.", [
-						m.skipped_time,
-					]);
+			if (skipped) {
+				frappe.show_alert({
+					message: __("{0} skipped (time budget) — run it again for the rest.", [skipped]),
+					indicator: "orange",
+				});
 			}
-			frappe.show_alert({ message: msg, indicator: m.added ? "green" : "orange" });
 			setTimeout(() => frm.reload_doc(), 1200);
 		},
 		error: () => {
 			frappe.show_alert({
-				message: __("The AI fix request failed — see the error popup for details."),
+				message: __("The AI refresh request failed — see the error popup for details."),
 				indicator: "red",
 			});
 		},
 	});
-}
-
-// "Generate AI fixes" — fill in the suggestions for ALL eligible findings
-// that don't have one yet (then re-render the report). The retry path for
-// when the LLM was unavailable during analyze (the analyze still completes —
-// the AI step is just skipped); also works when "Suggest AI fixes by
-// default" is off. Shown only when there's something to do.
-function render_ai_backfill_button(frm) {
-	if (frm.is_new()) return;
-	if (frm.doc.status !== "Ready") return;
-	const pending = (frm.doc.findings || []).filter(
-		(f) =>
-			AI_ELIGIBLE_FINDING_TYPES.has(f.finding_type) &&
-			!((f.llm_fix_json || "").toString().trim())
-	);
-	if (!pending.length) return;
-
-	frm.add_custom_button(
-		__("Generate AI fixes ({0})", [pending.length]),
-		() => {
-			frappe.confirm(
-				__(
-					"Generate AI fix suggestions for the {0} eligible finding(s) " +
-						"that don't have one yet, then re-render the report? This " +
-						"calls the configured LLM for each — it can take a bit, and " +
-						"if it doesn't finish in one pass just run it again.",
-					[pending.length]
-				),
-				() => _ai_backfill_call(frm, "generate")
-			);
-		},
-		__("AI")
-	);
-}
-
-// "Re-evaluate AI fixes" — re-generate the suggestion for EVERY eligible
-// finding, overwriting the existing ones, then re-render. Use after changing
-// the AI model or prompt. A failure mid-run leaves the old suggestion in
-// place. Shown whenever there's an eligible finding (so it's distinct from
-// "Generate AI fixes", it's only offered when at least one already HAS a
-// suggestion to re-evaluate).
-function render_ai_reevaluate_button(frm) {
-	if (frm.is_new()) return;
-	if (frm.doc.status !== "Ready") return;
-	const eligible = (frm.doc.findings || []).filter((f) =>
-		AI_ELIGIBLE_FINDING_TYPES.has(f.finding_type)
-	);
-	const haveSome = eligible.some((f) => (f.llm_fix_json || "").toString().trim());
-	if (!eligible.length || !haveSome) return;
-
-	frm.add_custom_button(
-		__("Re-evaluate AI fixes ({0})", [eligible.length]),
-		() => {
-			frappe.confirm(
-				__(
-					"Re-generate AI fix suggestions for ALL {0} eligible finding(s), " +
-						"overwriting the ones that already have a suggestion, then " +
-						"re-render the report? Useful after changing the AI model or " +
-						"prompt. Calls the configured LLM for each — it can take a bit; " +
-						"if it doesn't finish in one pass, run it again. (A failure on " +
-						"any finding leaves its old suggestion in place.)",
-					[eligible.length]
-				),
-				() => _ai_backfill_call(frm, "reevaluate")
-			);
-		},
-		__("AI")
-	);
-}
-
-// v0.6.0: "Humanize Steps (AI)" — rewrite the auto-generated "Steps to
-// Reproduce" note into a friendly, human-readable flow via the LLM. Shown on
-// Ready sessions; the server (api.humanize_steps) validates that AI is
-// configured. If the note already has hand-written content, confirm first
-// (the action overwrites it).
-function render_humanize_steps_button(frm) {
-	if (frm.is_new()) return;
-	if (frm.doc.status !== "Ready") return;
-
-	const hasNotes = (frm.doc.notes || "").toString().trim().length > 0;
-	frm.add_custom_button(
-		__("Humanize Steps (AI)"),
-		() => {
-			const run = () =>
-				frappe.call({
-					method: "optimus.api.humanize_steps",
-					args: { session_uuid: frm.doc.session_uuid },
-					freeze: true,
-					freeze_message: __("Asking the AI to rewrite the steps to reproduce…"),
-					callback: (r) => {
-						if (!r || !r.message || !r.message.ok) return;
-						frappe.show_alert({
-							message: __("Steps to Reproduce updated"),
-							indicator: "green",
-						});
-						frm.reload_doc();
-					},
-				});
-			if (hasNotes) {
-				frappe.confirm(
-					__(
-						"Replace the current “Steps to Reproduce” with an AI-drafted " +
-							"version? Any text you've written there will be overwritten."
-					),
-					run
-				);
-			} else {
-				run();
-			}
-		},
-		__("AI")
-	);
-}
-
-// v0.6.0: "Suggest an index (AI)" — pick one of the tables in the breakdown
-// that has a heuristic index candidate, and let the LLM vet it (which
-// composite, whether existing indexes already cover it, the write-cost call).
-// Shown when the session is Ready and the breakdown has at least one such
-// table; the server (api.suggest_index) validates that AI is configured.
-function _tables_with_index_candidate(frm) {
-	let breakdown = [];
-	try {
-		breakdown = JSON.parse(frm.doc.table_breakdown_json || "[]");
-	} catch (e) {
-		breakdown = [];
-	}
-	return (breakdown || []).filter(
-		(t) => t && t.recommended_index && t.recommended_index.columns && t.recommended_index.columns.length
-	);
-}
-
-function render_suggest_index_button(frm) {
-	if (frm.is_new()) return;
-	if (frm.doc.status !== "Ready") return;
-	const tables = _tables_with_index_candidate(frm);
-	if (!tables.length) return;
-
-	frm.add_custom_button(
-		__("Suggest an index (AI)"),
-		() => open_suggest_index_dialog(frm, tables),
-		__("AI")
-	);
-}
-
-function open_suggest_index_dialog(frm, tables) {
-	const options = tables.map((t) => {
-		const rec = t.recommended_index;
-		const cols = (rec.columns || []).join(", ");
-		const had = t.ai_index ? " · already has AI advice" : "";
-		return { label: `${t.table} — (${cols})${had}`, value: t.table };
-	});
-	const d = new frappe.ui.Dialog({
-		title: __("Suggest an index (AI)"),
-		fields: [
-			{
-				fieldname: "table_name",
-				fieldtype: "Select",
-				label: __("Table"),
-				options: options.map((o) => o.value).join("\n"),
-				default: options[0] && options[0].value,
-				reqd: 1,
-			},
-			{
-				fieldname: "hint",
-				fieldtype: "HTML",
-				options:
-					'<p class="text-muted small">The LLM gets this table\'s candidate columns, a few of the actual queries, and the table\'s current indexes (<code>SHOW INDEX</code>), and recommends the smallest index that actually helps — or tells you an existing index already covers it. Result is written into the report\'s "Time spent per database table" section.</p>',
-			},
-		],
-		primary_action_label: __("Generate"),
-		primary_action: (values) => {
-			d.hide();
-			frappe.call({
-				method: "optimus.api.suggest_index",
-				args: { session_uuid: frm.doc.session_uuid, table_name: values.table_name },
-				freeze: true,
-				freeze_message: __("Asking the AI about indexes for {0}…", [values.table_name]),
-				callback: (r) => {
-					if (!r || !r.message || !r.message.ok) return;
-					frappe.show_alert({
-						message: __("Index advice added for {0}", [r.message.table || values.table_name]),
-						indicator: "green",
-					});
-					frm.reload_doc();
-				},
-			});
-		},
-	});
-	d.show();
-}
-
-function open_ai_fix_dialog(frm, eligible) {
-	const options = eligible.map((f) => ({
-		label: `[${f.severity || "?"}] ${f.finding_type} — ${f.title || ""}`,
-		value: f.name,
-	}));
-
-	const d = new frappe.ui.Dialog({
-		title: __("Suggest a fix (AI)"),
-		size: "large",
-		fields: [
-			{
-				fieldname: "finding",
-				fieldtype: "Select",
-				label: __("Finding"),
-				reqd: 1,
-				options: options,
-			},
-			{
-				fieldname: "privacy_note",
-				fieldtype: "HTML",
-				options:
-					'<p class="text-muted small">This sends the selected finding\'s code snippet, callsite, and SQL to the AI provider configured in <b>Optimus Settings ▸ AI Fix Suggestions</b>. Use a local model (Ollama / LM Studio) there to keep everything on-box.</p>',
-			},
-			{
-				fieldname: "result",
-				fieldtype: "HTML",
-				options:
-					'<div class="ai-fix-result text-muted small">Pick a finding and click <b>Generate</b>.</div>',
-			},
-		],
-		primary_action_label: __("Generate"),
-		primary_action() {
-			run_ai_suggest(frm, d, d.get_value("finding"), false);
-		},
-	});
-
-	// When the user picks a finding that already has a cached suggestion,
-	// show it immediately and flip the primary action to "Regenerate".
-	d.fields_dict.finding.$input &&
-		d.fields_dict.finding.$input.on("change", () => {
-			const name = d.get_value("finding");
-			const f = (frm.doc.findings || []).find((x) => x.name === name);
-			let cached = null;
-			if (f && f.llm_fix_json) {
-				try {
-					cached = JSON.parse(f.llm_fix_json);
-				} catch (e) {
-					cached = null;
-				}
-			}
-			if (cached && cached.suggestion) {
-				render_ai_result(d, cached, true);
-				d.set_primary_action(__("Regenerate"), () =>
-					run_ai_suggest(frm, d, name, true)
-				);
-			} else {
-				d.fields_dict.result.$wrapper.html(
-					'<div class="ai-fix-result text-muted small">No suggestion yet. Click <b>Generate</b>.</div>'
-				);
-				d.set_primary_action(__("Generate"), () =>
-					run_ai_suggest(frm, d, name, false)
-				);
-			}
-		});
-
-	d.onhide = () => frm.reload_doc();
-	d.show();
-}
-
-function run_ai_suggest(frm, d, finding_ref, regenerate) {
-	if (!finding_ref) {
-		frappe.msgprint(__("Pick a finding first."));
-		return;
-	}
-	d.disable_primary_action();
-	d.fields_dict.result.$wrapper.html(
-		'<div class="ai-fix-result text-muted small"><i class="fa fa-spinner fa-spin"></i> ' +
-			__("Asking the AI provider…") +
-			"</div>"
-	);
-	frappe.call({
-		method: "optimus.api.suggest_fix",
-		args: {
-			session_uuid: frm.doc.session_uuid,
-			finding_ref: finding_ref,
-			regenerate: regenerate ? 1 : 0,
-		},
-		callback(r) {
-			d.enable_primary_action();
-			const m = (r && r.message) || {};
-			if (!m.ok || !m.suggestion) {
-				d.fields_dict.result.$wrapper.html(
-					'<div class="ai-fix-result text-danger small">' +
-						__("No suggestion was returned.") +
-						"</div>"
-				);
-				return;
-			}
-			render_ai_result(d, m, !!m.cached);
-			d.set_primary_action(__("Regenerate"), () =>
-				run_ai_suggest(frm, d, finding_ref, true)
-			);
-			if (!m.cached) {
-				frappe.show_alert({
-					message: __(
-						"Saved on the finding. Run 'Regenerate Reports' to include it in the downloadable report."
-					),
-					indicator: "green",
-				});
-			}
-		},
-		error() {
-			d.enable_primary_action();
-			d.fields_dict.result.$wrapper.html(
-				'<div class="ai-fix-result text-danger small">' +
-					__("The AI request failed — see the error popup for details.") +
-					"</div>"
-			);
-		},
-	});
-}
-
-// Scoped CSS for the before/after diff highlighting in the dialog (the HTML
-// report has its own copy in report.html). Injected with the result so it's
-// torn down when the wrapper is re-rendered.
-const _DIFF_STYLE =
-	"<style>" +
-	".dh-ai-result pre.dh{padding:6px 0;}" +
-	".dh-ai-result pre.dh .dh-line{display:block;padding:0 10px;white-space:pre-wrap;word-break:break-word;}" +
-	".dh-ai-result pre.dh .dh-add{background:#e6ffec;color:#116329;}" +
-	".dh-ai-result pre.dh .dh-del{background:#ffebe9;color:#a40e26;}" +
-	".dh-ai-result pre.dh .dh-meta{background:#f2effd;color:#6639ba;}" +
-	"</style>";
-
-function _diff_looks_like(code_attrs, lines) {
-	if ((code_attrs || "").indexOf("diff") !== -1) return true;
-	if (lines.some((l) => l.indexOf("@@") === 0)) return true;
-	return lines.some((l) => l.indexOf("+") === 0) && lines.some((l) => l.indexOf("-") === 0);
-}
-
-function _diff_line_class(line) {
-	if (line.indexOf("@@") === 0 || line.indexOf("+++") === 0 || line.indexOf("---") === 0) return "dh-meta";
-	if (line.indexOf("+") === 0) return "dh-add";
-	if (line.indexOf("-") === 0) return "dh-del";
-	return null;
-}
-
-// Wrap +/-/@@ lines inside diff-looking <pre> blocks (frappe.markdown escapes
-// HTML inside code fences, so the inner text is already safe to re-emit).
-function highlight_diff_blocks(html) {
-	return (html || "").replace(
-		/<pre[^>]*>(?:\s*<code([^>]*)>)?([\s\S]*?)(?:<\/code>\s*)?<\/pre>/g,
-		(whole, code_attrs, inner) => {
-			code_attrs = code_attrs || "";
-			let lines = (inner || "").split("\n");
-			if (lines.length && lines[lines.length - 1] === "") lines = lines.slice(0, -1);
-			if (!lines.length || !_diff_looks_like(code_attrs, lines)) return whole;
-			const out = lines.map((ln) => {
-				const cls = _diff_line_class(ln);
-				return '<span class="dh-line ' + (cls || "dh-ctx") + '">' + (ln || "&#8203;") + "</span>";
-			});
-			const code_open = code_attrs ? "<code" + code_attrs + ">" : "<code>";
-			return '<pre class="dh">' + code_open + out.join("") + "</code></pre>";
-		}
-	);
-}
-
-function render_ai_result(d, payload, cached) {
-	const body = highlight_diff_blocks(frappe.markdown(payload.suggestion || ""));
-	const meta = [
-		payload.model ? __("Model: {0}", [frappe.utils.escape_html(payload.model)]) : "",
-		payload.generated_at ? frappe.utils.escape_html(payload.generated_at) : "",
-		cached ? __("(cached)") : "",
-	]
-		.filter(Boolean)
-		.join(" · ");
-	// `source_available === false` means the LLM only had the finding's title
-	// + numbers (no source window, no SQL) — the suggestion is necessarily
-	// directional, so flag it. Older cached rows lack the key → treat as true.
-	const caution =
-		payload.source_available === false
-			? '<div class="small" style="color:#92400e;background:#fffbeb;border:1px solid #fde68a;border-radius:4px;padding:5px 8px;margin-bottom:8px;">' +
-				__(
-					"The profiler couldn't show the AI this finding's source code (or SQL) — treat this as directional guidance, not a verified code fix."
-				) +
-				"</div>"
-			: "";
-	d.fields_dict.result.$wrapper.html(
-		_DIFF_STYLE +
-			'<div class="ai-fix-result dh-ai-result" style="border-left:3px solid #7c3aed;background:#f5f3ff;padding:10px 12px;border-radius:0 4px 4px 0;">' +
-			'<div class="text-muted small" style="margin-bottom:6px;">' +
-			meta +
-			"</div>" +
-			caution +
-			'<div class="ai-fix-body">' +
-			body +
-			"</div>" +
-			'<div class="text-muted small" style="margin-top:6px;border-top:1px dashed #ddd6fe;padding-top:5px;">' +
-			__("Machine-generated — review before applying.") +
-			"</div>" +
-			"</div>"
-	);
 }
 
 // v0.6.0: Phase-2 line-profile picker.
@@ -740,30 +339,89 @@ function show_phase2_dialog(frm, data) {
 	var primary = data.candidates || [];
 	var framework = data.observations || [];
 
-	function to_option(c) {
-		return {
-			label:
-				c.dotted_path +
-				" (" +
-				(c.cumulative_ms || 0).toFixed(1) +
-				"ms · " +
-				(c.hit_count || 0) +
-				"× hits · " +
-				c.app +
-				")",
-			value: c.dotted_path,
-		};
-	}
+	// Phase K v0.7 GA: build a collapsible <details> tree from the
+	// flat DFS pre-order candidate list. Each candidate's ``depth``
+	// field tells us where to nest it; the stack-based walk re-builds
+	// parent-child structure in one pass. Browser-native <details>
+	// handles expand/collapse - no custom toggle JS needed. Children
+	// start collapsed (closed <details>) so the user sees just the
+	// top-level entries by default and drills in on demand.
+	function build_tree_html(candidates) {
+		if (!candidates.length) return "";
+		var roots = [];
+		var stack = [{depth: -1, children: roots}];
+		candidates.forEach(function (c) {
+			var depth = c.depth || 0;
+			while (stack[stack.length - 1].depth >= depth) stack.pop();
+			var node = {c: c, children: []};
+			stack[stack.length - 1].children.push(node);
+			stack.push({depth: depth, children: node.children});
+		});
 
-	var primary_options = primary.map(to_option);
-	var framework_options = framework.map(to_option);
+		function esc(s) {
+			return frappe.utils.escape_html(String(s == null ? "" : s));
+		}
+		function meta(c) {
+			return (
+				" <span style='color:#6b7280;font-size:0.85em;'>(" +
+				(c.cumulative_ms || 0).toFixed(1) + "ms &middot; " +
+				(c.hit_count || 0) + "&times; hits &middot; " +
+				esc(c.app) +
+				")</span>"
+			);
+		}
+		function row(node) {
+			var c = node.c;
+			var dotted = esc(c.dotted_path);
+			var cb = (
+				"<input type='checkbox' class='fp-pick'" +
+				" data-pick=\"" + dotted + "\"" +
+				" onclick='event.stopPropagation()'" +
+				" style='margin-right:6px;vertical-align:middle;'>"
+			);
+			var body = cb +
+				"<span class='fp-pick-label' " +
+				"style='font-family:var(--font-mono);font-size:0.85em;'>" +
+				dotted + "</span>" + meta(c);
+
+			if (node.children.length === 0) {
+				return (
+					"<div style='padding:2px 0 2px 22px;'>" +
+					"<label style='cursor:pointer;'>" + body + "</label>" +
+					"</div>"
+				);
+			}
+			var inner = node.children.map(row).join("");
+			return (
+				"<details style='margin:2px 0;'>" +
+				"<summary style='cursor:pointer;list-style:revert;" +
+				"padding:2px 0;'>" +
+				"<label style='cursor:pointer;' " +
+				"onclick='event.stopPropagation()'>" +
+				body + "</label>" +
+				"</summary>" +
+				"<div style='padding-left:18px;border-left:1px dashed " +
+				"#d1d5db;margin-left:6px;'>" +
+				inner +
+				"</div>" +
+				"</details>"
+			);
+		}
+		return (
+			"<div class='fp-tree' style='max-height:340px;" +
+			"overflow-y:auto;border:1px solid var(--border-color, #e5e7eb);" +
+			"border-radius:4px;padding:8px 12px;'>" +
+			roots.map(row).join("") +
+			"</div>"
+		);
+	}
 
 	// When there are no user-app frames at all (vanilla ERPNext or a
 	// site without custom apps), the framework list IS the primary
 	// list — the customer is profiling erpnext / frappe code. Promote
 	// it to default-expanded so the dialog shows usable candidates
 	// instead of an empty primary section.
-	var no_user_app = primary_options.length === 0 && framework_options.length > 0;
+	var no_user_app = primary.length === 0 && framework.length > 0;
 
 	var fields = [
 		{
@@ -777,25 +435,64 @@ function show_phase2_dialog(frm, data) {
 		},
 	];
 
-	if (primary_options.length) {
+	// Phase K v0.7 GA: when the picker has zero curated candidates, show
+	// a yellow callout explaining why (no actions / no call trees / all
+	// filtered) instead of a silently empty dialog. The diagnostic dict
+	// is populated by api.get_phase2_candidates; older callers without
+	// it fall back to a generic message.
+	if (primary.length === 0 && framework.length === 0) {
+		var diag = data.diagnostic || {};
+		var hint = diag.hint || (
+			"No curated picks were found. Use the freeform textbox below " +
+			"to type the dotted path of the function you want to profile."
+		);
 		fields.push({
-			fieldname: "curated",
-			fieldtype: "MultiCheck",
-			label: __("Hot frames from your apps"),
-			options: primary_options,
-			columns: 1,
+			fieldname: "empty_state_html",
+			fieldtype: "HTML",
+			options: (
+				"<div style='padding:10px 14px;background:#fef3c7;" +
+				"border:1px solid #fbbf24;border-radius:6px;" +
+				"margin-bottom:12px;'>" +
+				"<strong>No curated functions available</strong><br>" +
+				"<span style='font-size:0.85em;color:#92400e'>" +
+				hint +
+				"</span><br><br>" +
+				"<code style='font-size:0.78em;color:#6b7280'>" +
+				"actions=" + (diag.action_count || 0) +
+				" &middot; with_tree=" + (diag.actions_with_call_tree_json || 0) +
+				" &middot; parsed=" + (diag.trees_parsed_ok || 0) +
+				" &middot; pre_filter=" + (diag.raw_candidates_before_filter || 0) +
+				"</code></div>"
+			),
 		});
 	}
 
-	if (framework_options.length) {
+	if (primary.length) {
 		fields.push({
-			fieldname: "section_break_framework",
+			fieldname: "curated_section",
+			fieldtype: "Section Break",
+			label: __("Hot frames from your apps"),
+			description: __(
+				"Click a row's chevron to expand its nested calls. " +
+				"Tick the boxes you want to line-profile."
+			),
+		});
+		fields.push({
+			fieldname: "curated_html",
+			fieldtype: "HTML",
+			options: build_tree_html(primary),
+		});
+	}
+
+	if (framework.length) {
+		fields.push({
+			fieldname: "framework_section",
 			fieldtype: "Section Break",
 			label: no_user_app
 				? __("Hot frames (frappe / erpnext / framework code)")
 				: __(
 					"+ " +
-					framework_options.length +
+					framework.length +
 					" framework frames (frappe / erpnext) — actionable for " +
 					"customizations or framework-level fixes"
 				),
@@ -803,11 +500,9 @@ function show_phase2_dialog(frm, data) {
 			collapsible_depends_on: no_user_app ? "" : "0",
 		});
 		fields.push({
-			fieldname: "framework_picks",
-			fieldtype: "MultiCheck",
-			label: "",
-			options: framework_options,
-			columns: 1,
+			fieldname: "framework_html",
+			fieldtype: "HTML",
+			options: build_tree_html(framework),
 		});
 	}
 
@@ -856,11 +551,14 @@ function show_phase2_dialog(frm, data) {
 		primary_action_label: __("Run Line-Profile Pass"),
 		primary_action: function (values) {
 			var picks = [];
-			(values.curated || []).forEach(function (path) {
-				picks.push({ dotted_path: path, source: "curated" });
-			});
-			(values.framework_picks || []).forEach(function (path) {
-				picks.push({ dotted_path: path, source: "curated" });
+			// Phase K v0.7 GA: collect ticked checkboxes from the
+			// custom HTML trees (curated + framework). The legacy
+			// MultiCheck arrays (values.curated / values.framework_picks)
+			// no longer exist - the dialog now uses an HTML field
+			// per section, and selected state lives on the DOM.
+			d.$wrapper.find(".fp-tree input.fp-pick:checked").each(function () {
+				var path = $(this).data("pick");
+				if (path) picks.push({ dotted_path: String(path), source: "curated" });
 			});
 			(values.freeform || "")
 				.split("\n")
@@ -1083,10 +781,21 @@ function render_download_buttons(frm) {
 			() => {
 				frappe.confirm(
 					__(
-						"The report contains literal SQL values, request headers, and stack traces. Do not share it externally without redacting it yourself. Continue?",
+						"The report will be saved to your downloads folder and contains literal SQL values, request headers, and stack traces. Do not share it externally without redacting it yourself. Continue?",
 					),
 					() => {
-						window.open(frm.doc.raw_report_file, "_blank");
+						// Programmatic <a download="..."> click forces
+						// the browser to save the file rather than navigate
+						// to it. window.open serves the HTML inline because
+						// the file's Content-Type is text/html — that's the
+						// "Open Report" flow below; this button needs a
+						// real save-to-disk.
+						const link = document.createElement("a");
+						link.href = frm.doc.raw_report_file;
+						link.download = "";
+						document.body.appendChild(link);
+						link.click();
+						document.body.removeChild(link);
 					},
 				);
 			},
@@ -1094,33 +803,66 @@ function render_download_buttons(frm) {
 		);
 
 		frm.add_custom_button(
-			__("Download Report (PDF)"),
+			__("Open Report"),
 			() => {
-				frappe.show_alert({
-					message: __("Generating PDF..."),
-					indicator: "blue",
-				});
-				frappe.call({
-					method: "optimus.api.download_pdf",
-					args: { session_uuid: frm.doc.session_uuid },
-					callback: (r) => {
-						const data = (r && r.message) || {};
-						if (data.file_url) {
-							window.open(data.file_url, "_blank");
-						} else {
+				frappe.confirm(
+					__(
+						"The report opens in a new tab and contains literal SQL values, request headers, and stack traces. Do not share it externally without redacting it yourself. Continue?",
+					),
+					() => {
+						// Frappe serves /private/files/*.html with
+						// Content-Disposition: attachment, which triggers a
+						// download dialog instead of rendering inline. Fetch
+						// the content, wrap it in a blob URL with the right
+						// MIME type, and window.open that — blob URLs are
+						// not governed by the original response's
+						// Content-Disposition, so the browser renders the
+						// HTML inline. Works because the report HTML is
+						// self-contained (no external asset references); see
+						// product-thesis "safe report" guarantee.
+						const showError = (msg) =>
 							frappe.show_alert({
-								message: __("PDF generation failed; download the HTML version instead"),
+								message: __(msg),
 								indicator: "red",
 							});
-						}
+						fetch(frm.doc.raw_report_file, {
+							credentials: "same-origin",
+						})
+							.then((r) => {
+								if (!r.ok) {
+									throw new Error("HTTP " + r.status);
+								}
+								return r.text();
+							})
+							.then((html) => {
+								const blob = new Blob([html], {
+									type: "text/html",
+								});
+								const url = URL.createObjectURL(blob);
+								const win = window.open(url, "_blank");
+								if (!win) {
+									showError(
+										"Pop-up blocked; allow pop-ups for this site to open the report inline.",
+									);
+									URL.revokeObjectURL(url);
+									return;
+								}
+								// Revoke the blob URL once the new tab has had
+								// a chance to load it. The tab keeps a DOM
+								// reference to the rendered content
+								// independent of the URL.
+								setTimeout(
+									() => URL.revokeObjectURL(url),
+									60000,
+								);
+							})
+							.catch(() => {
+								showError(
+									"Could not load the report; try Download Report instead.",
+								);
+							});
 					},
-					error: () => {
-						frappe.show_alert({
-							message: __("PDF generation failed"),
-							indicator: "red",
-						});
-					},
-				});
+				);
 			},
 			__("Reports"),
 		);

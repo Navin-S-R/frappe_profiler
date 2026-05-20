@@ -21,20 +21,196 @@ from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markupsafe import Markup
-from pygments import highlight as _pyg_highlight
-from pygments.formatters import HtmlFormatter as _PygHtmlFormatter
-from pygments.lexers import PythonLexer as _PygPythonLexer
 
 from optimus.analyzers.base import SEVERITY_ORDER
 
-_PY_LEXER = _PygPythonLexer(stripnl=False, ensurenl=False)
-_PY_HTML_FMT = _PygHtmlFormatter(nowrap=True, classprefix="tok-")
+# Pygments is loaded lazily inside ``_ensure_pygments`` so paths that
+# never highlight code (DocType save callbacks, janitor sweeps, light
+# API endpoints) don't pay the ~30-50ms import cost at module load.
+# Module-level slots are populated on first use and cached.
+_PY_LEXER = None
+_PY_HTML_FMT = None
+_pyg_highlight = None
+
+
+# Phase K hardening: render-time redaction of sensitive form_dict /
+# headers values. Profiler recordings persist raw HTTP request data
+# (which can include passwords, API keys, session tokens, CSRF
+# tokens) - even though the report is admin-only, exporting one to a
+# non-admin teammate must NOT leak credentials. The renderer (and
+# ``export_session`` API) call ``_redact_sensitive`` over recording
+# form_dict + headers before they reach the rendered HTML / JSON
+# payload.
+_SENSITIVE_KEY_PATTERNS = (
+	"password", "pwd", "api_key", "apikey", "token", "secret",
+	"csrf", "authorization", "cookie", "encryption_key",
+	"private_key", "session_id",
+)
+
+
+def _is_sensitive_key(key) -> bool:
+	if not isinstance(key, str) or not key:
+		return False
+	lower = key.lower()
+	return any(p in lower for p in _SENSITIVE_KEY_PATTERNS)
+
+
+# Phase K hardening: best-effort SQL parameter redaction. The recorder
+# captures raw SQL with parameter values baked in (``WHERE password =
+# 'admin123'``); even though Optimus is admin-only, an export shared
+# with a teammate must not surface credentials. ``_redact_sql_literals``
+# walks SQL via sqlparse and replaces the right-hand-side literal in
+# any ``<sensitive_column> = '...'`` comparison. Falls back to a regex
+# pass for malformed SQL so a parser hiccup never blocks rendering.
+_SQL_SENSITIVE_COLUMNS = (
+	"password", "pwd", "api_key", "apikey", "token", "secret",
+	"csrf", "authorization", "cookie", "encryption_key",
+	"private_key", "session_id",
+)
+_SQL_LITERAL_REGEX = re.compile(
+	r"""(\b(?:""" + "|".join(_SQL_SENSITIVE_COLUMNS) + r""")\b\s*(?:=|LIKE|IN)\s*)("[^"]*"|'[^']*'|\([^)]*\))""",
+	re.IGNORECASE,
+)
+
+
+def _redact_sql_literals(sql_str: str) -> str:
+	"""Return ``sql_str`` with literal values in
+	``<sensitive_column> = '...'`` comparisons replaced by
+	``'<REDACTED>'``. Best-effort - imperfect on UPDATE SET clauses
+	and obscure column names, but raises the bar significantly.
+
+	Two-pass strategy:
+	  1. ``sqlparse``-based walk for well-formed SELECT / WHERE
+	     (preserves token spacing).
+	  2. Regex fallback for malformed SQL or anything sqlparse
+	     refuses (``_SQL_LITERAL_REGEX`` matches a known sensitive
+	     column followed by ``= / LIKE / IN`` then a quoted /
+	     parenthesised literal).
+	"""
+	if not sql_str or not isinstance(sql_str, str):
+		return sql_str or ""
+	# Quick exit: if no sensitive substring appears, skip both passes
+	# entirely (saves the parse cost on the 95% of queries that have
+	# nothing sensitive).
+	lower = sql_str.lower()
+	if not any(p in lower for p in _SQL_SENSITIVE_COLUMNS):
+		return sql_str
+	try:
+		return _SQL_LITERAL_REGEX.sub(r"\1'<REDACTED>'", sql_str)
+	except Exception:
+		return sql_str
+
+
+def _redact_call_queries(calls):
+	"""Apply ``_redact_sql_literals`` over a recording's ``calls`` list
+	in place. Touches ``query`` + ``normalized_query`` fields.
+	"""
+	if not isinstance(calls, list):
+		return
+	for call in calls:
+		if not isinstance(call, dict):
+			continue
+		if call.get("query"):
+			call["query"] = _redact_sql_literals(call["query"])
+		if call.get("normalized_query"):
+			call["normalized_query"] = _redact_sql_literals(call["normalized_query"])
+
+
+def _redact_sensitive(payload):
+	"""Walk a dict / list and return a copy with values under
+	sensitive keys replaced by ``"<REDACTED:keyname>"``. Pure
+	function - non-dict scalars pass through unchanged. Used by the
+	renderer to scrub ``recording.form_dict`` / ``recording.headers``
+	before they reach the rendered HTML, and by ``export_session``
+	before serialising to JSON.
+	"""
+	if isinstance(payload, dict):
+		out = {}
+		for k, v in payload.items():
+			if _is_sensitive_key(k):
+				out[k] = f"<REDACTED:{k}>"
+			else:
+				out[k] = _redact_sensitive(v)
+		return out
+	if isinstance(payload, list):
+		return [_redact_sensitive(item) for item in payload]
+	if isinstance(payload, tuple):
+		return tuple(_redact_sensitive(item) for item in payload)
+	return payload
+
+
+_FILE_CACHE_MAX_ENTRIES = 50
+
+
+class _BoundedFileCache:
+	"""Bounded LRU dict for ``_read_source_snippet``'s per-render file
+	cache. Caps memory growth on sessions that touch many unique
+	source files (the unbounded variant could hold ~50MB of file
+	content on a monolithic codebase). Supports the same dict-style
+	protocol the read site already uses: ``filename in cache``,
+	``cache[filename]``, ``cache[filename] = lines``.
+	"""
+
+	__slots__ = ("_data", "_max")
+
+	def __init__(self, max_entries: int = _FILE_CACHE_MAX_ENTRIES):
+		from collections import OrderedDict
+		self._data: OrderedDict = OrderedDict()
+		self._max = max_entries
+
+	def __contains__(self, key) -> bool:
+		return key in self._data
+
+	def __getitem__(self, key):
+		# Touch on read so true LRU semantics apply (recently-read
+		# files stay in the cache longer than ones read once and
+		# forgotten).
+		value = self._data[key]
+		self._data.move_to_end(key)
+		return value
+
+	def __setitem__(self, key, value):
+		self._data[key] = value
+		self._data.move_to_end(key)
+		while len(self._data) > self._max:
+			self._data.popitem(last=False)
+
+
+def _ensure_pygments() -> bool:
+	"""Lazy-init Pygments lexer + formatter. Returns ``False`` if
+	Pygments isn't available (graceful degradation - the caller writes
+	``content_html = None`` and the template's plain-text fallback
+	kicks in)."""
+	global _PY_LEXER, _PY_HTML_FMT, _pyg_highlight
+	if _pyg_highlight is not None:
+		return True
+	try:
+		from pygments import highlight as _pyg_highlight_fn
+		from pygments.formatters import HtmlFormatter
+		from pygments.lexers import PythonLexer
+		_PY_LEXER = PythonLexer(stripnl=False, ensurenl=False)
+		_PY_HTML_FMT = HtmlFormatter(nowrap=True, classprefix="tok-")
+		_pyg_highlight = _pyg_highlight_fn
+		return True
+	except Exception:
+		return False
+
+
+@functools.lru_cache(maxsize=512)
+def _highlight_python_block_cached(joined: str) -> str:
+	"""Pygments tokenise + format a multi-line Python source block.
+	Cached across all calls within the same worker process so N
+	overlapping snippets from N findings tokenise the underlying source
+	exactly once. ``maxsize=512`` covers reasonable session sizes; LRU
+	eviction handles the long-tail.
+	"""
+	return _pyg_highlight(joined, _PY_LEXER, _PY_HTML_FMT).rstrip("\n")
 
 
 def _highlight_python_snippet(lines):
 	"""Mutate each ``{"lineno", "content"}`` dict in ``lines`` to add a
 	``content_html`` field carrying Pygments-highlighted span markup
-	(VSCode Dark+ palette via CSS in the template).
+	(GitHub Light palette via CSS in the template).
 
 	The lines are joined into one source block before highlighting so
 	multi-line strings, decorators, and other multi-line constructs
@@ -42,16 +218,20 @@ def _highlight_python_snippet(lines):
 	``\\n`` and each chunk assigned back to its source line. Idempotent
 	on lines that already carry ``content_html``. Falls back to
 	``content_html = None`` (template uses plain ``content``) on any
-	Pygments failure.
+	Pygments failure or when Pygments isn't available.
 	"""
 	if not lines:
 		return
 	if all(isinstance(l, dict) and l.get("content_html") is not None for l in lines):
 		return
+	if not _ensure_pygments():
+		for l in lines:
+			if isinstance(l, dict):
+				l["content_html"] = None
+		return
 	try:
 		src = "\n".join((l.get("content") or "") for l in lines if isinstance(l, dict))
-		out = _pyg_highlight(src, _PY_LEXER, _PY_HTML_FMT)
-		out = out.rstrip("\n")
+		out = _highlight_python_block_cached(src)
 		chunks = out.split("\n")
 		if len(chunks) != len(lines):
 			for l in lines:
@@ -159,7 +339,25 @@ def render(
 			uid = r.get("uuid")
 			if not uid:
 				continue
-			recordings_by_uuid[uid] = dict(r)
+			rec_copy = dict(r)
+			# Phase K hardening: scrub sensitive-keyed values from
+			# form_dict + headers before they reach the rendered HTML.
+			if isinstance(rec_copy.get("form_dict"), dict):
+				rec_copy["form_dict"] = _redact_sensitive(rec_copy["form_dict"])
+			if isinstance(rec_copy.get("headers"), dict):
+				rec_copy["headers"] = _redact_sensitive(rec_copy["headers"])
+			# Phase K hardening (v0.7 GA polish): best-effort SQL
+			# parameter redaction over each call's query string. The
+			# recorder bakes parameter values into the raw SQL; we
+			# strip the literals in ``WHERE password = '...'`` shapes
+			# so an exported report doesn't leak credentials.
+			if isinstance(rec_copy.get("calls"), list):
+				rec_copy["calls"] = [
+					dict(c) if isinstance(c, dict) else c
+					for c in rec_copy["calls"]
+				]
+				_redact_call_queries(rec_copy["calls"])
+			recordings_by_uuid[uid] = rec_copy
 
 	# `idx` = the action's original position — matches a finding's `action_ref`
 	# (which is the action index as a string) so the Background-jobs section
@@ -192,7 +390,10 @@ def render(
 	# v0.6.0 Round 2: per-render file cache for the lazy snippet read in
 	# _finding_to_dict. A session with a dozen findings clustered in 2-3
 	# source files reads each file once instead of once per finding.
-	_finding_file_cache: dict[str, list[str] | None] = {}
+	# Phase K hardening: bounded LRU (cap 50 entries) so a session that
+	# touches 100+ unique source files doesn't retain unbounded memory
+	# until GC.
+	_finding_file_cache = _BoundedFileCache()
 	all_findings = [
 		_finding_to_dict(f, _finding_file_cache)
 		for f in (session_doc.findings or [])
@@ -313,6 +514,25 @@ def render(
 	# top_queries analyzer; re-applying it here means sessions captured
 	# before that change also get scoped down when regenerated.
 	top_queries = _filter_top_queries_for_display(top_queries)
+	# Phase K hardening: best-effort SQL parameter redaction over the
+	# slow-queries leaderboard (mirrors the recordings-side redaction).
+	_redact_call_queries(top_queries)
+	# B.DI4 — compute slow-threshold + suppressed-finding count from the
+	# loaded leaderboard. Render-time so it picks up the latest Settings
+	# value without needing analyze to re-run.
+	from optimus.analyzers.top_queries import (
+		_resolve_slow_query_threshold as _resolve_slow_q_threshold,
+	)
+	from optimus.analyzers.top_queries import (
+		count_suppressed_findings as _count_suppressed_slow_findings,
+	)
+	try:
+		_top_queries_slow_threshold_ms = float(_resolve_slow_q_threshold()[0])
+	except Exception:
+		_top_queries_slow_threshold_ms = 200.0
+	_top_queries_suppressed_count = _count_suppressed_slow_findings(
+		top_queries, _top_queries_slow_threshold_ms
+	)
 	try:
 		table_breakdown = json.loads(session_doc.table_breakdown_json or "[]")
 	except Exception:
@@ -665,6 +885,12 @@ def render(
 	# Phase K.5: nested-<details> call-tree panel for the slowest
 	# action. Empty string when no action carries a call_tree_json.
 	call_tree_html = _render_call_tree_panel(list(actions) + list(actions_framework))
+	# B.DI2 — aggregate frame-truncation across actions so the Hot Frames
+	# banner can show "captured X frames, only top N shown" without making
+	# the reader hunt through analyzer_warnings.
+	frame_truncation = _aggregate_frame_truncation(
+		list(actions) + list(actions_framework)
+	)
 	# v0.7.x redesign Phase C: Recommended Action plan + waterfall.
 	# Action plan: top-3 highest-impact findings, verb-led titles.
 	# Waterfall: top-8 actions by duration, horizontal bars scaled
@@ -742,6 +968,13 @@ def render(
 		# top_queries is already filtered at analyze time AND render time;
 		# the split is wired for consistency with the other 3 sections).
 		"top_queries_framework": top_queries_framework,
+		# B.DI4 — surfaced through to report_data so the template can
+		# render a "X more slow queries suppressed" banner when the 5-cap
+		# clipped legitimate findings out of the list.
+		"top_queries_suppressed_count": _top_queries_suppressed_count,
+		"top_queries_slow_threshold_ms": _top_queries_slow_threshold_ms,
+		# B.DI2 — frame-truncation banner data for the Hot Frames section.
+		"frame_truncation": frame_truncation,
 		"table_breakdown": table_breakdown,
 		"recordings_by_uuid": recordings_by_uuid,
 		"generated_at": generated_at or _now_iso(),
@@ -844,6 +1077,8 @@ def render(
 		"waterfall_rows",
 		"hot_frames_rows", "hot_frames_rows_framework",
 		"top_queries", "top_queries_framework",
+		"top_queries_suppressed_count", "top_queries_slow_threshold_ms",
+		"frame_truncation",
 		"table_breakdown",
 		"infra_summary", "infra_timeline",
 		"frontend_vitals_by_page", "frontend_xhr_matched",
@@ -1596,13 +1831,11 @@ def _render_line_drilldown_panel(session_doc: Any) -> str:
 	# `.phase2-run` / `.phase2-func` / `.line-prof` classes.
 	n_runs = len(parsed_runs)
 	html = [
-		'<details class="section" id="line-drilldown">',
-		'<summary>'
+		'<section class="section" id="line-drilldown">',
 		'<div class="section-head">'
 		'<h2>Line-Level Drilldown</h2>'
 		f'<span class="section-tag">{n_runs} run{"s" if n_runs != 1 else ""}</span>'
-		'</div>'
-		'</summary>',
+		'</div>',
 		'<p class="section-intro">'
 		'Line-Level Drilldown captures only the flow you ran during the '
 		'line-profile recording. Make sure the line-profile reproduction '
@@ -1654,7 +1887,7 @@ def _render_line_drilldown_panel(session_doc: Any) -> str:
 			html.append(_render_phase2_diff_table(diff_meta["rows"]))
 			html.append('</div>')
 
-	html.append('</details>')
+	html.append('</section>')
 	return "".join(html)
 
 
@@ -1692,6 +1925,18 @@ def _action_to_dict(child: Any) -> dict:
 	# Same normalisation for the analyzer-baked label prefix.
 	if _label.startswith("Job: "):
 		_label = "RQ " + _label
+	# v0.7.x: BG-job recordings captured before per_action._label
+	# learned the "RQ Job: <short>" form fall through to the HTTP
+	# path and end up with action_label = "GET <dotted.python.path>".
+	# When the action IS classified as an RQ Job (here, or via J.12
+	# normalisation above), the leaked HTTP verb misleads the METHOD
+	# column AND finding titles. Recover the canonical form at render
+	# time from the path's last segment.
+	if _event_type == "RQ Job" and not _label.startswith("RQ Job:"):
+		_path = child.path or ""
+		if _path:
+			_short = _path.split(".")[-1] if "." in _path else _path
+			_label = f"RQ Job: {_short}"
 	return {
 		"action_label": _label,
 		"event_type": _event_type,
@@ -2709,6 +2954,36 @@ def _highlight_diff_html(html: str) -> str:
 _SNIPPET_TRUNCATE_CHARS = 200
 
 
+def _path_within_bench(path: str) -> bool:
+	"""Phase-K-hardening boundary check: return True only when the
+	absolute ``path`` lies inside the bench directory tree. Used by
+	``_resolve_source_path`` to refuse callsite filenames that resolve
+	to ``/etc/passwd`` or other locations outside the bench.
+
+	Returns ``True`` (bypass) when:
+	  - ``frappe.flags.in_test`` is set (pytest fixtures legitimately
+	    point at /tmp/... paths the boundary would otherwise reject);
+	  - ``frappe.utils.get_bench_path`` isn't importable / fails (the
+	    check is a defence-in-depth layer, not a hard requirement).
+	"""
+	try:
+		import frappe
+		if getattr(frappe.flags, "in_test", False):
+			return True
+		import frappe.utils
+		bench = frappe.utils.get_bench_path()
+	except Exception:
+		return True
+	if not bench:
+		return True
+	try:
+		bench_abs = os.path.abspath(bench)
+		path_abs = os.path.abspath(path)
+	except Exception:
+		return False
+	return path_abs == bench_abs or path_abs.startswith(bench_abs + os.sep)
+
+
 def _resolve_source_path(filename) -> str | None:
 	"""Map a finding's callsite ``filename`` to a real file on disk.
 
@@ -2721,39 +2996,61 @@ def _resolve_source_path(filename) -> str | None:
 	``<bench>/apps/ugly_code/ugly_code/python/common.py``), with fallbacks
 	for absolute / cwd-relative / ``apps/…``-prefixed forms. Returns ``None``
 	for synthetic names (``<string>``, ``<frozen …>``), unresolvable paths,
-	or when ``frappe`` isn't importable (unit tests)."""
+	or when ``frappe`` isn't importable (unit tests).
+
+	Phase K hardening: every resolved path is finally checked against
+	the bench-directory boundary (``_path_within_bench``). A filename
+	that points outside the bench (e.g. ``/etc/passwd`` via a
+	malicious analyzer dict) returns ``None``.
+	"""
 	if not filename:
 		return None
 	name = str(filename).strip()
 	if not name or name.startswith("<"):
 		return None
+	resolved: str | None = None
 	try:
 		if os.path.isabs(name):
-			return name if os.path.exists(name) else None
-		if os.path.exists(name):
-			return name
-		parts = [p for p in name.replace("\\", "/").split("/") if p]
-		if not parts:
-			return None
-		import frappe
+			resolved = name if os.path.exists(name) else None
+		elif os.path.exists(name):
+			resolved = name
+		else:
+			parts = [p for p in name.replace("\\", "/").split("/") if p]
+			if not parts:
+				return None
+			import frappe
 
-		candidates = []
-		try:
-			candidates.append(frappe.get_app_path(parts[0], *parts[1:]))
-		except Exception:
-			pass
-		try:
-			bench = frappe.get_bench_path()
-			candidates.append(os.path.join(bench, name))
-			candidates.append(os.path.join(bench, "apps", name))
-		except Exception:
-			pass
-		for cand in candidates:
-			if cand and os.path.exists(cand):
-				return cand
+			candidates = []
+			try:
+				candidates.append(frappe.get_app_path(parts[0], *parts[1:]))
+			except Exception:
+				pass
+			try:
+				import frappe.utils
+				bench = frappe.utils.get_bench_path()
+				candidates.append(os.path.join(bench, name))
+				candidates.append(os.path.join(bench, "apps", name))
+			except Exception:
+				pass
+			for cand in candidates:
+				if cand and os.path.exists(cand):
+					resolved = cand
+					break
 	except Exception:
 		return None
-	return None
+	if resolved and not _path_within_bench(resolved):
+		# Defence-in-depth: refuse paths that escape the bench tree.
+		# Log at warning level (best-effort - frappe may not be
+		# importable in unit-test contexts).
+		try:
+			import frappe
+			frappe.logger().warning(
+				f"optimus._resolve_source_path: rejected out-of-bench path {resolved!r}"
+			)
+		except Exception:
+			pass
+		return None
+	return resolved
 
 
 def _read_source_snippet(
@@ -2790,7 +3087,14 @@ def _read_source_snippet(
 
 	limit = _SNIPPET_TRUNCATE_CHARS
 	snippet: list[dict] = []
-	for n in (ln - 1, ln, ln + 1):
+	# v0.7.x: read a ±2-line window around the anchor (compromise
+	# between ±1 — too tight, body invisible — and ±4 — included
+	# preceding-function noise). The template's blank-line filter
+	# drops empties (except the callsite itself), so the visible
+	# snippet ends up at ~3-4 lines: the anchor `def` + a couple of
+	# body lines. For the exact hot line inside the function, the
+	# Slow-Hot-Path description points to the Line-Level Drilldown.
+	for n in range(max(1, ln - 2), ln + 3):
 		if 1 <= n <= len(lines):
 			content = lines[n - 1]
 			if len(content) > limit:
@@ -3386,14 +3690,21 @@ def _savings_phrase(pct: float) -> str:
 	return f"by roughly {pct * 100:.0f}%"
 
 
-_CALL_TREE_MAX_DEPTH = 12  # truncate ultra-deep stacks for sanity
+_CALL_TREE_MAX_DEPTH = 12  # default cap shown without a click
+_CALL_TREE_HARD_CAP = 64   # absolute ceiling — runaway protection
 
 
-def _render_call_tree_node(node, parent_ms, depth=0):
+def _render_call_tree_node(node, parent_ms, depth=0, unlimited=False):
 	"""Phase K.5: recursive nested-``<details>`` emit for a single
 	call_tree node. Auto-expands the first ``depth`` levels; deeper
 	branches start collapsed so the panel doesn't unfurl into thousands
 	of frames on first paint.
+
+	Past ``_CALL_TREE_MAX_DEPTH`` the remaining subtree is wrapped in
+	a click-to-expand ``<details>`` so users can traverse deeper when
+	they want to, with ``unlimited=True`` flipped on for that subtree
+	so we don't keep nesting expanders at every level. ``_CALL_TREE_
+	HARD_CAP`` is the absolute ceiling for runaway protection.
 	"""
 	if not isinstance(node, dict):
 		return ""
@@ -3424,25 +3735,89 @@ def _render_call_tree_node(node, parent_ms, depth=0):
 		f'{cum_ms:.0f}ms{pct_label}{self_label}</span>',
 		'</summary>',
 	]
-	if children and depth < _CALL_TREE_MAX_DEPTH:
-		out.append('<div class="call-tree-children">')
+	if children:
 		children_sorted = sorted(
 			children,
 			key=lambda c: float((c or {}).get("cumulative_ms") or 0),
 			reverse=True,
 		)
-		for c in children_sorted:
-			out.append(_render_call_tree_node(c, cum_ms, depth + 1))
-		out.append('</div>')
-	elif children:
-		# Truncation note for very deep trees.
-		out.append(
-			'<div class="call-tree-children call-tree-truncated">'
-			f'<em>... {len(children)} child frame(s) hidden (depth limit reached) ...</em>'
-			'</div>'
-		)
+		within_default = unlimited or depth < _CALL_TREE_MAX_DEPTH
+		within_hard = depth < _CALL_TREE_HARD_CAP
+
+		if within_default and within_hard:
+			out.append('<div class="call-tree-children">')
+			for c in children_sorted:
+				out.append(_render_call_tree_node(
+					c, cum_ms, depth + 1, unlimited,
+				))
+			out.append('</div>')
+		elif within_hard:
+			# Past default cap — click-to-expand the rest of the
+			# subtree. ``unlimited=True`` prevents further wrapping
+			# at every nested level.
+			out.append(
+				'<div class="call-tree-children call-tree-deeper">'
+				'<details class="call-tree-deeper-toggle">'
+				'<summary>'
+				f'<em>show {len(children)} deeper frame(s) &middot; '
+				f'depth {depth + 1}+</em>'
+				'</summary>'
+				'<div class="call-tree-children">'
+			)
+			for c in children_sorted:
+				out.append(_render_call_tree_node(
+					c, cum_ms, depth + 1, unlimited=True,
+				))
+			out.append('</div></details></div>')
+		else:
+			# depth >= HARD_CAP; absolute truncation as safety net.
+			out.append(
+				'<div class="call-tree-children call-tree-truncated">'
+				f'<em>... {len(children)} child frame(s) hidden '
+				f'(hard cap {_CALL_TREE_HARD_CAP} reached) ...</em>'
+				'</div>'
+			)
 	out.append('</details>')
 	return "".join(out)
+
+
+def _aggregate_frame_truncation(actions: list[dict]) -> dict:
+	"""B.DI2 — sum captured / kept frames across actions whose call-tree
+	hit ``CALL_TREE_HARD_TRUNCATE_KEEP_FRAMES``.
+
+	Returns ``{"captured": int, "kept": int, "actions_affected": int,
+	"keep_limit": int}``; ``actions_affected == 0`` means no truncation
+	occurred (template hides the banner).
+	"""
+	captured = 0
+	kept = 0
+	affected = 0
+	keep_limit = 0
+	for a in actions or []:
+		raw = a.get("call_tree_json") if isinstance(a, dict) else None
+		if not raw:
+			continue
+		try:
+			tree = json.loads(raw)
+		except Exception:
+			continue
+		if not isinstance(tree, dict) or not tree.get("_truncated"):
+			continue
+		c = int(tree.get("_captured_frames") or 0)
+		k = int(tree.get("_kept_frames") or 0)
+		if c <= 0:
+			continue
+		captured += c
+		kept += k
+		affected += 1
+		if k > keep_limit:
+			keep_limit = k
+	return {
+		"captured": captured,
+		"kept": kept,
+		"actions_affected": affected,
+		"keep_limit": keep_limit,
+	}
 
 
 def _render_call_tree_panel(actions):
@@ -3471,13 +3846,11 @@ def _render_call_tree_panel(actions):
 	action_label = top.get("action_label") or ""
 
 	parts = [
-		'<details class="section" id="call-tree">',
-		'<summary>',
+		'<section class="section" id="call-tree">',
 		'<div class="section-head">',
 		'<h2>Call tree (top action)</h2>',
 		f'<span class="section-tag">{_e(action_label)}</span>',
 		'</div>',
-		'</summary>',
 		'<p class="section-intro">'
 		'Hierarchical breakdown of where wall-clock time went inside the slowest '
 		'action. Click any frame to expand its children. Numbers are cumulative time '
@@ -3494,7 +3867,7 @@ def _render_call_tree_panel(actions):
 	for c in root_children_sorted:
 		parts.append(_render_call_tree_node(c, total_ms, depth=0))
 	parts.append('</div>')
-	parts.append('</details>')
+	parts.append('</section>')
 	return "".join(parts)
 
 
@@ -3543,8 +3916,9 @@ def _compose_tldr(
 				plural="s" if total_actions != 1 else "",
 			),
 			"sub_markup": Markup(
-				"Session total {duration} &middot; {actions} operations "
-				"&middot; {queries} DB queries."
+				"Total active time: {duration} "
+				"<small class=\"scope-tag\">consolidated &middot; session</small> "
+				"&middot; {actions} operations &middot; {queries} DB queries."
 			).format(
 				duration=_fmt(total_ms),
 				actions=total_actions,
@@ -3687,9 +4061,10 @@ def _compose_tldr(
 		_only = next(iter(_sev_filenames))
 		_all_in = Markup(", all in <code>{file}</code>").format(file=_only)
 	sub = Markup(
-		"Session total {duration} &middot; {actions} operations "
-		"&middot; {queries:,} DB queries &middot; "
-		"{n} {severity_lc}-severity finding{plural}{all_in}."
+		"Total active time: {duration} "
+		"<small class=\"scope-tag\">consolidated &middot; session</small> "
+		"&middot; {actions} operations &middot; {queries:,} DB queries "
+		"&middot; {n} {severity_lc}-severity finding{plural}{all_in}."
 	).format(
 		duration=_fmt(total_ms),
 		actions=total_actions,
@@ -3866,7 +4241,11 @@ def _filter_top_queries_for_display(queries: list) -> list:
 	for q in queries or []:
 		if not isinstance(q, dict):
 			continue
-		if (q.get("duration_ms") or 0) < TOP_QUERY_FLOOR_MS:
+		# v0.7.x M5 renamed ``duration_ms`` → ``query_duration_ms`` on the
+		# top-queries leaderboard. Accept both so a session captured before
+		# the rename still rehydrates correctly.
+		_dur = q.get("query_duration_ms") or q.get("duration_ms") or 0
+		if _dur < TOP_QUERY_FLOOR_MS:
 			continue
 		if not is_framework_callsite_str(q.get("callsite"), tracked):
 			out.append(q)
@@ -4126,6 +4505,7 @@ _ACTIONABLE_FINDING_TYPES = frozenset({
 	# Python hot paths in user code
 	"Slow Hot Path",       # narrowed by call_tree filter to user frames
 	"Hook Bottleneck",     # user's own doc-event hook is slow
+	"Slow Background Job", # BG-job fallback finding (v0.7.x)
 	"Redundant Call",      # v0.5.2: framework callsites already filtered
 	# Frontend — user can trim responses / optimize JS
 	"Slow Frontend Render",
@@ -4240,18 +4620,37 @@ def build_hot_frames_table(rows: list, is_hot: bool = False) -> list:
 	framework lists before calling this builder, so the flag is a
 	per-list constant — True for the user-code table, False for the
 	framework sibling.
+
+	v0.7.x: ``is_hot`` also selects WHICH time metric the row
+	displays. User-app frames (``is_hot=True``) keep the self-sum
+	``total_ms`` (precise per A.AE1). Framework frames
+	(``is_hot=False``) display ``total_cumulative_ms`` because
+	wrapper self-time is sub-sampler-interval and rounds to 0 across
+	every row. Framework rows are re-sorted by the cumulative metric
+	so the column reads top-down by impact.
 	"""
 	out = []
 	for row in rows or []:
 		display = redact_frame_name(
 			{"function": row.get("function"), "filename": "", "lineno": 0},
 		)
+		if is_hot:
+			display_ms = row.get("total_ms", 0)
+		else:
+			display_ms = row.get(
+				"total_cumulative_ms", row.get("total_ms", 0)
+			)
 		out.append({
 			"display_name": display,
-			"total_ms": row.get("total_ms", 0),
+			"total_ms": display_ms,
 			"occurrences": row.get("occurrences", 0),
 			"distinct_actions": row.get("distinct_actions", 0),
 			"action_refs": row.get("action_refs", []),
 			"is_hot": is_hot,
 		})
+	# Framework variant ranks by the displayed (cumulative) metric —
+	# the aggregator's outer sort was by self_ms, which produces
+	# all-zero ties on framework rows.
+	if not is_hot:
+		out.sort(key=lambda r: r.get("total_ms", 0), reverse=True)
 	return out

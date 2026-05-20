@@ -26,23 +26,38 @@
 	// the user is on cached JS and needs a hard refresh + bench restart.
 	const WIDGET_BUILD_ID = "2026-04-16-hide-when-disabled";
 
-	// LOUD diagnostic so we can SEE this script execute in the browser console.
-	console.log(
-		"[optimus] floating_widget.js LOADED",
+	// Developer-only diagnostic. Defaults to silent in production so the
+	// browser console isn't spammed on every Desk page. Set
+	// ``window.OPTIMUS_DEBUG = true`` before page load (or from devtools)
+	// to surface the per-step trace. Replaces the prior unconditional
+	// ``console.log`` / ``console.warn`` / ``console.error`` calls.
+	function _diag() {
+		if (window.OPTIMUS_DEBUG !== true) return;
+		if (typeof console === "undefined" || !console.log) return;
+		try {
+			console.log.apply(
+				console,
+				["[optimus]"].concat([].slice.call(arguments))
+			);
+		} catch (e) { /* swallow */ }
+	}
+
+	_diag(
+		"floating_widget.js LOADED",
 		"build=" + WIDGET_BUILD_ID,
 		"at", new Date().toISOString()
 	);
 
 	// Only run inside Desk (not on web pages or guest sessions).
 	if (typeof frappe === "undefined" || typeof frappe.session === "undefined") {
-		console.warn("[optimus] no frappe global, script exiting");
+		_diag("[optimus] no frappe global, script exiting");
 		return;
 	}
 	if (frappe.session.user === "Guest") {
-		console.warn("[optimus] user is Guest, script exiting");
+		_diag("[optimus] user is Guest, script exiting");
 		return;
 	}
-	console.log("[optimus] proceeding for user:", frappe.session.user);
+	_diag("[optimus] proceeding for user:", frappe.session.user);
 
 	// v0.5.1: HTTP polling of optimus.api.status is GONE. The
 	// widget now drives its state from realtime events pushed by the
@@ -94,7 +109,7 @@
 			frappe.boot && frappe.boot.optimus_enabled
 		);
 		if (bootEnabled === false) {
-			console.log(
+			_diag(
 				"[optimus] profiler is disabled in settings — "
 				+ "widget will not mount"
 			);
@@ -202,11 +217,11 @@
 	}
 
 	function mountWidget() {
-		console.log("[optimus] mountWidget() called");
+		_diag("[optimus] mountWidget() called");
 		// Idempotent: don't double-mount on accidental re-init.
 		const existing = document.getElementById("frappe-profiler-widget");
 		if (existing) {
-			console.log("[optimus] widget already in DOM, skipping mount");
+			_diag("[optimus] widget already in DOM, skipping mount");
 			widget = existing;
 			return;
 		}
@@ -224,9 +239,10 @@
 			<span class="fp-elapsed"></span>
 		`;
 		widget.addEventListener("click", onClick);
-		// Inline styles with MAXIMUM visibility — bright red, large, top-right,
-		// max z-index. This is intentionally loud so the user can SEE it.
-		// Once we confirm it's visible we'll dial it back to the styled pill.
+		// Inline-style only the layout primitives that need to override
+		// any Desk-side CSS regression (positioning + force-visible).
+		// Visual styling (size, padding, border, colour, font) lives in
+		// floating_widget.css so the pill stays mobile-overlay-sized.
 		widget.style.cssText = [
 			"position: fixed",
 			"right: 20px",
@@ -235,24 +251,12 @@
 			"display: block !important",
 			"visibility: visible !important",
 			"opacity: 1 !important",
-			"min-width: 180px",
-			"padding: 16px 24px",
-			"border-radius: 32px",
-			"border: 3px solid #b91c1c",
-			"background: #fef2f2",
-			"box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3)",
-			"font-family: -apple-system, BlinkMacSystemFont, sans-serif",
-			"font-size: 1rem",
-			"font-weight: 700",
-			"color: #b91c1c",
-			"cursor: pointer",
-			"user-select: none",
 			"pointer-events: auto",
 		].join("; ");
 		document.body.appendChild(widget);
-		console.log("[optimus] widget appended to body, id=#frappe-profiler-widget");
-		console.log("[optimus] widget element:", widget);
-		console.log("[optimus] body has child count:", document.body.children.length);
+		_diag("[optimus] widget appended to body, id=#frappe-profiler-widget");
+		_diag("[optimus] widget element:", widget);
+		_diag("[optimus] body has child count:", document.body.children.length);
 	}
 
 	function setDisplay(display, label, elapsed) {
@@ -393,19 +397,11 @@
 						"Give this session a name you'll recognize later — e.g. 'Sales Invoice flow with 50 items'.",
 				},
 				{
-					fieldname: "capture_python_tree",
-					fieldtype: "Check",
-					label: "Capture Python call tree (recommended)",
-					default: 1,
-					description:
-						"Adds ~5–15% overhead but enables hot path detection, hook bottleneck findings, and redundant call detection. Disable for SQL-only capture (v0.2.0 behavior).",
-				},
-				{
 					fieldname: "warning_html",
 					fieldtype: "HTML",
 					options: `
 						<div style="background: #fffbeb; border: 1px solid #fbbf24; border-radius: 4px; padding: 10px 12px; margin-top: 10px; font-size: 0.85rem; color: #92400e;">
-							<strong>Note:</strong> Recording adds 10–30% overhead per database query (1.5–2× wall clock with Python tree capture).
+							<strong>Note:</strong> Recording adds ~1.5–2× wall-clock overhead per request while it's running.
 							Only your traffic will be captured — other users on this site are not affected.
 							The session auto-stops after 10 minutes.
 						</div>
@@ -419,7 +415,12 @@
 					method: "optimus.api.start",
 					args: {
 						label: values.label || "",
-						capture_python_tree: values.capture_python_tree ? 1 : 0,
+						// v0.7 GA: tree capture is always on - users
+						// who turn it off then file "no candidates"
+						// bugs. The api.start kwarg still defaults
+						// True so CLI / external callers can opt
+						// out if they really need SQL-only capture.
+						capture_python_tree: 1,
 					},
 					callback: (r) => {
 						const data = (r && r.message) || {};
@@ -490,7 +491,7 @@
 		// v0.5.0: also flush any buffered frontend metrics before the stop
 		// API fires, so analyze can join them to recordings. Best-effort —
 		// a failed flush never blocks stop.
-		console.log("[optimus] confirmAndStop: click received");
+		_diag("[optimus] confirmAndStop: click received");
 		setDisplay("stopping", "Stopping…", "");
 		currentState.display = "stopping";
 		stopElapsedTimer();
@@ -505,7 +506,7 @@
 			method: "optimus.api.stop",
 			callback: (r) => {
 				const data = (r && r.message) || {};
-				console.log("[optimus] stop callback:", data);
+				_diag("[optimus] stop callback:", data);
 
 				// v0.5.1: handle the "no active session" case explicitly.
 				// Stop API returns {stopped: false, reason: "no active session"}
@@ -575,7 +576,7 @@
 				// Safer: call status() to ask the server what it thinks.
 				// If active → really revert to Recording. If inactive →
 				// the session is gone; reset the widget to inactive.
-				console.warn("[optimus] stop error:", r);
+				_diag("[optimus] stop error:", r);
 				frappe.call({
 					method: "optimus.api.status",
 					callback: (sr) => {
@@ -788,7 +789,7 @@
 	// runs (Desk.set_globals at desk.js:329 runs later, asynchronously).
 	// The server-side _require_profiler_user check is the real gate.
 	function bootstrap() {
-		console.log("[optimus] bootstrap() called, document.body exists:", !!document.body);
+		_diag("[optimus] bootstrap() called, document.body exists:", !!document.body);
 		if (!document.body) {
 			setTimeout(bootstrap, 50);
 			return;
@@ -796,11 +797,11 @@
 		try {
 			init();
 		} catch (e) {
-			console.error("[optimus] init failed:", e);
+			_diag("[optimus] init failed:", e);
 		}
 	}
 
-	console.log("[optimus] document.readyState:", document.readyState);
+	_diag("[optimus] document.readyState:", document.readyState);
 	if (document.readyState === "loading") {
 		document.addEventListener("DOMContentLoaded", bootstrap);
 	} else {

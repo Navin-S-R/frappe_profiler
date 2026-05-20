@@ -563,6 +563,24 @@ def project_post_fix_ms(
 	return max(POST_FIX_FLOOR_MS, round(current_avg_ms * factor, 2))
 
 
+def percentile(values: list[float], pct: int) -> float:
+	"""Linear-interpolated percentile of ``values``. Returns 0.0 for an
+	empty list. ``pct`` is in [0, 100]. Used by repetition-heavy
+	analyzers (N+1, redundant calls) to surface the tail of the per-hit
+	duration distribution alongside the consolidated total.
+
+	No numpy dependency — Optimus already ships pure-Python analyzers,
+	and this is exact enough for finding-card P95 readouts.
+	"""
+	if not values:
+		return 0.0
+	s = sorted(values)
+	k = (len(s) - 1) * pct / 100.0
+	f = int(k)
+	c = min(f + 1, len(s) - 1)
+	return s[f] + (s[c] - s[f]) * (k - f)
+
+
 def short_filename(filename: str, keep_segments: int = 2) -> str:
 	"""Return the last ``keep_segments`` path components of ``filename``.
 
