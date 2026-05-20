@@ -160,6 +160,43 @@ class TestEnrichFindingsWithSourceSnippets:
 		# Function should not crash on malformed JSON.
 		assert f["technical_detail_json"] == "{not valid json"
 
+	def test_string_form_callsite_skipped_cleanly(self, tmp_path):
+		# Slow Query findings (optimus/analyzers/top_queries.py:129) store
+		# callsite as a "path:lineno" string, not the canonical
+		# {filename, lineno, function} dict every other finding type uses.
+		# The enrichment loop must not crash on that shape — renderer
+		# handles snippets for these findings at render time via
+		# _normalize_callsite + lazy attach in _finding_to_dict.
+		#
+		# Regression for the production traceback on session
+		# 523567a82bce0342: ``builtins.AttributeError: 'str' object has
+		# no attribute 'get'`` at analyze.py:1391.
+		src = tmp_path / "fake.py"
+		src.write_text("line\n")
+		f = {
+			"finding_type": "Slow Query",
+			"severity": "High",
+			"title": "Slow query: 1020ms",
+			"customer_description": "...",
+			"estimated_impact_ms": 1020,
+			"affected_count": 1,
+			"action_ref": "0",
+			"technical_detail_json": json.dumps({
+				"normalized_query": "SELECT 1",
+				"callsite": f"{src}:1",  # STRING form, not dict
+				"recording_uuid": "abc",
+				"fix_hint": "",
+			}),
+		}
+
+		# Must not raise.
+		analyze._enrich_findings_with_source_snippets([f])
+
+		# Slow Query callsite shape preserved (string, not mutated to
+		# dict) — renderer normalizes it lazily at render time.
+		detail = json.loads(f["technical_detail_json"])
+		assert detail["callsite"] == f"{src}:1"
+
 	def test_file_cache_avoids_repeated_reads(self, tmp_path, monkeypatch):
 		src = tmp_path / "shared.py"
 		src.write_text("a\nb\nc\nd\ne\n")
