@@ -130,10 +130,15 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 					s["write_count"] += 1
 					s["write_duration"] += duration
 
+	# v0.7.x C.AM2: renamed ``duration_ms`` → ``consolidated_time_ms`` to
+	# disambiguate from action.duration_ms (per-request wall) and
+	# top_queries.query_duration_ms (per-call query exec). The value is
+	# the sum of every query touching this table — a consolidated total
+	# across the session, not a per-hit measurement.
 	breakdown = [
 		{
 			"table": t,
-			"duration_ms": round(s["duration"], 2),
+			"consolidated_time_ms": round(s["duration"], 2),
 			"queries": s["count"],
 			"read_count": s["read_count"],
 			"write_count": s["write_count"],
@@ -147,7 +152,7 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 		}
 		for t, s in stats.items()
 	]
-	breakdown.sort(key=lambda x: x["duration_ms"], reverse=True)
+	breakdown.sort(key=lambda x: x["consolidated_time_ms"], reverse=True)
 	combined = breakdown[:DEFAULT_TOP_N]
 	seen = {t["table"] for t in combined}
 	extra_writes = sorted(
@@ -155,7 +160,7 @@ def analyze(recordings: list[dict], context) -> AnalyzerResult:
 		key=lambda x: (-x["write_count"], -x["write_time_ms"]),
 	)[:DEFAULT_WRITE_TOP_N]
 	combined = combined + extra_writes
-	combined.sort(key=lambda x: x["duration_ms"], reverse=True)
+	combined.sort(key=lambda x: x["consolidated_time_ms"], reverse=True)
 	return AnalyzerResult(aggregate={"table_breakdown": combined})
 
 

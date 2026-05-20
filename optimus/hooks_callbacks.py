@@ -643,17 +643,23 @@ def _dump_capture_state_to_redis(recording_uuid: str | None) -> None:
 	Called from after_request / after_job after the recorder has dumped
 	its own SQL recording. The two new Redis keys are:
 
-	  profiler:tree:<recording_uuid>      → pickle.dumps(pyi.last_session)
+	  profiler:tree:<recording_uuid>      → HMAC-signed pickle.dumps(pyi.last_session)
 	  profiler:sidecar:<recording_uuid>   → list[dict]
 
 	Both inherit the same TTL semantics as RECORDER_REQUEST_HASH (cleaned
 	up at the end of analyze, or expire naturally if analyze never runs).
 
+	Phase K hardening: the pickled tree carries a 32-byte HMAC-SHA256
+	prefix derived from the site's ``encryption_key``. ``analyze.py``
+	refuses to unpickle blobs whose signature doesn't match - this
+	stops a Redis-poisoning attacker from injecting a malicious pickle
+	to gain code execution in a worker process.
+
 	Best-effort: failures here log but never break the request.
 	"""
 	import pickle
 
-	from optimus.session import SESSION_TTL_SECONDS
+	from optimus.session import SESSION_TTL_SECONDS, sign_blob
 
 	if not recording_uuid:
 		# No recorder ran on this request — nothing to dump.
@@ -664,7 +670,22 @@ def _dump_capture_state_to_redis(recording_uuid: str | None) -> None:
 	if prof is not None:
 		try:
 			prof.stop()
-			tree_blob = pickle.dumps(prof.last_session)
+			tree_blob = sign_blob(pickle.dumps(prof.last_session))
+			# Visibility for the picker-diagnostic path: log whether
+			# this write was signed or unsigned, plus byte size.
+			# Helps operators correlate a "with_tree=0" picker
+			# diagnostic with the actual write mode (signed blobs
+			# need a stable encryption_key; unsigned blobs round-
+			# trip via the fallback).
+			try:
+				from optimus.session import _has_stable_hmac_secret
+				frappe.logger().debug(
+					f"optimus pyi dump: {recording_uuid} "
+					f"({'signed' if _has_stable_hmac_secret() else 'unsigned'}, "
+					f"{len(tree_blob)} bytes)"
+				)
+			except Exception:
+				pass
 			frappe.cache.set_value(
 				f"profiler:tree:{recording_uuid}",
 				tree_blob,

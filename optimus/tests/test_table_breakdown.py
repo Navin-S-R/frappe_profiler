@@ -20,8 +20,8 @@ def test_single_table_aggregated(clean_recording, empty_context):
 	assert "tabCustomer" in tables
 	customer_row = next(b for b in breakdown if b["table"] == "tabCustomer")
 	assert customer_row["queries"] == 2
-	# Sum of 18 + 20 = 38 ms
-	assert customer_row["duration_ms"] == pytest.approx(38.0, abs=0.5)
+	# Sum of 18 + 20 = 38 ms.  C.AM2 renamed duration_ms → consolidated_time_ms.
+	assert customer_row["consolidated_time_ms"] == pytest.approx(38.0, abs=0.5)
 
 
 def test_sorted_by_duration_desc(empty_context):
@@ -113,7 +113,7 @@ class TestReadWriteSplit:
 		assert row["write_count"] == 3
 		assert row["read_time_ms"] == pytest.approx(30.0, abs=0.1)
 		assert row["write_time_ms"] == pytest.approx(6.0, abs=0.1)
-		assert row["duration_ms"] == pytest.approx(36.0, abs=0.1)
+		assert row["consolidated_time_ms"] == pytest.approx(36.0, abs=0.1)
 
 	def test_write_only_table_has_zero_reads_and_no_candidates(self, empty_context):
 		rec = _rec(
@@ -270,7 +270,7 @@ class TestFrappeMetaTablesExcluded:
 		assert row["index_candidates"] == []
 		assert row["framework_cols_filtered"] == []
 		# Still counted in the breakdown (time/reads aren't suppressed).
-		assert row["read_count"] == 1 and row["duration_ms"] == 5.0
+		assert row["read_count"] == 1 and row["consolidated_time_ms"] == 5.0
 
 	def test_non_meta_table_flag_is_false(self, empty_context):
 		q = "SELECT `name` FROM `tabSales Invoice` WHERE `customer` = ?"
@@ -281,11 +281,13 @@ class TestFrappeMetaTablesExcluded:
 		assert row["is_meta_table"] is False
 		assert [c["column"] for c in row["index_candidates"]] == ["customer"]
 
-	def test_render_shows_meta_table_note(self):
-		# v0.6.x: with the default "Hide framework / internal database tables"
-		# toggle on, meta tables are filtered out of the section entirely.
-		# Disable the toggle so the row reaches the template and the
-		# "Frappe framework meta table" disclaimer renders as it used to.
+	def test_meta_table_skipped_from_index_recs(self):
+		# User direction: "Ignore Non-actionable tables on Index
+		# recommendations waste of space". Meta tables can't be acted on
+		# (bench migrate owns their schema), so they're filtered out of
+		# the index-recommendations cards. They still appear in the timing
+		# breakdown table above (when the "Hide framework tables" toggle
+		# is off) — the row is informational, just not actionable.
 		from unittest.mock import patch
 
 		from optimus import renderer
@@ -299,11 +301,14 @@ class TestFrappeMetaTablesExcluded:
 		with patch("optimus.settings.get_config",
 		           return_value=OptimusConfig(hide_framework_tables=False)):
 			html = renderer.render_raw(doc, recordings=[])
+		# Still in the timing table.
 		assert "tabCustom Field" in html
-		assert "Frappe framework meta table" in html
-		assert "bench migrate</code> owns its schema" in html
-		# Must NOT fall through to the generic "no single indexable column" line.
+		# Index-recs card disclaimer no longer rendered.
+		assert "Frappe framework meta table" not in html
+		assert "bench migrate</code> owns its schema" not in html
+		# Also no fall-through to other non-actionable branches.
 		assert "no single indexable column" not in html
+		assert "Reads here only filter on Frappe metadata columns" not in html
 
 
 class TestRenderedFrameworkColsNote:
@@ -337,7 +342,12 @@ class TestRenderedFrameworkColsNote:
 		assert "never suggested" in html.lower()
 		assert "framework meta tables" in html.lower()
 
-	def test_metadata_only_table_shows_not_safe_targets_line(self):
+	def test_metadata_only_table_skipped_from_index_recs(self):
+		# User direction: "Ignore Non-actionable tables on Index
+		# recommendations waste of space". When a table's only filters
+		# are Frappe metadata cols (no actionable index_candidates), the
+		# table is dropped from the index-recommendations cards. Still
+		# appears in the timing breakdown table above.
 		from optimus import renderer
 		breakdown = [{
 			"table": "tabAudit", "duration_ms": 12.0, "queries": 2,
@@ -346,8 +356,10 @@ class TestRenderedFrameworkColsNote:
 			"framework_cols_filtered": ["docstatus", "idx", "name"],
 		}]
 		html = renderer.render_raw(self._doc(breakdown), recordings=[])
-		assert "Reads here only filter on Frappe metadata columns" in html
-		# It should NOT claim "no single indexable column" (that's the other branch).
+		# Still in the timing table.
+		assert "tabAudit" in html
+		# But the non-actionable index-rec card is gone.
+		assert "Reads here only filter on Frappe metadata columns" not in html
 		assert "no single indexable column" not in html
 
 
@@ -378,9 +390,10 @@ class TestRenderedSection:
 		}]
 		html = renderer.render_raw(self._doc(breakdown), recordings=[])
 		assert "Time spent per database table" in html
-		# Reads / Writes columns rendered.
-		assert "<th class=\"num\">Reads</th>" in html
-		assert "<th class=\"num\">Writes</th>" in html
+		# Reads / Writes columns rendered (each carries a "consolidated"
+		# scope tag — match a prefix so the test is robust to tag tweaks).
+		assert "<th class=\"num\">Reads " in html
+		assert "<th class=\"num\">Writes " in html
 		# Candidate columns + their source tooltip + the write-impact note.
 		assert "<code title=\"used in WHERE" in html
 		assert ">docstatus</code>" in html

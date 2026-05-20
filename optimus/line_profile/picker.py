@@ -166,6 +166,92 @@ def _walk_tree(node: dict, hits: dict) -> None:
 		_walk_tree(child, hits)
 
 
+def _build_tree_indented_candidates(trees: list[dict]) -> list[dict]:
+	"""Phase K v0.7 GA: pick the hottest tree (largest root
+	``cumulative_ms``) and walk it DFS, emitting candidates with a
+	``depth`` field so the picker UI can indent parent → child
+	hierarchies.
+
+	DFS pre-order means a parent always lands in the list before its
+	children. Children at each level are explored hottest-first so the
+	30-row cap surfaces the dominant paths.
+
+	Replaces the cross-tree-aggregating ``_build_candidates_from_trees``
+	for the production picker - the user's mental model is "profile
+	this one slow action", and the hottest tree IS that action. The
+	legacy helper stays in place for back-compat / tests.
+	"""
+	if not trees:
+		return []
+	biggest = max(
+		trees,
+		key=lambda t: float((t or {}).get("cumulative_ms") or 0),
+	)
+
+	out: list[dict] = []
+
+	def walk(node, ua_depth, fw_depth):
+		"""Dual-depth DFS: ``ua_depth`` is the depth a user-app frame
+		would get if it's user-app at this node; ``fw_depth`` is the
+		analog for framework frames. The emitted ``depth`` is the
+		PER-LIST depth (user-app list or framework list), so each
+		list's hierarchy renders flush-left in the dialog independent
+		of where the other list's frames sit in the absolute tree.
+		"""
+		if not isinstance(node, dict) or len(out) >= CANDIDATE_CAP:
+			return
+		function = node.get("function") or ""
+		filename = node.get("filename") or ""
+		kind = node.get("kind", "python")
+		is_real = (
+			kind == "python"
+			and not _is_synthetic_frame(function)
+			and not _is_pure_helper_frame(node)
+		)
+		next_ua = ua_depth
+		next_fw = fw_depth
+		# Emit BEFORE recursing so DFS pre-order parents land first.
+		if is_real:
+			dotted = _build_dotted_path(filename, function)
+			app = _derive_app(filename) or (
+				dotted.split(".", 1)[0] if "." in dotted else ""
+			)
+			is_framework = app in FRAMEWORK_APPS
+			my_depth = fw_depth if is_framework else ua_depth
+			out.append({
+				"dotted_path": dotted,
+				"qualname": function,
+				"file": filename,
+				"lineno": int(node.get("lineno") or 0),
+				"app": app,
+				"cumulative_ms": round(float(node.get("cumulative_ms") or 0), 2),
+				"hit_count": int(node.get("hit_count") or 1),
+				"is_framework": is_framework,
+				"depth": my_depth,
+			})
+			# Crossing back into the other list starts a fresh subtree
+			# at depth 0 in that list; stay-in-list increments by 1.
+			if is_framework:
+				next_fw = fw_depth + 1
+				next_ua = 0
+			else:
+				next_ua = ua_depth + 1
+				next_fw = 0
+		# Sort children by cumulative_ms desc so the hottest subtree
+		# gets DFS-explored first - keeps the top of the picker list
+		# focused on the slow paths even with the 30-row cap.
+		children = sorted(
+			node.get("children") or [],
+			key=lambda c: float((c or {}).get("cumulative_ms") or 0),
+			reverse=True,
+		)
+		for child in children:
+			walk(child, next_ua, next_fw)
+
+	walk(biggest, 0, 0)
+	return out
+
+
 def _build_candidates_from_trees(trees: list[dict], findings: list[dict]) -> list[dict]:
 	"""Aggregate candidates from per-action pyinstrument trees.
 

@@ -391,8 +391,9 @@ def _attach_phase1_hint(finding: dict, hint: dict) -> None:
 	finding["technical_detail_json"] = json.dumps(td, default=str)
 
 	finding["customer_description"] = finding["customer_description"] + (
-		f"\n\nTime also flows into **{hint['next_hot_callee']}** "
-		f"({hint['phase1_cumulative_ms']:.0f}ms in phase 1). "
+		f"\n\nIn phase 1, this descendant **{hint['next_hot_callee']}** "
+		f"accumulated {hint['phase1_cumulative_ms']:.0f}ms across all calls "
+		f"of the parent function (not a single-action wall time). "
 		f"{hint['suggested_action']}"
 	)
 

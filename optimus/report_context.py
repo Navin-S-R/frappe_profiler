@@ -161,12 +161,24 @@ def _build_kpis(session_doc, ctx) -> list[dict]:
 
 	ops_plural = "s" if total_requests != 1 else ""
 
+	# C.UT2 — Total-time KPI carries a caveat about wall-clock sampling.
+	# The interval is dynamic (Optimus Settings); read once for the sub-line.
+	try:
+		from optimus.settings import get_config as _get_cfg
+		_sampler_ms = float(_get_cfg().pyinstrument_sampler_interval_ms or 1.0)
+	except Exception:
+		_sampler_ms = 1.0
+
 	return [
 		{
 			"label": "Total time",
 			"value": fmt_ms(total_ms),
 			"unit": "",
 			"sub": total_time_sub,
+			"caveat": (
+				f"Call-tree timings sampled at ~{_sampler_ms:g}ms intervals; "
+				"sub-interval functions can be under-counted."
+			),
 			"is_danger": total_ms >= threshold_ms,
 		},
 		{
@@ -174,6 +186,7 @@ def _build_kpis(session_doc, ctx) -> list[dict]:
 			"value": str(total_queries),
 			"unit": "",
 			"sub": f"across {total_requests} operation{ops_plural}",
+			"caveat": None,
 			"is_danger": False,
 		},
 		{
@@ -181,6 +194,7 @@ def _build_kpis(session_doc, ctx) -> list[dict]:
 			"value": str(total_requests),
 			"unit": "",
 			"sub": "page loads · saves · jobs",
+			"caveat": None,
 			"is_danger": False,
 		},
 		{
@@ -188,6 +202,7 @@ def _build_kpis(session_doc, ctx) -> list[dict]:
 			"value": str(total_findings),
 			"unit": "",
 			"sub": findings_sub if total_findings else "none detected",
+			"caveat": None,
 			"is_danger": high > 0,
 		},
 	]
@@ -807,7 +822,15 @@ def _build_slow_queries(top_queries, fmt_ms=None) -> list[dict]:
 	fmt = fmt_ms or (lambda v, **kw: _ms_display(v))
 	result = []
 	for q in top_queries or []:
-		total_ms = q.get("duration_ms") or q.get("total_ms", 0) or 0
+		# v0.7.x M5 rename: accept the new ``query_duration_ms`` and the
+		# legacy ``duration_ms`` / ``total_ms`` so pre-rename sessions
+		# still render correctly through regenerate_reports.
+		total_ms = (
+			q.get("query_duration_ms")
+			or q.get("duration_ms")
+			or q.get("total_ms", 0)
+			or 0
+		)
 		count = q.get("count") or q.get("call_count", 0) or 0
 		avg = (total_ms / count) if count else 0
 		entry = dict(q)
@@ -843,10 +866,18 @@ def _build_db(table_breakdown, fmt_ms=None) -> dict | None:
 	index_recs = []
 	for t in table_breakdown:
 		is_hot = bool(t.get("is_write_hot", False)) or (t.get("queries", 0) or 0) >= 100
+		# v0.7.x C.AM2: prefer the new ``consolidated_time_ms`` key; fall
+		# back to legacy ``duration_ms`` for pre-rename sessions.
+		_t_ms = t.get("consolidated_time_ms")
+		if _t_ms is None:
+			_t_ms = t.get("duration_ms", 0) or 0
 		entry = dict(t)  # preserve original keys
+		# Expose the canonical name to the template so it can stop reading
+		# either of the legacy keys.
+		entry["consolidated_time_ms"] = _t_ms
 		entry.update({
 			"name": t.get("table", "") or "",
-			"time_display": fmt(t.get("duration_ms", 0) or 0),
+			"time_display": fmt(_t_ms),
 			"queries": t.get("queries", 0) or 0,
 			"reads": t.get("read_count", 0) or 0,
 			"writes": t.get("write_count", 0) or 0,
@@ -864,7 +895,7 @@ def _build_db(table_breakdown, fmt_ms=None) -> dict | None:
 			stats = (
 				f"{t.get('read_count', 0) or 0} reads · "
 				f"{t.get('write_count', 0) or 0} writes · "
-				f"{t.get('duration_ms', 0) or 0:.0f} ms"
+				f"{_t_ms:.0f} ms"
 			)
 			index_recs.append({
 				"table_name": t.get("table", "") or "",
@@ -921,10 +952,20 @@ def build_report_context(session_doc: Any, ctx: dict) -> dict:
 	section-by-section in J.2 without breaking. J.3 will unpack the
 	namespace and drop legacy keys.
 	"""
+	# v0.7.x B.DI1: surface the sampler interval onto report_data so
+	# every disclosure (KPI caveat, "How to read", finding desc) reads
+	# the same number. Defaults to 1.0ms when settings aren't reachable
+	# (pure-test path).
+	try:
+		from optimus.settings import get_config
+		_sampler_ms = float(get_config().pyinstrument_sampler_interval_ms or 1.0)
+	except Exception:
+		_sampler_ms = 1.0
 	return {
 		"session": _build_session(session_doc, ctx),
 		"tldr": _build_tldr(ctx.get("tldr")),
 		"kpis": _build_kpis(session_doc, ctx),
+		"sampler_interval_ms": _sampler_ms,
 		"repro": _build_repro(ctx.get("notes_html")),
 		"summary": _build_summary(ctx.get("summary_html")),
 		"findings": _build_findings(ctx.get("findings", []), ctx),
@@ -978,6 +1019,15 @@ def build_report_context(session_doc: Any, ctx: dict) -> dict:
 		"slow_queries": _build_slow_queries(ctx.get("top_queries", []), ctx.get("fmt_ms")),
 		# J.2.5 non-contract addition for framework split.
 		"slow_queries_framework": _build_slow_queries(ctx.get("top_queries_framework", []), ctx.get("fmt_ms")),
+		# B.DI4 — how many user-app slow queries the analyzer truncated
+		# out of the findings list (5-cap). 0 when nothing was suppressed.
+		"top_queries_suppressed_count": int(ctx.get("top_queries_suppressed_count") or 0),
+		"top_queries_slow_threshold_ms": float(ctx.get("top_queries_slow_threshold_ms") or 0),
+		# B.DI2 — Hot Frames section truncation banner data:
+		# {captured, kept, actions_affected, keep_limit}. actions_affected=0 hides it.
+		"frame_truncation": ctx.get("frame_truncation") or {
+			"captured": 0, "kept": 0, "actions_affected": 0, "keep_limit": 0,
+		},
 		"db": _build_db(ctx.get("table_breakdown", []), ctx.get("fmt_ms")),
 		"how_to_read_items": None,
 		"footer": _build_footer(ctx.get("render_config")),

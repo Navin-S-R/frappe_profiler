@@ -32,6 +32,10 @@ def test_actionable_finding_types_has_concrete_fixes_only():
 		"Slow Query",
 		"Slow Hot Path",
 		"Hook Bottleneck",
+		# v0.7.x: BG-job fallback finding points at the deepest
+		# user-code frame inside a slow job — a concrete callsite
+		# to investigate with Line-Level Drilldown.
+		"Slow Background Job",
 		"Redundant Call",
 		"Slow Frontend Render",
 		"Heavy Response",
@@ -109,19 +113,19 @@ def test_template_has_observations_subsection_inside_findings():
 	assert "observational_findings" in template, (
 		"report.html must iterate observational_findings"
 	)
-	# Observations is now a <details class="subsection"> inside Findings.
+	# Observations lives as a <section class="subsection"> inside Findings.
 	findings_idx = template.find("Findings - what to fix")
 	obs_idx = template.find("Framework-level observations")
 	assert findings_idx > 0 and obs_idx > 0
 	assert obs_idx > findings_idx, (
 		"Framework-level observations subsection must live inside the "
-		"Findings section (below its <summary>, above its </details>)"
+		"Findings section (between its <h2> and closing </section>)"
 	)
-	# And the subsection uses the collapsed-by-default pattern (no `open` attribute).
-	subsection_marker = '<details class="subsection">'
+	# The subsection is a plain <section> block (non-collapsible).
+	subsection_marker = '<section class="subsection">'
 	assert subsection_marker in template, (
-		"Framework-level observations must be a collapsed-by-default "
-		"<details class='subsection'> block (no `open` attribute)"
+		"Framework-level observations must be a <section class='subsection'> "
+		"block — non-collapsible by user request"
 	)
 
 

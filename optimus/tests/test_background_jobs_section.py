@@ -87,10 +87,18 @@ class TestBuildBackgroundJobs:
 		recs = {"c": {"cmd": "myapp.z.cmd"}}
 		out = renderer.build_background_jobs(actions, recs)
 		by_uuid = {j["recording_uuid"]: j["method"] for j in out["jobs"]}
-		assert by_uuid["a"] == "myapp.x.run"      # "Job: " stripped
-		assert by_uuid["b"] == "myapp.y.go"        # falls back to path
-		assert by_uuid["c"] == "myapp.z.cmd"       # falls back to recording cmd
-		assert by_uuid["d"] == "RQ Job"     # generic placeholder
+		# "Job: " gets promoted to "RQ Job: " then stripped → the
+		# label body ("myapp.x.run") survives because it doesn't look
+		# like a dotted python path that needs short-forming.
+		assert by_uuid["a"] == "myapp.x.run"
+		# Empty label + a dotted-path → render-time normalisation
+		# rewrites action_label to "RQ Job: go" (last segment),
+		# _clean_job_method then strips the prefix.
+		assert by_uuid["b"] == "go"
+		# Empty label + empty path → falls back to recording cmd.
+		assert by_uuid["c"] == "myapp.z.cmd"
+		# Empty label + empty path + no recording cmd → generic placeholder.
+		assert by_uuid["d"] == "RQ Job"
 
 	def test_sorted_by_duration_desc(self):
 		actions = [
@@ -177,8 +185,10 @@ class TestRenderedBackgroundJobsSection:
 		assert "1 RQ Job" in html
 		assert "ran during this flow" in html
 		# 1200ms > default threshold (1000ms) → renders as 1.20s wrapped
-		# in the v0.7.x highlight span.
-		assert '<span class="time-high">1.20s</span> total' in html
+		# in the v0.7.x highlight span. The " total" suffix was replaced
+		# by the scope tag "consolidated · across jobs" in the same iteration.
+		assert '<span class="time-high">1.20s</span>' in html
+		assert 'scope-tag">consolidated &middot; across jobs' in html
 		# caveat about jobs that ran too late / no worker
 		assert "Retry Analyze" in html
 		# its query made it into the drill-down
@@ -523,3 +533,87 @@ class TestDocEventLifecycleSection:
 		html = renderer.render_raw(doc, recordings=[self._si_recording()])
 		assert "<h2>Doc-event lifecycle</h2>" not in html
 		assert ">Doc events<" not in html
+
+
+# --------------------------------------------------------------------------
+# _action_to_dict — BG-job action_label normalisation
+# --------------------------------------------------------------------------
+
+class TestBgJobActionLabelNormalisation:
+	"""``_action_to_dict`` rewrites stale BG-job labels at render time.
+
+	A recording captured before per_action._label learned the
+	``"RQ Job: <short>"`` form falls through to the HTTP path and ends
+	up with ``action_label = "GET <dotted.python.path>"``. The action's
+	``event_type`` is later normalised to ``"RQ Job"`` (so the row
+	appears in the RQ Jobs section), but the persisted label still
+	carries the HTTP-shaped string — leaking "GET" into the METHOD
+	column AND into finding titles that read ``In {action_label}``.
+
+	``_action_to_dict`` is the single funnel every downstream
+	consumer reads from, so the fix lives there.
+	"""
+
+	def test_leaked_http_verb_label_gets_canonicalised(self):
+		"""``event_type == "RQ Job"`` + label like
+		``"GET ugly_code.python.common.bg_recheck_users"`` →
+		``action_label`` is rewritten to ``"RQ Job: bg_recheck_users"``."""
+		child = _action(
+			action_label="GET ugly_code.python.common.bg_recheck_users",
+			event_type="RQ Job",
+			http_method="GET",
+			path="ugly_code.python.common.bg_recheck_users",
+		)
+		out = renderer._action_to_dict(child)
+		assert out["action_label"] == "RQ Job: bg_recheck_users"
+		# Other fields untouched.
+		assert out["event_type"] == "RQ Job"
+		assert out["path"] == "ugly_code.python.common.bg_recheck_users"
+
+	def test_canonical_label_passes_through_untouched(self):
+		"""A label already prefixed ``"RQ Job: "`` is returned
+		unchanged — no double-prefix, no path-derived rewrite."""
+		child = _action(
+			action_label="RQ Job: sync_customer_data",
+			event_type="RQ Job",
+			path="my_app.jobs.sync_customer_data",
+		)
+		out = renderer._action_to_dict(child)
+		assert out["action_label"] == "RQ Job: sync_customer_data"
+
+	def test_legacy_job_prefix_still_promoted(self):
+		"""The existing J.12 ``"Job: …"`` → ``"RQ Job: …"`` rewrite
+		still works; the new conditional doesn't interfere with it."""
+		child = _action(
+			action_label="Job: legacy_payload",
+			event_type="RQ Job",
+			path="my_app.jobs.legacy_payload",
+		)
+		out = renderer._action_to_dict(child)
+		assert out["action_label"] == "RQ Job: legacy_payload"
+
+	def test_non_bg_action_label_untouched(self):
+		"""HTTP requests (event_type != "RQ Job") keep their original
+		``"GET /api/…"`` label — the rewrite only fires for jobs."""
+		child = _action(
+			action_label="POST /api/method/save",
+			event_type="HTTP Request",
+			http_method="POST",
+			path="/api/method/save",
+		)
+		out = renderer._action_to_dict(child)
+		assert out["action_label"] == "POST /api/method/save"
+
+	def test_bg_job_with_no_path_falls_back_to_original_label(self):
+		"""When event_type is "RQ Job" but ``path`` is empty (degenerate
+		case), the rewrite has no source to derive the short name from
+		— leave the label as-is rather than emitting "RQ Job: " with no
+		body."""
+		child = _action(
+			action_label="GET something_weird",
+			event_type="RQ Job",
+			path="",  # no path → can't derive short name
+		)
+		out = renderer._action_to_dict(child)
+		# Label unchanged because the path was empty.
+		assert out["action_label"] == "GET something_weird"

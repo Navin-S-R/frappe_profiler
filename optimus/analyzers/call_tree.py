@@ -17,6 +17,12 @@ Findings emitted:
 Aggregates:
   - hot_frames_json: top-20 leaderboard of hottest frames in the session
   - session_time_breakdown_json: SQL ms + per-app Python ms for the donut
+
+Terminology note (U1): internal field names use ``cumulative_ms``
+(pyinstrument's term — self_time + descendant time). The
+user-facing report tags the same value as ``consolidated``. This
+split is intentional — don't rename one to match the other without
+a project-owner sign-off.
 """
 
 import json
@@ -364,6 +370,14 @@ _PURE_HELPER_FUNCTION_NAMES = frozenset({
 	# sibling (save → _save, insert → _insert, etc.). Keep the public
 	# entry point in the leaderboard; hide the private one.
 	"_save", "_insert",
+	# v0.7.x: RQ worker + scheduler wrappers. These carry the full
+	# job wall time as cumulative_ms because they sit at the top of
+	# every BG job's call tree. Without skipping them, the Slow Hot
+	# Path walker emits a finding on the wrapper instead of descending
+	# to the real user-code hot frame inside the job.
+	"execute_job", "run_job", "worker_main", "perform_job",
+	"enqueue", "enqueue_call", "dequeue", "dequeue_any",
+	"work", "execute_in_subprocess", "perform",
 })
 
 # v0.5.2: bench/site third-party libraries whose frames pyinstrument
@@ -456,6 +470,29 @@ def _is_pure_helper_frame(node: dict) -> bool:
 		return True
 
 	return False
+
+
+def _is_walker_plumbing_frame(node: dict) -> bool:
+	"""Walker-specific plumbing predicate. ``True`` when ``_walk_for_findings``
+	should descend past this node without emitting a finding on it.
+
+	Union of ``_is_framework_frame`` (frappe/*, optimus/*) and
+	``_is_pure_helper_frame`` (RQ wrappers, werkzeug/gunicorn, decorator
+	shims, stdlib singletons), with one carve-out: **Server Script bodies
+	are not plumbing**. Server Scripts get exec'd through pyinstrument with
+	``function=""`` and a synthetic ``<serverscript-N>`` filename, which
+	``_is_pure_helper_frame``'s angle-bracket-filename rule classifies as
+	plumbing for the Repeated Hot Frame aggregator (one-off scripts don't
+	aggregate). For the Slow Hot Path walker, they are legitimate
+	user-actionable hot frames.
+	"""
+	if _is_framework_frame(node):
+		return True
+	filename = (node.get("filename") or "").replace("\\", "/").lstrip("/")
+	# Server Script bodies → user code for the walker, not plumbing.
+	if filename.startswith("<serverscript-"):
+		return False
+	return _is_pure_helper_frame(node)
 
 
 def _frames_match(node: dict, frame: dict) -> bool:
@@ -676,6 +713,12 @@ DEFAULT_HOT_PATH_PCT = 0.25  # fallback when settings unreachable
 DEFAULT_HOT_PATH_MS = 200
 HOT_PATH_HIGH_PCT_MULTIPLIER = 2.0     # 0.50 / 0.25 — preserves legacy ratio
 HOT_PATH_HIGH_MS_MULTIPLIER = 2.5      # 500 / 200
+# v0.7.x: absolute-impact escape hatch. A subtree consuming >= this many
+# multiples of high_ms is High regardless of relative pct. Picked at 2.0
+# (≥1s at default) so a 1.4s subtree at 49% of a 3s action gets the
+# severity its absolute impact deserves — without this, the TL;DR
+# headline picks smaller High findings over larger Medium ones.
+HOT_PATH_HIGH_ABS_MULTIPLIER = 2.0     # 2× high_ms → 1000ms by default
 SQL_DOMINANCE_SUPPRESSION_PCT = 0.80
 
 
@@ -781,6 +824,40 @@ def _display_name_for_node(node: dict) -> str:
 	return "<unnamed code>"
 
 
+def _first_user_code_descendant(
+	node: dict, threshold_ms: float
+) -> dict | None:
+	"""Deepest non-plumbing descendant with cumulative ≥ threshold, or None.
+
+	Walks depth-first so the *deepest* hot user-code frame wins over an
+	enclosing wrapper that just relays its work. Skips frames classified
+	as framework OR pure-helper plumbing — same predicates the walker
+	uses to descend past them.
+
+	Used by the BG-job fallback when the regular Slow Hot Path walker
+	emits no finding for a slow job (every frame is plumbing, or the
+	user-code frame is below the percentage threshold).
+	"""
+	candidate = None
+	fn = node.get("function") or ""
+	if (
+		node.get("kind") == "python"
+		and fn
+		and fn != "<root>"
+		and not fn.startswith("[")
+		and not _is_walker_plumbing_frame(node)
+		and (node.get("cumulative_ms") or 0) >= threshold_ms
+	):
+		candidate = node
+	for c in node.get("children", []) or []:
+		if c.get("kind") != "python":
+			continue
+		deeper = _first_user_code_descendant(c, threshold_ms)
+		if deeper is not None:
+			candidate = deeper
+	return candidate
+
+
 def _emit_per_action_findings(
 	tree: dict,
 	action_idx: int,
@@ -792,6 +869,11 @@ def _emit_per_action_findings(
 	One finding per qualifying subtree. F3 (Hook Bottleneck) takes
 	precedence over F1 (Slow Hot Path). F1 is suppressed when a single
 	SQL leaf dominates the subtree.
+
+	For BG jobs (action_label starts with "RQ Job: ") that don't produce
+	any per-frame finding but ARE slow, emit a Slow Background Job
+	finding rooted at the deepest user-code frame — so the reader has an
+	actionable callsite instead of an unexplained 12s job entry.
 	"""
 	if action_wall_time_ms <= 0:
 		return []
@@ -805,6 +887,54 @@ def _emit_per_action_findings(
 		action_wall_time_ms=action_wall_time_ms,
 		findings=findings,
 	)
+
+	# v0.7.x: BG-job fallback. When the walker emits nothing for a slow
+	# job, surface the deepest non-plumbing frame so the finding card
+	# still carries an actionable callsite. Gated on the RQ Job label so
+	# request actions that simply produce no findings (legitimate fast
+	# responses) stay quiet.
+	if not findings and action_label.startswith("RQ Job: "):
+		med_pct, med_ms, _hi_pct, _hi_ms = _resolve_hot_path_thresholds()
+		if action_wall_time_ms >= med_ms:
+			deepest = _first_user_code_descendant(tree, med_ms)
+			if deepest is not None:
+				short_label = action_label[len("RQ Job: "):]
+				fn_name = _display_name_for_node(deepest)
+				cumulative = deepest.get("cumulative_ms", 0) or 0
+				impact_ms = min(cumulative, action_wall_time_ms)
+				pct_of_action = min(
+					1.0, cumulative / action_wall_time_ms
+				) if action_wall_time_ms else 0
+				pct_str = f"{pct_of_action * 100:.0f}%"
+				severity = "High" if impact_ms >= _hi_ms else "Medium"
+				findings.append({
+					"finding_type": "Slow Background Job",
+					"severity": severity,
+					"title": (
+						f"In job {short_label}, {fn_name} is the deepest "
+						f"hot frame ({impact_ms:.0f}ms, {pct_str} of the job)"
+					),
+					"customer_description": (
+						f"The background job *{short_label}* ran for "
+						f"{action_wall_time_ms:.0f}ms but no single subtree "
+						f"crossed the Slow Hot Path threshold. **{fn_name}** "
+						f"is the deepest user-code frame and accounts for "
+						f"{impact_ms:.0f}ms ({pct_str} of the job). Start "
+						"there — open the Line-Level Drilldown for a "
+						"statement-level breakdown of where the time goes."
+					),
+					"technical_detail_json": json.dumps({
+						"function": fn_name,
+						"filename": deepest.get("filename"),
+						"lineno": deepest.get("lineno"),
+						"cumulative_ms": cumulative,
+						"action_wall_time_ms": action_wall_time_ms,
+						"is_bg_job_fallback": True,
+					}, default=str),
+					"estimated_impact_ms": round(impact_ms, 2),
+					"affected_count": 1,
+					"action_ref": str(action_idx),
+				})
 	return findings
 
 
@@ -817,7 +947,16 @@ def _walk_for_findings(
 	findings: list,
 ) -> None:
 	cumulative = node.get("cumulative_ms", 0)
-	pct_of_action = cumulative / action_wall_time_ms if action_wall_time_ms else 0
+	# v0.7.x A.CR1: clamp pct at the gating + severity site too. The
+	# raw cumulative_ms from pyinstrument's aggregated tree can sum
+	# across actions and produce pct > 100% (impossible per-action),
+	# which would tier-promote a Medium finding to High purely
+	# because of cross-action aggregation. The absolute-ms gate
+	# (cumulative >= med_ms / high_ms) still uses raw cumulative —
+	# the user *did* spend that much time across actions; we only
+	# refuse to inflate the *percentage* tier.
+	raw_pct = cumulative / action_wall_time_ms if action_wall_time_ms else 0
+	pct_of_action = min(1.0, raw_pct)
 
 	# v0.6.0 Round 6: thresholds now read from Optimus Settings (via a
 	# cached resolver) instead of being module constants.
@@ -834,7 +973,14 @@ def _walk_for_findings(
 		and node.get("kind") == "python"
 		and not (node.get("function") or "").startswith("[")  # skip [other] / [omitted]
 		and node.get("function") != "<root>"
-		and not _is_framework_frame(node)
+		# v0.7.x: descend past framework AND pure-helper plumbing (RQ
+		# worker wrappers, werkzeug/gunicorn dispatch, decorator shims).
+		# _is_framework_frame alone only covers frappe/*/optimus/*; the
+		# walker also needs to skip /rq/ and bare wrapper function
+		# names. _is_walker_plumbing_frame is the union with a
+		# Server-Script carve-out (those have synthetic filenames but
+		# are user code).
+		and not _is_walker_plumbing_frame(node)
 	)
 
 	if qualifies:
@@ -851,21 +997,63 @@ def _walk_for_findings(
 				for p in parent_chain
 			)
 			severity = (
-				"High" if (pct_of_action >= high_pct
-				           and cumulative >= high_ms)
+				"High" if (
+					# Relative + absolute dominance (the original rule):
+					# subtree owns ≥ high_pct of the action AND ≥ high_ms.
+					(pct_of_action >= high_pct and cumulative >= high_ms)
+					# OR overwhelming absolute impact: a ≥ 2× high_ms
+					# subtree is High regardless of pct_of_action. Without
+					# this, a 1.4s subtree at 49% of a 3s action lands as
+					# Medium and silently loses TL;DR + Action-plan
+					# rankings to smaller High findings. Users care more
+					# about the 1.4s code path than a 0.6s "High" one.
+					or cumulative >= HOT_PATH_HIGH_ABS_MULTIPLIER * high_ms
+				)
 				else "Medium"
 			)
+			# pct_of_action is already clamped at the top of the
+			# function (A.CR1) so display_pct is just an alias.
 			pct_str = f"{pct_of_action * 100:.0f}%"
 			fn_name = _display_name_for_node(node)
+			# v0.7.x: BG-job action_label carries an "RQ Job: " prefix
+			# for disambiguation in the per-action table. Inside a
+			# finding title that already says "In <label>, …", the
+			# prefix reads as boilerplate — strip it to "In job
+			# <short>" so the hotspot is the visual anchor, not the
+			# wrapper noise.
+			if action_label.startswith("RQ Job: "):
+				_label_for_title = "job " + action_label[len("RQ Job: "):]
+			else:
+				_label_for_title = action_label
+			impact_ms = (
+				min(cumulative, action_wall_time_ms)
+				if action_wall_time_ms else cumulative
+			)
+			# v0.7.x U4: intra-action repetition count. Count peer
+			# children of the parent that share this node's function
+			# name. Pyinstrument's aggregator merges trivially-identical
+			# siblings, but distinct call sites stay separate nodes;
+			# sharing function name across them means this function was
+			# hit from N call sites in one action — useful signal for
+			# "called from a loop" diagnoses.
+			parent = parent_chain[-1] if parent_chain else None
+			intra_action_repetitions = (
+				sum(
+					1 for c in (parent.get("children") or [])
+					if (c.get("function") or "") == (node.get("function") or "")
+				)
+				if parent
+				else 1
+			)
 
 			if is_hook:
 				findings.append({
 					"finding_type": "Hook Bottleneck",
 					"severity": severity,
-					"title": f"In {action_label}, the {fn_name} hook consumed {cumulative:.0f}ms",
+					"title": f"In {_label_for_title}, the {fn_name} hook consumed {impact_ms:.0f}ms",
 					"customer_description": (
-						f"During *{action_label}*, the **{fn_name}** doc-event hook "
-						f"consumed {pct_str} of the total time ({cumulative:.0f}ms). "
+						f"During *{_label_for_title}*, the **{fn_name}** doc-event hook "
+						f"consumed {pct_str} of its wall time ({impact_ms:.0f}ms). "
 						"Hook functions run on every save/submit — optimizing this "
 						"would speed up every similar action across your site."
 					),
@@ -876,8 +1064,9 @@ def _walk_for_findings(
 						"cumulative_ms": cumulative,
 						"action_wall_time_ms": action_wall_time_ms,
 						"is_hook": True,
+						"intra_action_repetitions": intra_action_repetitions,
 					}, default=str),
-					"estimated_impact_ms": round(cumulative, 2),
+					"estimated_impact_ms": round(impact_ms, 2),
 					"affected_count": 1,
 					"action_ref": str(action_idx),
 				})
@@ -899,25 +1088,34 @@ def _walk_for_findings(
 				if self_referential:
 					title = (
 						f"{fn_name} is a self-time hot path "
-						f"({pct_str} of the action, {cumulative:.0f}ms)"
+						f"({pct_str} of the action, {impact_ms:.0f}ms)"
 					)
 					desc = (
 						f"The body of **{fn_name}** itself consumed "
-						f"{pct_str} of the action time ({cumulative:.0f}ms). "
+						f"{pct_str} of the action time ({impact_ms:.0f}ms). "
 						"This isn't a slow subcall — the function's own logic "
-						"is the bottleneck. Profile the function body to find "
-						"the hot lines (tight loops, expensive computations, "
-						"string/regex work, etc.) and optimize or cache them."
+						"is the bottleneck. To pinpoint the exact hot line, "
+						"run a **Line-Level Drilldown** (the *Run Line-Profile "
+						"Pass* button on the session) and pick this function "
+						"from the candidates — that profiles tight loops, "
+						"expensive computations, and string/regex work at the "
+						"statement level so you can optimize or cache them."
+						"\n\nNote: self-time here is wall-clock (the sampler "
+						"measures elapsed time, not CPU). If this function "
+						"blocks on I/O — `requests.get`, sync DB calls "
+						"outside the recorder, `time.sleep` — that wait "
+						"counts as self-time. Check the call tree for "
+						"hidden I/O before optimising compute."
 					)
 				else:
 					title = (
-						f"In {action_label}, {pct_str} of the time "
+						f"In {_label_for_title}, {pct_str} of its wall time "
 						f"was spent in {fn_name}"
 					)
 					desc = (
-						f"During *{action_label}*, **{fn_name}** and its "
-						f"callees consumed {pct_str} of the total time "
-						f"({cumulative:.0f}ms). This is the highest-impact "
+						f"During *{_label_for_title}*, **{fn_name}** and its "
+						f"callees consumed {pct_str} of the action's wall "
+						f"time ({impact_ms:.0f}ms). This is the highest-impact "
 						"code path for this action."
 					)
 				findings.append({
@@ -933,8 +1131,9 @@ def _walk_for_findings(
 						"action_wall_time_ms": action_wall_time_ms,
 						"is_hook": False,
 						"is_self_referential": self_referential,
+						"intra_action_repetitions": intra_action_repetitions,
 					}, default=str),
-					"estimated_impact_ms": round(cumulative, 2),
+					"estimated_impact_ms": round(impact_ms, 2),
 					"affected_count": 1,
 					"action_ref": str(action_idx),
 				})
@@ -1006,16 +1205,16 @@ def _aggregate_hot_frames(per_action_trees: list):
 	               no action_ref)
 	  leaderboard — list of top-N dicts for hot_frames_json
 	"""
-	# {function_key: [(action_idx, cumulative_ms), ...]}
+	# {function_key: [(action_idx, self_ms, cumulative_ms), ...]}
 	occurrences: dict = defaultdict(list)
 
 	for action_idx, tree in enumerate(per_action_trees):
 		_walk_for_aggregation(tree, action_idx, occurrences)
-		# Cap intermediate map size to bound memory
+		# Cap intermediate map size to bound memory.
 		if len(occurrences) > HOT_FRAMES_INTERMEDIATE_CAP * 2:
 			by_total = sorted(
 				occurrences.items(),
-				key=lambda kv: sum(ms for _, ms in kv[1]),
+				key=lambda kv: sum(self_ms for _, self_ms, _ in kv[1]),
 				reverse=True,
 			)[:HOT_FRAMES_INTERMEDIATE_CAP]
 			occurrences = defaultdict(list, dict(by_total))
@@ -1024,16 +1223,24 @@ def _aggregate_hot_frames(per_action_trees: list):
 	leaderboard_rows = []
 
 	for key, occs in occurrences.items():
-		distinct_actions = {idx for idx, _ in occs}
-		total_ms = sum(ms for _, ms in occs)
+		distinct_actions = {idx for idx, _, _ in occs}
+		total_self_ms = sum(self_ms for _, self_ms, _ in occs)
+		total_cum_ms = sum(cum_ms for _, _, cum_ms in occs)
 		row = {
 			"function": key,
-			"total_ms": round(total_ms, 2),
+			# A.AE1: self-sum is the precise "time in this function
+			# across the whole tree" metric — what the user-app
+			# variant displays.
+			"total_ms": round(total_self_ms, 2),
+			# Cumulative-sum — what the framework variant displays.
+			# See _walk_for_aggregation's comment for the why.
+			"total_cumulative_ms": round(total_cum_ms, 2),
 			"occurrences": len(occs),
 			"distinct_actions": len(distinct_actions),
 			"action_refs": sorted(distinct_actions),
 		}
 		leaderboard_rows.append(row)
+		total_ms = total_self_ms  # alias for downstream Repeated Hot Frame logic
 
 		if (
 			len(distinct_actions) >= DEFAULT_REPEATED_FRAME_MIN_ACTIONS
@@ -1090,8 +1297,23 @@ def _walk_for_aggregation(node: dict, action_idx: int, occurrences: dict) -> Non
 				node.get("filename", ""),
 			)
 			if key:
+				# v0.7.x A.AE1: track self_ms (immune to recursion
+				# double-counting) for the user-app variant — that's
+				# the exact "time in this function's body across the
+				# whole action's tree" answer.
+				#
+				# v0.7.x: also track cumulative_ms because the
+				# framework variant of the hot-frames table needs it.
+				# Framework wrapper frames have sub-sampler-interval
+				# self_ms (rounds to 0); aggregated → 0 across rows.
+				# The framework column displays cumulative_ms instead
+				# (renderer.build_hot_frames_table chooses per
+				# variant). Risk: nested same-name framework frames
+				# would double-count cumulative — acceptable on the
+				# collapsed-by-default framework table, where the
+				# column is informational rather than decision-grade.
 				occurrences[key].append(
-					(action_idx, node.get("cumulative_ms", 0))
+					(action_idx, node.get("self_ms", 0), node.get("cumulative_ms", 0))
 				)
 	for child in node.get("children", []):
 		_walk_for_aggregation(child, action_idx, occurrences)

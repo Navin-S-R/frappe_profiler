@@ -57,9 +57,10 @@ class TestLensPromoRendering:
 	def test_block_positioned_before_jump_to_nav(self):
 		"""The Lens block must sit BEFORE the Jump-to nav (sibling, above
 		it). v0.7.x Phase A: nav is `<nav class="nav-pills">`; anchor on
-		that opening tag."""
+		the opening tag's class attribute (the nav may also carry an
+		aria-label, so match the class prefix not the literal `>`)."""
 		html = renderer.render_raw(_doc(), recordings=[])
-		jump_idx = html.find('<nav class="nav-pills">')
+		jump_idx = html.find('<nav class="nav-pills"')
 		lens_idx = html.find('class="section lens-promo"')
 		assert jump_idx != -1, "Jump-to nav-pills not found"
 		assert lens_idx != -1, "Lens promo block not found"

@@ -61,61 +61,34 @@
   }
   .section > h2:first-child { margin-top: 0; }
 
-  /* v0.5.2: collapsible <details> sections. Native HTML5 - no JS
-     required, fully keyboard + screen-reader accessible. Default
-     expanded for primary sections (via `open` attribute in the
-     template); nested sub-sections (e.g., framework-level
-     observations under Findings) default collapsed so the main
-     list isn't buried in noise by default. */
-  details.section > summary,
-  details.subsection > summary {
-    list-style: none;
-    cursor: pointer;
-    user-select: none;
-  }
-  details.section > summary::-webkit-details-marker,
-  details.subsection > summary::-webkit-details-marker {
-    display: none;
-  }
-  details.section > summary h2 {
-    display: inline-block;
-    margin: 0;
-  }
-  /* Chevron that rotates when the details is open. */
-  details.section > summary::before,
-  details.subsection > summary::before {
-    content: "";
-    display: inline-block;
-    width: 0;
-    height: 0;
-    margin-right: 8px;
-    vertical-align: middle;
-    border-left: 6px solid currentColor;
-    border-top: 4px solid transparent;
-    border-bottom: 4px solid transparent;
-    transition: transform 0.15s ease;
-    transform-origin: center;
-  }
-  details.section[open] > summary::before,
-  details.subsection[open] > summary::before {
-    transform: rotate(90deg);
-  }
-  details.section > summary:hover h2 {
-    color: #2563eb;
-  }
-  details.subsection {
+  /* Report sections are plain <section class="section"> blocks -
+     non-collapsible by user request (everything renders
+     expanded). The inline <details> drill-downs in tables /
+     call-trees still toggle and have their own styling further
+     down. */
+  .subsection {
     margin-top: 16px;
     padding-top: 12px;
     border-top: 1px dashed #e5e7eb;
   }
-  details.subsection > summary h3 {
-    display: inline-block;
-    margin: 0;
+  .subsection > h3 {
+    margin: 0 0 8px;
     font-size: 0.95rem;
     color: #6b7280;
   }
-  details.subsection > summary:hover h3 {
-    color: #2563eb;
+  /* Framework subsections wrap their content in <details> so the
+     reader can collapse the framework noise out of the way. The
+     interactive cursor signals the summary is clickable; the
+     extra margin-bottom only kicks in when the disclosure is
+     open, so collapsed state stays tight. The native ▶ marker
+     stays visible (the disclosure-hiding rules at line ~431 are
+     guarded by @media print). */
+  details.subsection > summary {
+    cursor: pointer;
+    padding: 4px 0;
+  }
+  details.subsection[open] > summary {
+    margin-bottom: 8px;
   }
 
   /* v0.5.2: per-app bucket header - the <h3> inside a subsection
@@ -309,12 +282,52 @@
   table.per-action-table col.col-slowest  { width: 88px; }
   /* col.col-action uses the remaining width implicitly (auto) */
 
+  /* C.UT1: per-table totals row in <tfoot>. Subtle separator + heavier
+     numerics so the sum reads at a glance without dominating the table. */
+  table.data tfoot tr.totals-row {
+    border-top: 2px solid var(--rule, #e5e7eb);
+    background: #fafbfc;
+  }
+  table.data tfoot tr.totals-row td {
+    padding-top: 8px;
+    padding-bottom: 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  table.data tfoot tr.totals-row td.muted {
+    color: var(--ink-mute, #9ca3af);
+    font-weight: normal;
+  }
+
   /* Per-action XHR timing: numeric columns capped, Action and URL
      share the remaining width; .tbl-clip wraps long /api/method/...
      strings inside the URL cell instead of pushing past the page. */
   table.xhr-timing-table col.col-action { width: 28%; }
   table.xhr-timing-table col.col-num    { width: 70px; }
   /* col.col-url uses the remaining width implicitly (auto) */
+
+  /* resource-table column widths — pairs with the tbl-clip class
+     on the same table. Without these the fixed-layout distributes
+     width equally and the `#` column gets ~14% of the table while
+     the Action column gets crammed. */
+  table.resource-table col.col-idx      { width: 40px; }
+  table.resource-table col.col-num      { width: 80px; }
+  table.resource-table col.col-num-wide { width: 110px; }
+  /* col.col-action gets the remaining width implicitly (auto). */
+
+  /* Tight horizontal padding for the # column so 1-3 digit row
+     indexes fit inside the narrow col-idx without wrapping. The
+     default table.data td padding (14px each side) eats 28px of
+     column width before content; with col-idx at 32-40px, that
+     leaves 4-12px of content area — not enough for "10" or
+     "999". This override gives ~28px of content room at 40px
+     total width (40 − 12 = 28). */
+  table.per-action-table tbody td:first-child,
+  table.per-action-table thead th:first-child,
+  table.resource-table tbody td:first-child,
+  table.resource-table thead th:first-child {
+    padding-left: 6px;
+    padding-right: 6px;
+  }
 
   /* ---------- Findings ---------- */
   .finding {
@@ -463,7 +476,7 @@
     details > summary { cursor: default; }
     /* Ensure subsection borders still visually separate app buckets
        when everything is expanded at once. */
-    details.subsection { border-top: 1px dashed #e5e7eb; margin-top: 12px; padding-top: 10px; }
+    .subsection { border-top: 1px dashed #e5e7eb; margin-top: 12px; padding-top: 10px; }
   }
 
   @media (max-width: 700px) {
@@ -509,73 +522,132 @@
     --mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
   }
 
-  /* TL;DR HERO - replaces the "At a glance" exec-summary card */
+  /* TL;DR HEADLINE - light wash that shares the page bg */
   .tldr {
-    background: var(--ink); color: var(--bg);
+    background: var(--bg); color: var(--ink);
     padding: 30px 34px; border-radius: 4px; margin-bottom: 28px;
-    position: relative; overflow: hidden;
-  }
-  .tldr::before {
-    content: ''; position: absolute; top: 0; right: 0;
-    width: 240px; height: 100%;
-    background: radial-gradient(circle at 80% 50%, rgba(197,57,43,0.25), transparent 70%);
-    pointer-events: none;
+    border: 1px solid var(--rule); position: relative;
   }
   .tldr-label {
     font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase;
-    color: rgba(255,255,255,0.55); font-weight: 600; margin-bottom: 12px;
+    color: var(--ink-mute); font-weight: 600; margin-bottom: 12px;
   }
   .tldr-headline {
     font-family: var(--display); font-size: 26px; line-height: 1.3;
     font-weight: 500; margin: 0 0 14px; letter-spacing: -0.005em;
-    max-width: 880px; color: var(--bg);
+    max-width: 880px; color: var(--ink);
   }
-  .tldr-headline .hot { color: #ff8a7d; font-style: italic; }
+  .tldr-headline .hot { color: var(--accent); font-style: italic; }
   .tldr-headline code {
     font-family: var(--mono); font-size: 0.85em;
-    background: rgba(255,255,255,0.08); padding: 1px 6px;
-    border-radius: 2px; color: var(--bg);
+    background: var(--bg-tint); padding: 1px 6px;
+    border-radius: 2px; color: var(--ink);
   }
   .tldr-sub {
-    font-size: 13px; color: rgba(255,255,255,0.75);
+    font-size: 13px; color: var(--ink-soft);
     max-width: 720px; margin: 0; line-height: 1.6;
   }
   .tldr-sub code {
     font-family: var(--mono); font-size: 0.92em;
-    background: rgba(255,255,255,0.08); padding: 1px 5px;
-    border-radius: 2px; color: rgba(255,255,255,0.85);
+    background: var(--bg-tint); padding: 1px 5px;
+    border-radius: 2px; color: var(--ink);
   }
 
-  /* MASTHEAD - replaces .report-header */
+  /* MASTHEAD - replaces .report-header. Brand left, session id right. */
   .masthead {
     border-bottom: 2px solid var(--ink);
     padding-bottom: 20px;
     margin-bottom: 32px;
     display: grid;
-    grid-template-columns: 1fr auto;
-    align-items: end;
-    gap: 24px;
+    grid-template-columns: auto 1fr;
+    align-items: stretch;
+    gap: 32px;
   }
   .masthead-eyebrow {
     font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase;
     color: var(--ink-mute); margin-bottom: 6px; font-weight: 600;
   }
-  .masthead h1 {
+  .masthead-brand {
+    display: flex; align-items: flex-start; gap: 16px;
+  }
+  .masthead-brand .masthead-eyebrow { margin-bottom: 0; }
+  .masthead-logo {
+    height: 104px; width: auto; display: inline-block;
+    vertical-align: middle;
+  }
+  .masthead-brand-text {
+    display: flex; flex-direction: column; gap: 4px;
+    align-self: stretch;
+  }
+  .masthead-brand-tool {
+    display: flex; align-items: baseline; gap: 8px;
+  }
+  .masthead-publisher-name {
+    font-family: var(--display); font-weight: 600; font-size: 26px;
+    line-height: 1.15; letter-spacing: -0.01em; color: var(--ink);
+  }
+  .masthead-brand-name {
+    font-family: var(--display); font-weight: 600; font-size: 14px;
+    line-height: 1.2; letter-spacing: -0.005em; color: var(--ink);
+  }
+  .masthead-brand-contact {
+    display: flex; flex-direction: column;
+    gap: 2px; margin-top: auto;
+    font-size: 11px; color: var(--ink-mute);
+  }
+  .masthead-brand-contact-row {
+    display: flex; flex-wrap: wrap; align-items: baseline;
+    gap: 4px 10px;
+  }
+  .masthead-brand-contact a {
+    color: inherit; text-decoration: none;
+    border-bottom: 1px dotted transparent;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .masthead-brand-contact a:hover {
+    color: var(--ink); border-bottom-color: var(--ink-mute);
+  }
+  .masthead-brand-contact a + a::before {
+    content: "\00b7"; color: var(--ink-mute);
+    margin-right: 10px; margin-left: -8px;
+  }
+  .masthead-title {
+    text-align: right;
+    display: flex;
+    flex-direction: column;
+  }
+  .masthead-title h1 {
     font-family: var(--display); font-weight: 600; font-size: 44px;
     line-height: 1.05; letter-spacing: -0.02em; margin: 0;
     border-bottom: none; padding-bottom: 0;
     color: var(--ink);
   }
-  .masthead h1 em { font-style: italic; font-weight: 400; color: var(--accent); }
+  .masthead-title h1 em { font-style: italic; font-weight: 400; color: var(--accent); }
   .masthead-meta {
-    text-align: right; font-size: 12px; color: var(--ink-soft); line-height: 1.7;
+    margin: 0;
+    margin-top: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--ink-soft);
   }
-  .masthead-meta b { color: var(--ink); font-weight: 600; }
-  .masthead-meta .badge {
-    display: inline-block; padding: 2px 8px; background: var(--ink);
-    color: var(--bg); font-family: var(--mono); font-size: 10px;
-    letter-spacing: 0.05em; border-radius: 2px; margin-bottom: 4px;
+  .masthead-meta-row {
+    display: flex;
+    justify-content: flex-end;
+    align-items: baseline;
+    gap: 8px;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
   }
+  .masthead-meta-label {
+    font-size: 10px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    font-weight: 600;
+    color: var(--ink-mute);
+  }
+  .masthead-meta-row b { font-weight: 600; color: var(--ink); }
 
   /* KPI strip - replaces .stats / .stat */
   .kpis {
@@ -597,6 +669,35 @@
   .kpi-value.danger { color: var(--accent); }
   .kpi-unit { font-size: 14px; color: var(--ink-mute); font-weight: 400; margin-left: 2px; }
   .kpi-sub { font-size: 12px; color: var(--ink-soft); margin-top: 6px; line-height: 1.45; }
+  /* C.UT2: tiny caveat line under a KPI's sub-text — explains a known
+     limitation of the metric (e.g. sampler interval for Total time). */
+  .kpi-caveat {
+    font-size: 11px;
+    color: var(--ink-mute, #9ca3af);
+    margin-top: 4px;
+    line-height: 1.4;
+    font-style: italic;
+  }
+
+  /* Timing scope-tag: a small muted suffix next to every ms / second
+     reading, naming the scope as "per hit" (single occurrence) or
+     "consolidated" (sum across all hits in this session). Same rule
+     applies to inline prose, table headers, and KPI sub-lines.
+     -----
+     Terminology decision (U1, intentional split):
+     - Data-layer field names use ``cumulative_ms`` (pyinstrument's
+       term — sum of self_time + descendant time).
+     - UI text uses ``consolidated`` (the user-facing word, picked
+       by the project owner for the scope-tag vocabulary).
+     This split is intentional. Keep cumulative_ms in fixtures /
+     JSON / analyzer code; keep ``consolidated`` in human-facing
+     report text. Don't "fix" the perceived inconsistency. */
+  .scope-tag {
+    font-size: 0.8em; color: var(--ink-mute);
+    font-weight: 400; letter-spacing: 0.02em;
+    margin-left: 4px;
+  }
+  th .scope-tag, td.num .scope-tag { display: inline-block; }
 
   /* NAV PILLS - replaces the Jump-to .section.small block. Phase K.2:
      sticky-top so the jump-to nav stays accessible when the reader
@@ -607,11 +708,6 @@
     border: 1px solid var(--rule); border-radius: 4px;
     position: sticky; top: 0; z-index: 50;
     box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-  }
-  nav.nav-pills .jump-label {
-    font-size: 10px; letter-spacing: 0.15em; text-transform: uppercase;
-    color: var(--ink-mute); font-weight: 700; align-self: center;
-    margin-right: 8px;
   }
   nav.nav-pills a {
     padding: 4px 10px; font-size: 11.5px; letter-spacing: 0.04em;
@@ -624,8 +720,11 @@
   /* Responsive - masthead stacks, KPI strip becomes 2x2 */
   @media (max-width: 760px) {
     .masthead { grid-template-columns: 1fr; }
-    .masthead-meta { text-align: left; }
-    .masthead h1 { font-size: 32px; }
+    .masthead-title { text-align: left; }
+    .masthead-meta { align-items: flex-start; }
+    .masthead-meta-row { justify-content: flex-start; }
+    .masthead-title h1 { font-size: 32px; }
+    .masthead-logo { height: 72px; }
     .kpis { grid-template-columns: repeat(2, 1fr); }
     .kpi:nth-child(2) { border-right: none; }
     .kpi:nth-child(-n+2) { border-bottom: 1px solid var(--rule); }
@@ -830,67 +929,71 @@
   }
   .code-block {
     font-family: var(--mono); font-size: 12.5px;
-    background: #f6f8fa; color: #1f2328;
+    background: #1F1F1F; color: #D4D4D4;
     padding: 12px 16px; border-radius: 4px;
     overflow-x: auto; line-height: 1.6;
     margin: 0;
     white-space: pre;
-    border: 1px solid #d0d7de;
+    border: 1px solid #2D2D2D;
   }
   .code-block .line { display: block; margin: 0 -16px; padding: 0 16px; }
   .code-block .ln {
-    color: #8c959f; margin-right: 14px; user-select: none;
+    color: #858585; margin-right: 14px; user-select: none;
     display: inline-block; width: 32px; text-align: right;
   }
   .code-block .hot-line {
     display: block;
-    background: #fff8c5;
+    background: rgba(255, 213, 0, 0.15);
     margin: 0 -16px; padding: 0 16px;
   }
-  .code-block .added { color: #1a7f37; }
-  .code-block .removed { color: #cf222e; text-decoration: line-through; opacity: 0.8; }
+  .code-block .added { color: #6A9955; }
+  .code-block .removed { color: #F48771; text-decoration: line-through; opacity: 0.85; }
 
-  /* GitHub Light token palette for Pygments-highlighted Python snippets.
-     Pygments classes (with our ``tok-`` prefix) - applied to both the
-     smoking-gun .code-block and the Line-Level Drilldown .line-prof
-     table's source column. The hot-line yellow wrapper sits OUTSIDE
-     these per-token spans so the highlight composes correctly. */
-  .code-block .tok-k, .code-block .tok-kn, .code-block .tok-kc,
-  .code-block .tok-kd, .code-block .tok-kr,
-  .code-block .tok-ow,
+  /* VS Code Dark Modern token palette — smoking-gun .code-block
+     snippet only. The hot-line amber wrapper sits OUTSIDE these
+     per-token spans so the highlight composes correctly. */
+  .code-block .tok-k, .code-block .tok-kn        { color: #C586C0; }
+  .code-block .tok-kd, .code-block .tok-kc, .code-block .tok-kr,
+  .code-block .tok-ow                            { color: #569CD6; }
+  .code-block .tok-bp                            { color: #569CD6; font-style: italic; }
+  .code-block .tok-nb                            { color: #DCDCAA; }
+  .code-block .tok-nf, .code-block .tok-fm       { color: #DCDCAA; }
+  .code-block .tok-nd                            { color: #DCDCAA; }
+  .code-block .tok-nc                            { color: #4EC9B0; }
+  .code-block .tok-n                             { color: #9CDCFE; }
+  .code-block .tok-s, .code-block .tok-s1, .code-block .tok-s2,
+  .code-block .tok-sb                            { color: #CE9178; }
+  .code-block .tok-sa                            { color: #569CD6; }
+  .code-block .tok-se                            { color: #D7BA7D; }
+  .code-block .tok-si                            { color: #9CDCFE; }
+  .code-block .tok-m, .code-block .tok-mi, .code-block .tok-mf,
+  .code-block .tok-mh, .code-block .tok-mo       { color: #B5CEA8; }
+  .code-block .tok-c, .code-block .tok-c1, .code-block .tok-ch,
+  .code-block .tok-cm                            { color: #6A9955; font-style: italic; }
+  .code-block .tok-o, .code-block .tok-p         { color: #D4D4D4; }
+
+  /* VS Code Light Modern token palette — Line-Level Drilldown
+     .line-prof table only (light to match the editorial report
+     page). */
   .line-prof .tok-k, .line-prof .tok-kn, .line-prof .tok-kc,
   .line-prof .tok-kd, .line-prof .tok-kr,
-  .line-prof .tok-ow                       { color: #cf222e; }
-  .code-block .tok-bp,
-  .line-prof .tok-bp                       { color: #cf222e; font-style: italic; }
-  .code-block .tok-nb,
-  .line-prof .tok-nb                       { color: #0550ae; }
-  .code-block .tok-nf, .code-block .tok-nd, .code-block .tok-fm,
-  .line-prof .tok-nf, .line-prof .tok-nd, .line-prof .tok-fm   { color: #8250df; }
-  .code-block .tok-nc,
-  .line-prof .tok-nc                       { color: #953800; }
-  .code-block .tok-n,
-  .line-prof .tok-n                        { color: #1f2328; }
-  .code-block .tok-s, .code-block .tok-s1, .code-block .tok-s2,
-  .code-block .tok-sb,
+  .line-prof .tok-ow                             { color: #0000FF; }
+  .line-prof .tok-bp                             { color: #0000FF; font-style: italic; }
+  .line-prof .tok-nb                             { color: #267F99; }
+  .line-prof .tok-nf, .line-prof .tok-fm         { color: #795E26; }
+  .line-prof .tok-nd                             { color: #AF00DB; }
+  .line-prof .tok-nc                             { color: #267F99; }
+  .line-prof .tok-n                              { color: #001080; }
   .line-prof .tok-s, .line-prof .tok-s1, .line-prof .tok-s2,
-  .line-prof .tok-sb                       { color: #0a3069; }
-  .code-block .tok-sa,
-  .line-prof .tok-sa                       { color: #cf222e; }
-  .code-block .tok-se,
-  .line-prof .tok-se                       { color: #0550ae; }
-  .code-block .tok-si,
-  .line-prof .tok-si                       { color: #1f2328; }
-  .code-block .tok-m, .code-block .tok-mi, .code-block .tok-mf,
-  .code-block .tok-mh, .code-block .tok-mo,
+  .line-prof .tok-sb                             { color: #A31515; }
+  .line-prof .tok-sa                             { color: #0000FF; }
+  .line-prof .tok-se                             { color: #EE0000; }
+  .line-prof .tok-si                             { color: #001080; }
   .line-prof .tok-m, .line-prof .tok-mi, .line-prof .tok-mf,
-  .line-prof .tok-mh, .line-prof .tok-mo   { color: #0550ae; }
-  .code-block .tok-c, .code-block .tok-c1, .code-block .tok-ch,
-  .code-block .tok-cm,
+  .line-prof .tok-mh, .line-prof .tok-mo         { color: #098658; }
   .line-prof .tok-c, .line-prof .tok-c1, .line-prof .tok-ch,
-  .line-prof .tok-cm                       { color: #6e7781; font-style: italic; }
-  .code-block .tok-o, .code-block .tok-p,
-  .line-prof .tok-o, .line-prof .tok-p     { color: #1f2328; }
+  .line-prof .tok-cm                             { color: #008000; font-style: italic; }
+  .line-prof .tok-o, .line-prof .tok-p           { color: #000000; }
 
   /* CHAIN - call-chain pill track. Replaces the dashed-border-top
      Phase 2 / drill-down callouts inside the old smoking-gun panel. */
@@ -995,11 +1098,37 @@
     color: var(--ink-mute); font-size: 11px;
     font-style: italic;
   }
+  .call-tree-deeper > details.call-tree-deeper-toggle > summary {
+    cursor: pointer; list-style: none;
+    padding: 4px 12px;
+    color: var(--ink-mute); font-size: 12px;
+    user-select: none;
+  }
+  .call-tree-deeper > details.call-tree-deeper-toggle > summary::-webkit-details-marker {
+    display: none;
+  }
+  .call-tree-deeper > details.call-tree-deeper-toggle > summary::before {
+    content: "\25B8";
+    display: inline-block; margin-right: 6px;
+    transition: transform 0.15s ease;
+  }
+  .call-tree-deeper > details.call-tree-deeper-toggle[open] > summary::before {
+    transform: rotate(90deg);
+  }
+  .call-tree-deeper > details.call-tree-deeper-toggle > summary:hover {
+    color: var(--ink);
+  }
   @media print {
     details.call-tree-node:not([open]) > summary::after {
       content: " (collapsed)";
       font-size: 9px; color: var(--ink-mute);
     }
+    /* Auto-expand the deeper-frames toggle in print so all depth
+       is visible on paper / PDF. */
+    details.call-tree-deeper-toggle > *:not(summary) {
+      display: revert !important;
+    }
+    details.call-tree-deeper-toggle > summary::before { display: none; }
   }
 
   /* FIX-BOX - AI-suggested fix. Replaces the old `.ai-fix` panel. */
@@ -1109,6 +1238,22 @@
     font-weight: 700; color: var(--ink-soft);
     border-bottom: 1px solid var(--rule);
     white-space: nowrap;
+  }
+  /* v0.7.x: vitals + server-resource tables carry long scope-tags
+     and long action labels respectively. Allow th to wrap so the
+     table stays inside the section's card width. Other data
+     tables (per-action, RQ jobs, top-queries, DB tables) keep
+     the single-line nowrap header treatment. */
+  #server-resource table.data thead th,
+  #frontend table.vitals-table thead th {
+    white-space: normal;
+  }
+  /* Render the scope-tag on its own line under the metric name —
+     cleaner than wrapping mid-phrase. */
+  #frontend table.vitals-table thead th .scope-tag {
+    display: block;
+    margin-left: 0;
+    margin-top: 2px;
   }
   table.data thead th.num { text-align: right; }
   table.data tbody td {
@@ -1356,38 +1501,28 @@
 
   /* HOW-TO-READ APPENDIX - Phase F. Italic-serif heading + + / -
      chevron + muted bullet list. */
-  details.how-to {
+  .how-to {
     background: var(--bg-tint);
     border: 1px solid var(--rule); border-radius: 6px;
     padding: 14px 20px; margin-top: 48px;
   }
-  details.how-to summary {
+  .how-to > h2 {
     font-family: var(--display); font-size: 17px; font-weight: 600;
-    cursor: pointer; padding: 4px 0; outline: none;
-    list-style: none; display: flex; align-items: center; gap: 8px;
+    margin: 0; padding: 0;
+    border-bottom: none; letter-spacing: 0;
     color: var(--ink);
   }
-  details.how-to summary::-webkit-details-marker { display: none; }
-  details.how-to summary::before {
-    content: '+'; font-family: var(--mono); color: var(--accent);
-    font-size: 18px;
-  }
-  details.how-to[open] summary::before { content: '−'; }
-  details.how-to summary h2 {
-    display: inline; font: inherit; margin: 0; padding: 0;
-    border-bottom: none; letter-spacing: 0;
-  }
-  details.how-to ul {
+  .how-to ul {
     margin: 16px 0 4px 0; padding-left: 18px;
     font-size: 13.5px; line-height: 1.75; color: var(--ink-soft);
   }
-  details.how-to ul li { margin-bottom: 6px; }
-  details.how-to ul li strong { color: var(--ink); font-weight: 600; }
-  details.how-to ul li code {
+  .how-to ul li { margin-bottom: 6px; }
+  .how-to ul li strong { color: var(--ink); font-weight: 600; }
+  .how-to ul li code {
     font-family: var(--mono); font-size: 12px;
     background: var(--bg-paper); padding: 1px 5px; border-radius: 2px;
   }
-  details.how-to ul li em { font-style: italic; color: var(--ink-soft); }
+  .how-to ul li em { font-style: italic; color: var(--ink-soft); }
 
   /* RESOURCE CARDS - Phase G. Four KPIs at the top of the Server
      Resource panel; replaces the old .stats/.stat blocks reused
@@ -1483,22 +1618,11 @@
     white-space: pre-wrap; word-break: break-word;
   }
 
-  /* Print - drop the nav pills (they're useless on paper), invert
-     the TL;DR hero so it survives on white paper. */
+  /* Print - drop the nav pills (useless on paper). The TL;DR
+     headline is already light-wash on screen, so no override
+     needed here. */
   @media print {
     nav.nav-pills { display: none; }
-    .tldr {
-      background: var(--bg-paper); color: var(--ink);
-      border: 1px solid var(--rule);
-    }
-    .tldr::before { display: none; }
-    .tldr-label { color: var(--ink-mute); }
-    .tldr-headline { color: var(--ink); }
-    .tldr-headline .hot { color: var(--accent); }
-    .tldr-sub { color: var(--ink-soft); }
-    .tldr-headline code, .tldr-sub code {
-      background: var(--bg-tint); color: var(--ink);
-    }
   }
 </style>
 </head>
@@ -1544,9 +1668,15 @@
         {% endif %}
       </div>
       <div class="finding-impact">
-        <span class="big">~{{ fmt_ms(f.estimated_impact_ms) }}</span>
+        <span class="big">{{ fmt_ms(f.estimated_impact_ms) }}</span><small class="scope-tag">consolidated</small>
         {% if f.affected_count and f.affected_count > 1 %}
         <div class="small">{{ f.affected_count }}× hits</div>
+        {% endif %}
+        {% if f.technical_detail and f.technical_detail.intra_action_repetitions and f.technical_detail.intra_action_repetitions > 1 %}
+        <div class="small muted">called from {{ f.technical_detail.intra_action_repetitions }} sites in this action</div>
+        {% endif %}
+        {% if f.technical_detail and f.technical_detail.p95_ms %}
+        <div class="small muted">P95 {{ fmt_ms(f.technical_detail.p95_ms) }} per hit</div>
         {% endif %}
       </div>
     </div>
@@ -1620,7 +1750,7 @@
       <div class="phase2-line">
         <strong>Hint:</strong>
         time flows into <code>{{ _phase1_hint.next_hot_callee }}</code>
-        ({{ fmt_ms(_phase1_hint.phase1_cumulative_ms) }} in phase&nbsp;1).
+        ({{ fmt_ms(_phase1_hint.phase1_cumulative_ms) }}<small class="scope-tag">consolidated &middot; across hits</small> in phase&nbsp;1).
         Pick this function for a line-level breakdown.
       </div>
       {% endif %}
@@ -1736,7 +1866,7 @@
          when there's a credible estimate - see base.project_post_fix_ms
          for the per-finding-type heuristics. #}
       {% if detail.projected_avg_time_ms is defined and detail.projected_avg_time_ms %}
-        <p class="small projected-after-fix">
+        <p class="small projected-after-fix" title="Projection assumes a single batched query at ~2x the per-call cost. Verify with EXPLAIN on the actual batched form (IN-list / JOIN may cost differently in practice).">
           <span class="projected-label">Projected after fix:</span>
           ~{{ fmt_ms(detail.projected_avg_time_ms, 1) }} each
           {% if detail.projected_total_ms %} &middot; ~{{ fmt_ms(detail.projected_total_ms) }} total{% endif %}
@@ -1780,7 +1910,7 @@
         <summary>
           <span class="severity-pill {{ s.severity | lower }}">{{ s.severity }}</span>
           <span class="sub-title">{{ s.title }}</span>
-          {% if s.estimated_impact_ms %}<span class="sub-impact">~{{ fmt_ms(s.estimated_impact_ms) }}{% if s.affected_count %} &middot; {{ s.affected_count }}{% endif %}</span>{% endif %}
+          {% if s.estimated_impact_ms %}<span class="sub-impact">{{ fmt_ms(s.estimated_impact_ms) }}<small class="scope-tag">consolidated</small>{% if s.affected_count %} &middot; {{ s.affected_count }}{% endif %}</span>{% endif %}
         </summary>
         {% if s.customer_description %}
         <div class="sub-desc">{{ s.customer_description }}</div>
@@ -1800,7 +1930,7 @@
   <span class="app-bucket-meta small muted">
     &middot; {{ bucket.count }} finding{{ "s" if bucket.count != 1 else "" }}
     {% if bucket.total_impact_ms %}
-      &middot; ~{{ fmt_ms(bucket.total_impact_ms) }}
+      &middot; {{ fmt_ms(bucket.total_impact_ms) }}<small class="scope-tag">consolidated</small>
     {% endif %}
   </span>
 {% endmacro %}
@@ -1883,13 +2013,13 @@
     </td>
     <td class="num">{{ action.queries_count }}</td>
     <td class="num">{{ fmt_ms(action.query_time_ms) }}</td>
-    <td class="num">{{ fmt_ms(action.slowest_query_ms) }}</td>
+    <td class="num">{{ fmt_ms(action.slowest_query_ms) }}{% if action.query_time_ms and action.slowest_query_ms and (action.slowest_query_ms / action.query_time_ms) >= 0.5 %} <span class="small muted">({{ ((action.slowest_query_ms / action.query_time_ms) * 100) | round(0, 'common') | int }}% of DB time)</span>{% endif %}</td>
   </tr>
   {% if action.related_findings %}
   <tr>
     <td colspan="7" class="row-finding">
       &#9888; <strong>{{ action.related_findings | length }} finding{{ "s" if action.related_findings | length != 1 else "" }} linked:</strong>
-      {{ action.related_findings[0].title }}{% if action.related_findings[0].estimated_impact_ms %} &middot; ~{{ fmt_ms(action.related_findings[0].estimated_impact_ms) }}{% endif %}
+      {{ action.related_findings[0].title }}{% if action.related_findings[0].estimated_impact_ms %} &middot; {{ fmt_ms(action.related_findings[0].estimated_impact_ms) }}{% endif %}
       {% if action.related_findings | length > 1 %} &middot; <em>+ {{ action.related_findings | length - 1 }} more</em>{% endif %}
     </td>
   </tr>
@@ -1929,7 +2059,7 @@
     </td>
     <td class="num">{{ job.queries_count }}</td>
     <td class="num">{{ fmt_ms(job.query_time_ms) }}</td>
-    <td class="num">{{ fmt_ms(job.slowest_query_ms) }}</td>
+    <td class="num">{{ fmt_ms(job.slowest_query_ms) }}{% if job.query_time_ms and job.slowest_query_ms and (job.slowest_query_ms / job.query_time_ms) >= 0.5 %} <span class="small muted">({{ ((job.slowest_query_ms / job.query_time_ms) * 100) | round(0, 'common') | int }}% of DB time)</span>{% endif %}</td>
     {% if any_findings_counted %}
       <td class="num">{{ job.findings_count if job.findings_count is not none else '-' | safe }}</td>
     {% endif %}
@@ -1989,7 +2119,7 @@
 {% macro top_query_row(q, idx) %}
   <tr>
     <td>{{ idx }}</td>
-    <td class="num">{{ fmt_ms(q.duration_ms or 0) }}</td>
+    <td class="num">{{ fmt_ms(q.query_duration_ms or 0) }}</td>
     <td><code class="small">{{ q.callsite or "" }}</code></td>
     <td><pre class="sql-inline">{{ (q.normalized_query or "") }}</pre></td>
   </tr>
@@ -2008,20 +2138,44 @@
      defined upstream in the inline CSS and are no longer used by
      this block. #}
   <header class="masthead">
-    <div>
-      <div class="masthead-eyebrow">Performance Report</div>
-      <h1>{{ session.title or "Optimus Session" }}</h1>
-    </div>
-    <div class="masthead-meta">
-      <div><span class="badge">OPTIMUS</span></div>
-      <div>Recorded by <b>{{ session.user }}</b></div>
-      <div>
-        <time datetime="{{ session.started_at }}">{{ fmt_dt(session.started_at) }}</time>
-        {% if session.stopped_at %} &rarr;
-        <time datetime="{{ session.stopped_at }}">{{ fmt_dt(session.stopped_at) }}</time>
-        {% endif %}
+    <div class="masthead-brand">
+      <img class="masthead-logo" alt="Aerele Technologies"
+           src="data:image/png;base64,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">
+      <div class="masthead-brand-text">
+        <div class="masthead-publisher-name">Aerele Technologies</div>
+        <div class="masthead-brand-tool">
+          <span class="masthead-eyebrow">Performance audit by</span>
+          <span class="masthead-brand-name">Optimus</span>
+        </div>
+        <div class="masthead-brand-contact">
+          <div class="masthead-brand-contact-row">
+            <a href="https://aerele.in" target="_blank" rel="noopener">aerele.in</a>
+            <a href="mailto:hello@aerele.in">hello@aerele.in</a>
+            <a href="tel:+917790844832">+91 77908 44832</a>
+          </div>
+          <div class="masthead-brand-contact-row">
+            <a href="https://github.com/aerele" target="_blank" rel="noopener">GitHub</a>
+            <a href="https://www.linkedin.com/company/aerele/" target="_blank" rel="noopener">LinkedIn</a>
+            <a href="https://x.com/aereletech" target="_blank" rel="noopener">X</a>
+          </div>
+        </div>
       </div>
-      <div>Generated {{ fmt_dt(generated_at) }} &middot; {{ server_tz or "UTC" }}</div>
+    </div>
+    <div class="masthead-title">
+      <h1>{{ session.title or "Optimus Session" }}</h1>
+      <div class="masthead-meta">
+        <div class="masthead-meta-row">
+          <span class="masthead-meta-label">Recorded by</span>
+          <b>{{ session.user }}</b>
+        </div>
+        <div class="masthead-meta-row">
+          <time datetime="{{ session.started_at }}">{{ fmt_dt(session.started_at) }}</time>
+          {% if session.stopped_at %}
+          &nbsp;&rarr;&nbsp;
+          <time datetime="{{ session.stopped_at }}">{{ fmt_dt(session.stopped_at) }}</time>
+          {% endif %}
+        </div>
+      </div>
     </div>
   </header>
 
@@ -2077,7 +2231,7 @@
       <span style="font-size:0.78rem; color:#475569; font-family:var(--mono, monospace);">lens.aerele.in</span>
     </div>
     <p style="margin:0 0 12px; font-size:1rem; color:#0f172a; line-height:1.5;">
-      Audit your Frappe custom apps <strong>before they break in production</strong>.
+      Audit your Frappe ERPNext custom apps <strong>before they break in production</strong>.
     </p>
     <ul style="margin:0 0 14px; padding-left:20px; color:#1f2937; font-size:0.88rem; line-height:1.7;">
       <li>Static checks for <strong>performance regressions</strong>, <strong>security gaps</strong>, and framework mis-use.</li>
@@ -2094,10 +2248,9 @@
      jobs / Server Resource / Frontend) link only when they'll render.
      v0.7.x Phase A: restyled as nav pills (editorial design tokens).
      Anchors unchanged so external links / docs still resolve. The
-     "Jump to:" prefix is retained as a visually-quiet label so screen
-     readers still get the navigational cue. #}
-  <nav class="nav-pills">
-    <span class="jump-label">Jump to</span>
+     "Jump to" navigational cue lives in aria-label on the <nav>
+     itself — visually clean, still announced by screen readers. #}
+  <nav class="nav-pills" aria-label="Jump to">
     {% if report_data.line_drilldown_html %}<a href="#line-drilldown">Line-Level Drilldown</a>{% endif %}
     <a href="#findings">Findings</a>
     <a href="#per-action">Per-action</a>
@@ -2118,13 +2271,13 @@
      regardless of input shape - do NOT migrate this block to read
      session.notes directly through |safe, that's a stored-XSS sink. #}
   {% if report_data.repro and report_data.repro.raw_html %}
-  <details class="section" open style="background: #f0f9ff; border-left: 4px solid #2563eb;">
+  <section class="section" style="background: #f0f9ff; border-left: 4px solid #2563eb;">
     <a id="repro"></a>{# v0.7.x Phase I.1: mock-spec ID anchor #}
-    <summary><h2 style="margin-top: 0;">Steps to Reproduce</h2></summary>
+    <h2 style="margin-top: 0;">Steps to Reproduce</h2>
     <div class="notes-content">
       {{ report_data.repro.raw_html | safe }}
     </div>
-  </details>
+  </section>
   {% endif %}
 
   {# --------------- KPI STRIP ---------------
@@ -2140,7 +2293,8 @@
     <div class="kpi">
       <div class="kpi-label">{{ k.label }}</div>
       <div class="kpi-value{% if k.is_danger %} danger{% endif %}">{{ k.value }}</div>
-      <div class="kpi-sub">{{ k.sub }}</div>
+      <div class="kpi-sub">{{ k.sub }}{% if k.label == "Total time" %}<small class="scope-tag">consolidated &middot; session</small>{% endif %}</div>
+      {% if k.caveat %}<div class="kpi-caveat" title="{{ k.caveat }}">{{ k.caveat }}</div>{% endif %}
     </div>
     {% endfor %}
   </div>
@@ -2173,9 +2327,9 @@
      the render-time output always matches the current code. Fall back
      to the stored value only if the render-time build somehow returns
      empty. #}
-  <details class="section">
+  <section class="section">
     <a id="summary"></a>{# v0.7.x Phase I.1: mock-spec ID anchor #}
-    <summary><h2>Summary</h2></summary>
+    <h2>Summary</h2>
     {# v0.7.x Phase J.2.1: reads report_data.summary.paragraphs_html (a list
        of HTML paragraphs per the contract). Adapter currently wraps the
        single render-time summary block as a one-element list, so this
@@ -2187,7 +2341,7 @@
     {% else %}
       <p class="empty">No summary available.</p>
     {% endif %}
-  </details>
+  </section>
 
   {# v0.6.x: hoisted above Findings - the line-level drill-down is the
      report's most distinctive section, so it lands first after the
@@ -2224,8 +2378,8 @@
   {% endif %}
 
   {# --------------- FINDINGS (v0.5.2: per-app sub-grouping) --------------- #}
-  <details class="section" open id="findings">
-    <summary><h2>Findings - what to fix</h2></summary>
+  <section class="section" id="findings">
+    <h2>Findings - what to fix</h2>
     {# v0.7.x Phase J.2.7: Findings reads from report_data.findings_by_app
        (passthrough of the legacy app-bucketed list). The contract's
        transformed ``report_data.findings`` is available for a future
@@ -2234,6 +2388,11 @@
        etc.) and the bucketing logic stays in renderer.py. #}
     {% if report_data.findings_by_app %}
       <p class="small muted">Sorted by severity, then by impact. Grouped by app so you can focus on your custom code without scanning through framework noise.</p>
+      <p class="small muted" style="font-style: italic;">
+        Note: finding impacts may overlap when several findings cover the
+        same code path (e.g. a Slow Hot Path and an N+1 inside the same
+        function) &mdash; don't sum <em>estimated_impact_ms</em> across findings.
+      </p>
 
       {% if report_data.findings_by_app | length == 1 %}
         {# Single app → skip the wrapper, render flat to avoid a
@@ -2243,12 +2402,12 @@
         {% endfor %}
       {% else %}
         {% for bucket in report_data.findings_by_app %}
-        <details class="subsection" open>
-          <summary><h3>{{ app_bucket_header(bucket) }}</h3></summary>
+        <section class="subsection">
+          <h3>{{ app_bucket_header(bucket) }}</h3>
           {% for f in bucket.findings %}
             {{ finding_card(f, "How to fix") }}
           {% endfor %}
-        </details>
+        </section>
         {% endfor %}
       {% endif %}
     {% else %}
@@ -2262,8 +2421,8 @@
        rationale: "the framework and other 1 party app's scripts can
        be easily avoided and focus on their custom app". #}
     {% if report_data.observational_findings_by_app %}
-    <details class="subsection">
-      <summary><h3>Framework-level observations (not user-actionable)</h3></summary>
+    <section class="subsection">
+      <h3>Framework-level observations (not user-actionable)</h3>
       <p class="small muted">
         Informational signals without a concrete fix in your application code -
         framework-level activity, infrastructure pressure, and hot-frame
@@ -2276,17 +2435,17 @@
         {% endfor %}
       {% else %}
         {% for bucket in report_data.observational_findings_by_app %}
-        <details class="subsection">
-          <summary><h3>{{ app_bucket_header(bucket) }}</h3></summary>
+        <section class="subsection">
+          <h3>{{ app_bucket_header(bucket) }}</h3>
           {% for f in bucket.findings %}
             {{ finding_card(f, "Context") }}
           {% endfor %}
-        </details>
+        </section>
         {% endfor %}
       {% endif %}
-    </details>
+    </section>
     {% endif %}
-  </details>
+  </section>
 
   {# --------------- RECOMMENDED ACTION PLAN (v0.7.x Phase C) ---------
      Top-3 highest-impact findings rendered as a numbered punch list
@@ -2353,9 +2512,9 @@
   {% endif %}
 
   {# --------------- PER-ACTION BREAKDOWN --------------- #}
-  <details class="section" open id="per-action">
+  <section class="section" id="per-action">
     <a id="actions"></a>{# v0.7.x Phase G: mock-spec ID alias #}
-    <summary><h2>Per-action breakdown</h2></summary>
+    <h2>Per-action breakdown</h2>
     {% if report_data.actions or report_data.actions_framework %}
       <p class="small muted">Sorted by duration. Your app's actions first; framework actions are collapsed below. Click on the action to drill into its queries.</p>
       {# v0.7.x Phase E: precompute the per-table max duration once
@@ -2383,10 +2542,10 @@
             <th>#</th>
             <th>Action</th>
             <th>Type</th>
-            <th class="num">Duration</th>
+            <th class="num">Duration <small class="scope-tag">per hit</small></th>
             <th class="num">Queries</th>
-            <th class="num">DB time</th>
-            <th class="num">Slowest query</th>
+            <th class="num">DB time <small class="scope-tag">per req &middot; all queries</small></th>
+            <th class="num">Slowest query <small class="scope-tag">worst query</small></th>
           </tr>
         </thead>
         <tbody>
@@ -2394,7 +2553,20 @@
           {{ action_row(action, loop.index, max_ms=_max_action_ms, large_duration_threshold_ms=_threshold_ms) }}
         {% endfor %}
         </tbody>
+        <tfoot>
+          <tr class="totals-row">
+            <td colspan="3"><strong>Total / {{ report_data.actions | length }} action{{ 's' if report_data.actions | length != 1 else '' }}</strong></td>
+            <td class="num"><strong>{{ fmt_ms(report_data.actions | map(attribute='duration_ms') | map('default', 0) | sum) }}</strong></td>
+            <td class="num"><strong>{{ report_data.actions | map(attribute='queries_count') | map('default', 0) | sum }}</strong></td>
+            <td class="num"><strong>{{ fmt_ms(report_data.actions | map(attribute='query_time_ms') | map('default', 0) | sum) }}</strong></td>
+            <td class="num muted" title="Per-row maxes are not additive — column total intentionally suppressed">&mdash;</td>
+          </tr>
+        </tfoot>
       </table>
+      <p class="small muted" style="font-style: italic; margin-top: 6px;">
+        Note: <em>Slowest query</em> values are per-row maxes &mdash; don't sum them.
+        Use the <em>DB time</em> column when you want a column total.
+      </p>
       {% else %}
         <p class="small muted">No actions from your own app's code in this session - everything ran in framework code. Expand the block below to see what.</p>
       {% endif %}
@@ -2417,10 +2589,10 @@
               <th>#</th>
               <th>Action</th>
               <th>Type</th>
-              <th class="num">Duration</th>
+              <th class="num">Duration <small class="scope-tag">per hit</small></th>
               <th class="num">Queries</th>
-              <th class="num">DB time</th>
-              <th class="num">Slowest query</th>
+              <th class="num">DB time <small class="scope-tag">per req &middot; all queries</small></th>
+              <th class="num">Slowest query <small class="scope-tag">worst query</small></th>
             </tr>
           </thead>
           <tbody>
@@ -2434,7 +2606,7 @@
     {% else %}
       <p class="empty">No actions were recorded in this session.</p>
     {% endif %}
-  </details>
+  </section>
 
   {# --------------- v0.6.0: BACKGROUND JOBS --------------- #}
   {# The RQ Jobs the profiled flow enqueued - captured (the profiler
@@ -2448,14 +2620,20 @@
      ``framework_count`` alongside the jobs lists; those move to a dedicated
      namespace so the legacy dict can be dropped). #}
   {% if report_data.background_jobs_summary.count %}
-  <details class="section" open id="background-jobs">
+  <section class="section" id="background-jobs">
     <a id="jobs"></a>{# v0.7.x Phase G: mock-spec ID alias #}
-    <summary><h2>RQ Jobs</h2></summary>
+    <h2>RQ Jobs</h2>
     <p class="small muted">
       {{ report_data.background_jobs_summary.count }} RQ Job{{ 's' if report_data.background_jobs_summary.count != 1 else '' }}
-      ran during this flow - {{ fmt_ms(report_data.background_jobs_summary.total_ms) }} total,
+      ran during this flow - {{ fmt_ms(report_data.background_jobs_summary.total_ms) }}<small class="scope-tag">consolidated &middot; across jobs</small>,
       {{ report_data.background_jobs_summary.total_queries }} quer{{ 'ies' if report_data.background_jobs_summary.total_queries != 1 else 'y' }}.
       These also appear in the per-action breakdown above.
+    </p>
+    <p class="small muted" style="font-style: italic;">
+      Note: the consolidated total sums each job's wall time. If your
+      bench runs multiple RQ workers in parallel, the actual elapsed
+      pool time may be less than this sum &mdash; the per-job Duration
+      column shows each job's true wall.
     </p>
     <p class="small muted">
       Jobs are captured until they finish (up to the configured wait). If a worker
@@ -2476,10 +2654,10 @@
         <tr>
           <th>#</th>
           <th>Method</th>
-          <th class="num">Duration</th>
+          <th class="num">Duration <small class="scope-tag">per hit</small></th>
           <th class="num">Queries</th>
-          <th class="num">DB time</th>
-          <th class="num">Slowest query</th>
+          <th class="num">DB time <small class="scope-tag">per req &middot; all queries</small></th>
+          <th class="num">Slowest query <small class="scope-tag">worst query</small></th>
           {% if report_data.background_jobs_summary.any_findings_counted %}<th class="num">Findings</th>{% endif %}
         </tr>
       </thead>
@@ -2488,7 +2666,21 @@
         {{ bg_job_row(job, loop.index, cols, report_data.background_jobs_summary.any_findings_counted, max_ms=_max_job_ms, large_duration_threshold_ms=_threshold_ms) }}
       {% endfor %}
       </tbody>
+      <tfoot>
+        <tr class="totals-row">
+          <td colspan="2"><strong>Total / {{ report_data.background_jobs | length }} job{{ 's' if report_data.background_jobs | length != 1 else '' }}</strong></td>
+          <td class="num"><strong>{{ fmt_ms(report_data.background_jobs | map(attribute='duration_ms') | map('default', 0) | sum) }}</strong></td>
+          <td class="num"><strong>{{ report_data.background_jobs | map(attribute='queries_count') | map('default', 0) | sum }}</strong></td>
+          <td class="num"><strong>{{ fmt_ms(report_data.background_jobs | map(attribute='query_time_ms') | map('default', 0) | sum) }}</strong></td>
+          <td class="num muted" title="Per-row maxes are not additive — column total intentionally suppressed">&mdash;</td>
+          {% if report_data.background_jobs_summary.any_findings_counted %}<td class="num"><strong>{{ report_data.background_jobs | map(attribute='findings_count') | map('default', 0) | sum }}</strong></td>{% endif %}
+        </tr>
+      </tfoot>
     </table>
+    <p class="small muted" style="font-style: italic; margin-top: 6px;">
+      Note: <em>Slowest query</em> values are per-row maxes &mdash; don't sum them.
+      Use the <em>DB time</em> column when you want a column total.
+    </p>
     {% else %}
       <p class="small muted">No RQ Jobs from your own app's code - all jobs ran in framework code. Expand the block below to see what.</p>
     {% endif %}
@@ -2501,10 +2693,10 @@
           <tr>
             <th>#</th>
             <th>Method</th>
-            <th class="num">Duration</th>
+            <th class="num">Duration <small class="scope-tag">per hit</small></th>
             <th class="num">Queries</th>
-            <th class="num">DB time</th>
-            <th class="num">Slowest query</th>
+            <th class="num">DB time <small class="scope-tag">per req &middot; all queries</small></th>
+            <th class="num">Slowest query <small class="scope-tag">worst query</small></th>
             {% if report_data.background_jobs_summary.any_findings_counted %}<th class="num">Findings</th>{% endif %}
           </tr>
         </thead>
@@ -2516,7 +2708,7 @@
       </table>
     </details>
     {% endif %}
-  </details>
+  </section>
   {% endif %}
 
   {# --------------- v0.6.x: DOC-EVENT LIFECYCLE --------------- #}
@@ -2530,9 +2722,9 @@
      entry carries is_save_target/touched_during/method_count alongside
      the summary string. #}
   {% if report_data.doc_events %}
-  <details class="section" id="doc-event-lifecycle">
+  <section class="section" id="doc-event-lifecycle">
     <a id="doc-events"></a>{# v0.7.x Phase G: mock-spec ID alias #}
-    <summary><h2>Doc-event lifecycle</h2></summary>
+    <h2>Doc-event lifecycle</h2>
     <p class="small muted">
       Slow lifecycle methods (validate, on_submit, …) and registered doc-event
       hooks that ran during this session's save/submit actions, grouped by DocType
@@ -2570,7 +2762,7 @@
       {% endfor %}
     </div>
     {% endfor %}
-  </details>
+  </section>
   {% endif %}
 
   {# v0.7.x Phase J.2.4: Server Resource reads from report_data.resource
@@ -2579,9 +2771,9 @@
      infra_timeline travel under .summary and .timeline (non-contract
      extensions). #}
   {% if report_data.resource %}
-  <details class="section" id="server-resource">
+  <section class="section" id="server-resource">
     <a id="resource"></a>{# v0.7.x Phase G: mock-spec ID alias #}
-    <summary><h2>Server Resource</h2></summary>
+    <h2>Server Resource</h2>
     <p class="small muted">
       CPU, memory, load average, DB and Redis pressure, and background
       queue depth sampled at each action boundary. Use this to tell code-slow
@@ -2613,7 +2805,16 @@
         </div>
       </div>
     </div>
-    <table class="data">
+    <table class="data tbl-clip resource-table">
+      <colgroup>
+        <col class="col-idx">
+        <col class="col-action">
+        <col class="col-num">
+        <col class="col-num">
+        <col class="col-num">
+        <col class="col-num-wide">
+        <col class="col-num-wide">
+      </colgroup>
       <thead>
         <tr>
           <th class="num">#</th>
@@ -2639,7 +2840,7 @@
         {% endfor %}
       </tbody>
     </table>
-  </details>
+  </section>
   {% endif %}
 
   {# v0.7.x Phase J.2.4: Frontend reads from report_data.frontend (contract).
@@ -2649,8 +2850,8 @@
      ``*_class`` fields encode the web.dev thresholds in Python - the
      legacy _vital macro is no longer needed. #}
   {% if report_data.frontend %}
-  <details class="section" id="frontend">
-    <summary><h2>Frontend</h2></summary>
+  <section class="section" id="frontend">
+    <h2>Frontend</h2>
     <p class="small muted">
       Per-XHR timings from the browser joined to the matching server recording,
       plus Web Vitals (FCP, LCP, CLS) per page. Shows what the user actually
@@ -2664,15 +2865,15 @@
       </div>
       <div class="resource-card">
         <div class="rc-label">Browser wall time</div>
-        <div class="rc-value">{{ fmt_ms(_fs.total_xhr_ms or 0) }}</div>
+        <div class="rc-value">{{ fmt_ms(_fs.total_xhr_ms or 0) }}<small class="scope-tag">consolidated</small></div>
       </div>
       <div class="resource-card">
         <div class="rc-label">Backend time</div>
-        <div class="rc-value">{{ fmt_ms(_fs.total_backend_ms or 0) }}</div>
+        <div class="rc-value">{{ fmt_ms(_fs.total_backend_ms or 0) }}<small class="scope-tag">consolidated</small></div>
       </div>
       <div class="resource-card">
         <div class="rc-label">Network overhead</div>
-        <div class="rc-value">{{ fmt_ms(_fs.network_overhead_ms or 0) }}</div>
+        <div class="rc-value">{{ fmt_ms(_fs.network_overhead_ms or 0) }}<small class="scope-tag">consolidated</small></div>
       </div>
     </div>
 
@@ -2691,9 +2892,9 @@
       <thead>
         <tr style="background: #f3f4f6; border-bottom: 1px solid #e5e7eb;">
           <th style="padding: 6px 8px; text-align: left;">Action</th>
-          <th style="padding: 6px 8px; text-align: right;">Backend</th>
-          <th style="padding: 6px 8px; text-align: right;">Browser</th>
-          <th style="padding: 6px 8px; text-align: right;">Network Δ</th>
+          <th style="padding: 6px 8px; text-align: right;">Backend <small class="scope-tag">per hit</small></th>
+          <th style="padding: 6px 8px; text-align: right;">Browser <small class="scope-tag">per hit</small></th>
+          <th style="padding: 6px 8px; text-align: right;">Network Δ <small class="scope-tag">per hit</small></th>
           <th style="padding: 6px 8px; text-align: right;">Status</th>
           <th style="padding: 6px 8px; text-align: right;">Size</th>
           <th style="padding: 6px 8px; text-align: left;">URL</th>
@@ -2728,11 +2929,11 @@
       <thead>
         <tr>
           <th>Page</th>
-          <th class="num">FCP</th>
-          <th class="num">LCP</th>
-          <th class="num">CLS</th>
-          <th class="num">TTFB</th>
-          <th class="num">DCL</th>
+          <th class="num">FCP <small class="scope-tag">per page load &middot; latest sample</small></th>
+          <th class="num">LCP <small class="scope-tag">per page load &middot; latest sample</small></th>
+          <th class="num">CLS <small class="scope-tag">per page load &middot; latest sample</small></th>
+          <th class="num">TTFB <small class="scope-tag">per page load &middot; latest sample</small></th>
+          <th class="num">DCL <small class="scope-tag">per page load &middot; latest sample</small></th>
         </tr>
       </thead>
       <tbody>
@@ -2759,7 +2960,7 @@
         <thead>
           <tr style="background: #f3f4f6; border-bottom: 1px solid #e5e7eb;">
             <th style="padding: 6px 8px; text-align: left;">URL</th>
-            <th style="padding: 6px 8px; text-align: right;">Duration</th>
+            <th style="padding: 6px 8px; text-align: right;">Duration <small class="scope-tag">per hit</small></th>
             <th style="padding: 6px 8px; text-align: left;">Reason</th>
           </tr>
         </thead>
@@ -2775,7 +2976,7 @@
       </table>
     </details>
     {% endif %}
-  </details>
+  </section>
   {% endif %}
 
   {# --------------- v0.3.0: HOT FRAMES LEADERBOARD --------------- #}
@@ -2784,16 +2985,30 @@
      legacy split). The contract calls for a single list with
      is_user_code flag; that collapse moves to J.3. #}
   {% if report_data.hot_frames or report_data.hot_frames_framework %}
-  <details class="section">
+  <section class="section">
     <a id="hot-frames"></a>{# v0.7.x Phase I.1: mock-spec ID anchor #}
-    <summary><h2>Hot frames (top {{ (report_data.hot_frames | length) + (report_data.hot_frames_framework | length) }})</h2></summary>
+    <h2>Hot frames (top {{ (report_data.hot_frames | length) + (report_data.hot_frames_framework | length) }})</h2>
+    {% if report_data.frame_truncation and report_data.frame_truncation.actions_affected > 0 %}
+    <div class="warning-banner" style="background:#fff3cd; border-left:4px solid #f0ad4e; padding:10px 14px; margin:8px 0 14px; border-radius:4px;">
+      <p class="small" style="margin:0;">
+        <strong>Note:</strong> this session captured
+        <strong>{{ report_data.frame_truncation.captured }}</strong>
+        call-tree frames across
+        {{ report_data.frame_truncation.actions_affected }}
+        action{{ "s" if report_data.frame_truncation.actions_affected != 1 else "" }};
+        only the top {{ report_data.frame_truncation.keep_limit }} by self-time
+        {{ "are" if report_data.frame_truncation.keep_limit != 1 else "is" }} shown.
+        Re-run with a longer profile budget or narrower time window to see the rest.
+      </p>
+    </div>
+    {% endif %}
     {% if report_data.hot_frames %}
     <table class="data hot-frames-table">
       <thead>
         <tr>
           <th>Function</th>
-          <th class="num">Total time</th>
-          <th class="num">Occurrences</th>
+          <th class="num">Total time <small class="scope-tag">consolidated</small></th>
+          <th class="num" title="Sampler hits — proportional to call count but not exact. Use Line-Level Drilldown for a true call count.">Samples</th>
           <th class="num">Distinct actions</th>
         </tr>
       </thead>
@@ -2809,12 +3024,17 @@
     {% if report_data.hot_frames_framework %}
     <details class="subsection">
       <summary class="small muted"><strong>{{ report_data.hot_frames_framework | length }}</strong> framework frame{{ "s" if report_data.hot_frames_framework | length != 1 else "" }} (click to expand) - <code>frappe</code>, <code>erpnext</code>, and friends; the developer can't easily patch these</summary>
+      <p class="small muted" style="margin: 6px 0 8px; font-style: italic;">
+        Framework rows show <em>cumulative</em> time (includes nested
+        calls) &mdash; wrapper self-time is sub-sampler-interval and
+        would round to 0ms otherwise.
+      </p>
       <table class="data hot-frames-table">
         <thead>
           <tr>
             <th>Function</th>
-            <th class="num">Total time</th>
-            <th class="num">Occurrences</th>
+            <th class="num">Total time <small class="scope-tag">consolidated</small></th>
+            <th class="num" title="Sampler hits — proportional to call count but not exact. Use Line-Level Drilldown for a true call count.">Samples</th>
             <th class="num">Distinct actions</th>
           </tr>
         </thead>
@@ -2826,17 +3046,27 @@
       </table>
     </details>
     {% endif %}
-  </details>
+  </section>
   {% endif %}
 
   {# v0.7.x Phase J.2.5: Slow queries reads from
      report_data.slow_queries / .slow_queries_framework. The framework
      split mirrors the legacy two-table layout pending J.3 collapse. #}
-  <details class="section" id="top-queries">
+  <section class="section" id="top-queries">
     <a id="queries"></a>{# v0.7.x Phase G: mock-spec ID alias #}
-    <summary><h2>{% if report_data.slow_queries %}Top {{ report_data.slow_queries|length }} slowest queries{% else %}Slowest queries{% endif %} - your app</h2></summary>
+    <h2>{% if report_data.slow_queries %}Top {{ report_data.slow_queries|length }} slowest queries{% else %}Slowest queries{% endif %} - your app</h2>
     {% if report_data.slow_queries %}
       <p class="small muted">Slowest queries issued from your own app's code. Framework and third-party queries are excluded - see the per-action breakdown below for the complete list.</p>
+      {% if report_data.top_queries_suppressed_count and report_data.top_queries_suppressed_count > 0 %}
+      <p class="small muted" style="font-style: italic;">
+        Note: <strong>{{ report_data.top_queries_suppressed_count }}</strong>
+        additional quer{{ "ies" if report_data.top_queries_suppressed_count != 1 else "y" }}
+        cleared the {{ '%.0f'|format(report_data.top_queries_slow_threshold_ms) }}ms slow threshold but
+        {{ "were" if report_data.top_queries_suppressed_count != 1 else "was" }} suppressed from the
+        Findings list to avoid noise &mdash; the full leaderboard above shows
+        every query above the 10ms display floor.
+      </p>
+      {% endif %}
       <table class="query-table data">
         <colgroup>
           <col class="col-index">
@@ -2847,7 +3077,7 @@
         <thead>
           <tr>
             <th>#</th>
-            <th class="num">Duration</th>
+            <th class="num">Duration <small class="scope-tag">per hit</small></th>
             <th>Callsite</th>
             <th>Query (normalized)</th>
           </tr>
@@ -2861,7 +3091,7 @@
     {% else %}
       <div class="empty-state">
         <div class="empty-icon">&check; Clear</div>
-        <p>No notably slow queries from your app's own code in this session - nothing here is worth singling out. The per-action breakdown below lists every query, fast and framework ones included.</p>
+        <p>No queries cleared the 10ms display floor this session &mdash; sub-10ms queries are hidden by default to avoid noise. The per-action breakdown below lists every query, fast and framework ones included.</p>
       </div>
     {% endif %}
     {% if report_data.slow_queries_framework %}
@@ -2877,7 +3107,7 @@
         <thead>
           <tr>
             <th>#</th>
-            <th class="num">Duration</th>
+            <th class="num">Duration <small class="scope-tag">per hit</small></th>
             <th>Callsite</th>
             <th>Query (normalized)</th>
           </tr>
@@ -2890,12 +3120,12 @@
       </table>
     </details>
     {% endif %}
-  </details>
+  </section>
 
   {# --------------- QUERY BREAKDOWN PER ACTION --------------- #}
   {% if recordings_by_uuid %}
-  <details class="section">
-    <summary><h2>Queries per action</h2></summary>
+  <section class="section">
+    <h2>Queries per action</h2>
     <p class="small muted">
       The top queries for each action in this session, with callsites so your
       developer knows where to look. Actions are ordered by total duration.
@@ -2925,7 +3155,7 @@
             </colgroup>
             <thead>
               <tr>
-                <th class="num">Duration</th>
+                <th class="num">Duration <small class="scope-tag">per hit</small></th>
                 <th class="num">Copies</th>
                 <th>Callsite</th>
                 <th>Query (normalized)</th>
@@ -2961,13 +3191,13 @@
       </details>
       {% endif %}
     {% endfor %}
-  </details>
+  </section>
   {% endif %}
 
   {# --------------- PER-TABLE BREAKDOWN --------------- #}
-  <details class="section" id="db-tables">
+  <section class="section" id="db-tables">
     <a id="db"></a>{# v0.7.x Phase G: mock-spec ID alias #}
-    <summary><h2>Time spent per database table</h2></summary>
+    <h2>Time spent per database table</h2>
     {% if hidden_db_tables_count %}
       <p class="small muted" style="margin: 4px 0 10px; padding: 8px 12px; background: #f9fafb; border-radius: 6px;"><strong>{{ hidden_db_tables_count }}</strong> framework/internal table{{ "s" if hidden_db_tables_count != 1 else "" }} hidden (DocType / Workspace / Role / Has Role / DefaultValue / <code>information_schema.*</code> and friends). Uncheck <em>"Hide framework / internal database tables"</em> in Optimus Settings to see them.</p>
     {% endif %}
@@ -2990,17 +3220,17 @@
         <thead>
           <tr>
             <th>Table</th>
-            <th class="num">Time</th>
+            <th class="num">Time <small class="scope-tag">consolidated</small></th>
             <th class="num">Queries</th>
-            <th class="num">Reads</th>
-            <th class="num">Writes</th>
+            <th class="num">Reads <small class="scope-tag">consolidated</small></th>
+            <th class="num">Writes <small class="scope-tag">consolidated</small></th>
           </tr>
         </thead>
         <tbody>
         {% for t in report_data.db.tables %}
           <tr>
             <td><code>{{ t.table }}</code></td>
-            <td class="num">{{ fmt_ms(t.duration_ms) }}</td>
+            <td class="num">{{ fmt_ms(t.consolidated_time_ms) }}</td>
             <td class="num">{{ t.queries }}</td>
             <td class="num">{{ t.get("read_count", "-") }}{% if t.get("read_time_ms") %} <span class="small muted">/ {{ fmt_ms(t.read_time_ms) }}</span>{% endif %}</td>
             <td class="num">{{ t.get("write_count", "-") }}{% if t.get("write_time_ms") %} <span class="small muted">/ {{ fmt_ms(t.write_time_ms) }}</span>{% endif %}</td>
@@ -3014,11 +3244,15 @@
          the older markup used). Each card carries the table name, the
          read/write summary in mono, the recommendation prose, the
          dark SQL snippet for any composite DDL, and an amber
-         warn-line when writes are present. Render only when a table
-         carries at least one of the recommendation flags. #}
+         warn-line when writes are present. Only ACTIONABLE tables
+         get cards: a concrete `recommended_index` (LLM-vetted) or
+         at least one heuristic `index_candidates` column. The
+         "nothing to suggest" branches (Frappe meta tables, framework-
+         only filters, full-scan reads) are skipped — they took space
+         without telling the reader anything actionable. #}
       {% set _rec_tables = [] %}
       {% for t in report_data.db.tables %}
-        {% if t.get("recommended_index") or t.index_candidates or t.get("is_meta_table") or (t.get("framework_cols_filtered") and "index_candidates" in t) or ("index_candidates" in t and t.get("read_count")) %}
+        {% if t.get("recommended_index") or t.index_candidates %}
           {% set _ = _rec_tables.append(t) %}
         {% endif %}
       {% endfor %}
@@ -3032,7 +3266,7 @@
             <span class="index-rec-stats">
               {% if t.get("read_count") is not none %}<span class="stat-num">{{ t.get("read_count", 0) }}</span> reads{% endif %}
               {% if t.get("write_count") is not none %} &middot; <span class="stat-num">{{ t.get("write_count", 0) }}</span> writes{% endif %}
-              {% if t.get("duration_ms") %} &middot; {{ fmt_ms(t.duration_ms) }}{% endif %}
+              {% if t.get("consolidated_time_ms") %} &middot; {{ fmt_ms(t.consolidated_time_ms) }}<small class="scope-tag">consolidated</small>{% endif %}
             </span>
           </div>
 
@@ -3078,14 +3312,6 @@
               <div class="note-text">Also filtered on Frappe metadata columns ({% for fc in t.framework_cols_filtered %}<code>{{ fc }}</code>{% if not loop.last %}, {% endif %}{% endfor %}) - those aren't safe index targets (Frappe writes them on every save, or they're auto-indexed), so they're left out.</div>
             {% endif %}
 
-          {% elif t.get("is_meta_table") %}
-            <p class="note-text">Frappe framework meta table - <code>bench migrate</code> owns its schema (indexes included), so a hand-added index here is pointless and would be clobbered on the next migrate. Nothing suggested.</p>
-
-          {% elif "index_candidates" in t and t.get("framework_cols_filtered") %}
-            <p class="note-text">Reads here only filter on Frappe metadata columns ({% for fc in t.framework_cols_filtered %}<code>{{ fc }}</code>{% if not loop.last %}, {% endif %}{% endfor %}) - those aren't safe index targets (Frappe writes them on every save, or they're auto-indexed), so nothing's suggested for this table.</p>
-
-          {% elif "index_candidates" in t and t.get("read_count") %}
-            <p class="note-text">Reads here filter on no single indexable column (full scans or primary-key lookups) - nothing obvious to add.</p>
           {% endif %}
         </div>
         {% endfor %}
@@ -3095,12 +3321,12 @@
     {% else %}
       <p class="empty">No table breakdown available.</p>
     {% endif %}
-  </details>
+  </section>
 
   {# --------------- Full recordings drill-down --------------- #}
   {% if recordings_by_uuid %}
-  <details class="section">
-    <summary><h2>Full recordings</h2></summary>
+  <section class="section">
+    <h2>Full recordings</h2>
     <p class="small muted">Every action's complete data - raw SQL with literal values, request headers, form data, and full Python stack traces. <strong>This contains potentially sensitive customer data - do not share externally.</strong></p>
     <p class="small muted">Each action is collapsed by default. Click to expand.</p>
 
@@ -3110,7 +3336,7 @@
       <details style="margin: 12px 0; padding: 12px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px;">
         <summary style="cursor: pointer; font-weight: 600; color: #111827;">
           {{ loop.index }}. {{ action.action_label }}
-          <span class="small muted" style="font-weight: 400;">({{ fmt_ms(action.duration_ms) }}, {{ action.queries_count }} queries)</span>
+          <span class="small muted" style="font-weight: 400;">({{ fmt_ms(action.duration_ms) }}<small class="scope-tag">per hit</small>, {{ action.queries_count }} queries)</span>
         </summary>
         <div style="padding-top: 12px;">
 
@@ -3152,7 +3378,7 @@
       </details>
       {% endif %}
     {% endfor %}
-  </details>
+  </section>
   {% endif %}
 
   {# v0.6.0: orientation for someone seeing this report for the first time.
@@ -3161,22 +3387,27 @@
      the Jump-to nav and the executive summary). Repeat readers don't need
      it surfaced above the technical content; first-time readers reach it
      via the "How to read" link in the Jump-to nav. #}
-  <details class="how-to" id="how-to-read">
-    <summary><h2>How to read this report</h2></summary>
+  <section class="how-to" id="how-to-read">
+    <h2>How to read this report</h2>
     <ul class="small" style="margin:6px 0 0 18px;padding:0;line-height:1.7;">
       <li>Start with <strong>Findings</strong> - that's the punch list of what to fix. The <em>Observations</em> sub-list under it is FYI signal (framework-level issues, system pressure) with no concrete fix you can ship.</li>
       <li>The per-action table below lists every request the session captured, sorted by duration; the background-jobs section lists the jobs those requests enqueued (captured and analyzed too).</li>
       <li>The database-tables section shows where DB time went, with an index candidate per table; the <em>tables written to</em> line at the top of it lists every table the session wrote - writes are cheap, so they rank low by time. The slowest-queries section covers your own app's code only.</li>
       <li>The server-resource and frontend panels show CPU / memory / queue pressure and browser timings - only when captured.</li>
-      <li>The full-recordings and queries-per-action sections (collapsed) hold the raw SQL, headers, form data and stack traces - for deep dives.</li>
+      <li>The full-recordings and queries-per-action sections hold the raw SQL, headers, form data and stack traces - for deep dives.</li>
       <li>Hover any <code>file.py:123</code> callsite to open it in VS&nbsp;Code. Anything starting with <code>tab</code> is a database table; the DocType is the part after <code>tab</code>.</li>
+      <li>Every duration carries a small grey scope tag: <strong>per hit</strong> (one occurrence — a single request, one query execution) or <strong>consolidated</strong> (sum across all hits in this session — total time in a table, full impact of a finding's pattern, etc.).</li>
+      <li>Call-tree and Hot-frame timings come from a wall-clock sampler at ≈{{ report_data.sampler_interval_ms }}ms intervals. Functions whose execution is shorter than the interval can be under-sampled or invisible — for exact per-line timings, use the <strong>Line-Level Drilldown</strong>.</li>
+      <li><strong>Self-time</strong> is wall-clock self-time (the sampler measures elapsed time, not CPU). A function that blocks on I/O — <code>requests.get</code>, sync DB calls outside the recorder, <code>time.sleep</code> — counts that wait as self-time. Check the call tree for hidden I/O before optimising compute.</li>
     </ul>
-  </details>
+  </section>
 
   {# --------------- FOOTER --------------- #}
   <div class="footer">
     <p>
-      Generated by <strong>Optimus</strong> &middot;
+      Generated by <strong>Optimus</strong>
+      &middot; {{ fmt_dt(generated_at) }} &middot; {{ server_tz or "UTC" }}
+      &middot;
       <span class="warn-line">Admin report - contains sensitive data, internal use only</span>
     </p>
     <p class="small" style="margin-top: 8px; color: #9ca3af;">

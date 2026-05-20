@@ -37,7 +37,10 @@ def _read_snippet(finding):
 
 
 class TestEnrichFindingsWithSourceSnippets:
-	def test_attaches_three_lines_centered_on_lineno(self, tmp_path):
+	def test_attaches_lines_centered_on_lineno(self, tmp_path):
+		# v0.7.x: snippet window widened from ±1 to ±4 — for a 5-line file
+		# anchored on line 3, the window covers lines 1..5 (clipped at
+		# file boundaries).
 		src = tmp_path / "fake.py"
 		src.write_text("line one\nline two\nline three\nline four\nline five\n")
 		findings = [_finding(str(src), 3)]
@@ -46,12 +49,16 @@ class TestEnrichFindingsWithSourceSnippets:
 
 		snippet = _read_snippet(findings[0])
 		assert snippet == [
+			{"lineno": 1, "content": "line one"},
 			{"lineno": 2, "content": "line two"},
 			{"lineno": 3, "content": "line three"},
 			{"lineno": 4, "content": "line four"},
+			{"lineno": 5, "content": "line five"},
 		]
 
 	def test_lineno_at_first_line_skips_below(self, tmp_path):
+		# Anchored on line 1 with a ±4 window → range(1, 6); a 3-line
+		# file → all 3 lines returned, none below line 1.
 		src = tmp_path / "fake.py"
 		src.write_text("alpha\nbeta\ngamma\n")
 		findings = [_finding(str(src), 1)]
@@ -62,9 +69,12 @@ class TestEnrichFindingsWithSourceSnippets:
 		assert snippet == [
 			{"lineno": 1, "content": "alpha"},
 			{"lineno": 2, "content": "beta"},
+			{"lineno": 3, "content": "gamma"},
 		]
 
 	def test_lineno_at_last_line_skips_above(self, tmp_path):
+		# Anchored on line 3 (file end) with ±4 window → range(1, 8) but
+		# only 3 lines exist; window clipped to lines 1..3.
 		src = tmp_path / "fake.py"
 		src.write_text("alpha\nbeta\ngamma\n")
 		findings = [_finding(str(src), 3)]
@@ -73,6 +83,7 @@ class TestEnrichFindingsWithSourceSnippets:
 
 		snippet = _read_snippet(findings[0])
 		assert snippet == [
+			{"lineno": 1, "content": "alpha"},
 			{"lineno": 2, "content": "beta"},
 			{"lineno": 3, "content": "gamma"},
 		]

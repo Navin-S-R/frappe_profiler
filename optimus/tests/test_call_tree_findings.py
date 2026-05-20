@@ -177,8 +177,9 @@ def test_non_self_referential_hot_path_keeps_classic_phrasing():
 	)
 	slow = [f for f in findings if f["finding_type"] == "Slow Hot Path"]
 	assert len(slow) == 1
-	assert "80% of the time was spent in validate" in slow[0]["title"], (
-		f"Non-self-referential titles must keep the classic phrasing; "
+	assert "80% of its wall time was spent in validate" in slow[0]["title"], (
+		f"Non-self-referential titles must follow the 'of its wall time' "
+		f"phrasing (clearer per-action attribution); "
 		f"got: {slow[0]['title']!r}"
 	)
 
@@ -228,11 +229,15 @@ def test_slow_hot_path_suppressed_when_dominated_by_sql():
 
 
 def test_repeated_hot_frame_finding_aggregates_across_actions():
-	# Same frame in 4 different actions, total 800ms
+	# Same frame in 4 different actions, total 800ms self-time
+	# (v0.7.x A.AE1: hot-frames aggregator switched from cumulative
+	# to self_ms to avoid recursive double-count. Leaf fixtures now
+	# need self_ms set explicitly — cumulative alone no longer feeds
+	# the leaderboard.)
 	per_action_trees = []
 	for _ in range(4):
 		t = _node("<root>", "", 500, [
-			_node("my_app.discounts.calc", "apps/my_app/d.py", 200, []),
+			_node("my_app.discounts.calc", "apps/my_app/d.py", 200, [], self_ms=200),
 		])
 		per_action_trees.append(t)
 
@@ -1112,7 +1117,7 @@ def test_repeated_hot_frame_keeps_user_code_finding():
 	per_action_trees = []
 	for _ in range(5):
 		per_action_trees.append(_node("<root>", "", 1000, [
-			_node("compute_taxes", "erpnext/accounts/tax.py", 200, []),
+			_node("compute_taxes", "erpnext/accounts/tax.py", 200, [], self_ms=200),
 		]))
 
 	findings, _ = call_tree._aggregate_hot_frames(per_action_trees)

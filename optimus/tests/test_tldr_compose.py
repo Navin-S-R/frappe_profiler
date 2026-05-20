@@ -145,8 +145,10 @@ class TestEmptyState:
 		tldr = renderer._compose_tldr([], _doc())
 		sub = str(tldr["sub_markup"])
 		assert "severity finding" not in sub
-		# But session totals stay.
-		assert "Session total" in sub
+		# But session totals stay — sub-line reworded in v0.7.x to make
+		# the consolidated-session aggregation explicit.
+		assert "Total active time:" in sub
+		assert "consolidated &middot; session" in sub
 		assert "20 operations" in sub
 		assert "1868 DB queries" in sub
 

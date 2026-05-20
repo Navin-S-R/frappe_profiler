@@ -50,8 +50,10 @@ class TestSurface:
 		"""The endpoint must carry @frappe.whitelist() — otherwise
 		the front-end can't call it."""
 		src = _read_api_source()
+		# Allow optional intermediate decorators (e.g. @rate_limit) between
+		# @frappe.whitelist() and the def line.
 		match = re.search(
-			r"@frappe\.whitelist\(\)\s*\ndef regenerate_reports",
+			r"@frappe\.whitelist\(\)\s*\n(?:@\w+(?:\.\w+)*\([^)]*\)\s*\n)*def regenerate_reports",
 			src,
 		)
 		assert match is not None, (

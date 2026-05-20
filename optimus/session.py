@@ -16,6 +16,8 @@ have no TTL — they live until the analyze pipeline finalizes the session
 into a `Optimus Session` DocType row and explicitly deletes them.
 """
 
+import hashlib
+import hmac
 import time
 
 import frappe
@@ -28,6 +30,87 @@ SESSION_TTL_SECONDS = 10 * 60
 # Prevents pathological flows from filling Redis. Configurable per site
 # via site_config.json: optimus_max_recordings_per_session
 MAX_RECORDINGS_PER_SESSION = 200
+
+# Phase K hardening: every pickled pyinstrument tree we stash in
+# Redis is preceded by a 32-byte HMAC-SHA256 signature computed with
+# the site's encryption_key. ``unsign_blob`` rejects any blob whose
+# signature doesn't match - so a Redis-poisoning attacker can't slip
+# a malicious pickle in and trigger a deserialization RCE.
+_SIG_LEN = 32  # SHA-256 digest size in bytes.
+
+
+def _has_stable_hmac_secret() -> bool:
+	"""Phase K v0.7 GA: True only when ``frappe.conf.encryption_key``
+	is set. That's the only secret guaranteed to be the same across
+	HTTP / RQ / analyze workers on the same site. When False, callers
+	skip signing (and accept unsigned blobs on read) - signing with
+	the per-process random fallback produces blobs no other process
+	can verify, which breaks the recorder → analyze handoff silently.
+	"""
+	try:
+		return bool(frappe.conf and frappe.conf.get("encryption_key"))
+	except Exception:
+		return False
+
+
+def _hmac_secret() -> bytes:
+	"""Site-local secret for blob signing. Uses ``encryption_key`` if
+	available (the same secret Frappe uses to encrypt password fields,
+	rotated only on conscious operator action). Falls back to a
+	process-local random key in test environments where
+	``frappe.conf`` isn't wired up - signed blobs are then valid only
+	within the current process, which matches the test isolation
+	model. Callers that need cross-process round-trip should check
+	``_has_stable_hmac_secret`` first."""
+	try:
+		key = frappe.conf.get("encryption_key") if frappe.conf else None
+	except Exception:
+		key = None
+	if not key:
+		# Test / unconfigured environment - synthesise a per-process
+		# secret so sign/verify still round-trips within one worker.
+		global _FALLBACK_SECRET
+		try:
+			return _FALLBACK_SECRET  # type: ignore[name-defined]
+		except NameError:
+			import os
+			_FALLBACK_SECRET = os.urandom(32)
+			return _FALLBACK_SECRET
+	return key.encode("utf-8") if isinstance(key, str) else bytes(key)
+
+
+def sign_blob(blob: bytes) -> bytes:
+	"""Prepend an HMAC-SHA256 signature so ``unsign_blob`` can verify
+	integrity on read. Use for any opaque payload (pickle / msgpack /
+	binary) that we'll later trust enough to deserialize.
+
+	Phase K v0.7 GA: skip signing entirely when there's no stable
+	shared secret - returning the raw blob means the unsigned-blob
+	fallback path on read handles it cleanly. Signing with a
+	per-process random key would produce blobs that fail HMAC
+	verification in any other process and break the recorder →
+	analyze handoff.
+	"""
+	if not isinstance(blob, (bytes, bytearray)):
+		raise TypeError(f"sign_blob expects bytes, got {type(blob).__name__}")
+	if not _has_stable_hmac_secret():
+		return bytes(blob)
+	sig = hmac.new(_hmac_secret(), bytes(blob), hashlib.sha256).digest()
+	return sig + bytes(blob)
+
+
+def unsign_blob(signed: bytes) -> bytes | None:
+	"""Verify the HMAC-SHA256 prefix and return the payload, or
+	``None`` if the signature is missing / mismatched. Constant-time
+	comparison via ``hmac.compare_digest`` so signature-stripping
+	attacks don't leak timing info."""
+	if not isinstance(signed, (bytes, bytearray)) or len(signed) < _SIG_LEN:
+		return None
+	sig, blob = bytes(signed[:_SIG_LEN]), bytes(signed[_SIG_LEN:])
+	expected = hmac.new(_hmac_secret(), blob, hashlib.sha256).digest()
+	if not hmac.compare_digest(sig, expected):
+		return None
+	return blob
 
 
 def _active_key(user: str) -> str:

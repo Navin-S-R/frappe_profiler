@@ -99,8 +99,9 @@ class TestActionEntryCallsite:
 		fn = cs["filename"].replace("\\", "/")
 		assert fn.endswith("optimus/renderer.py")
 		assert not os.path.isabs(cs["filename"])
-		# ±1-line snippet: 3 rows, the target row is "def render(".
-		assert cs["source_snippet"] and len(cs["source_snippet"]) == 3
+		# v0.7.x: snippet window widened from ±1 to ±4 — up to 9 rows
+		# centered on the target line. The target row is "def render(".
+		assert cs["source_snippet"] and len(cs["source_snippet"]) <= 5
 		target = [r for r in cs["source_snippet"] if r["lineno"] == cs["lineno"]]
 		assert target and target[0]["content"].lstrip().startswith("def render(")
 
@@ -171,7 +172,7 @@ class TestResolveFrameKeyToCallsite:
 		assert os.path.isabs(cs["_abs"]) and cs["_abs"].endswith("renderer.py")
 		assert cs["function"] == "render"
 		assert cs["lineno"] == _expected_lineno()
-		assert cs["source_snippet"] and len(cs["source_snippet"]) == 3
+		assert cs["source_snippet"] and len(cs["source_snippet"]) <= 5
 		target = [r for r in cs["source_snippet"] if r["lineno"] == cs["lineno"]]
 		assert target and target[0]["content"].lstrip().startswith("def render(")
 

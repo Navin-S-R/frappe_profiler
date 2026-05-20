@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Aerele-RnD/optimus/optimus/report_data_schema.json",
+  "title": "Optimus report_data contract",
+  "description": "Shape of the 19-key namespace exposed to the rendered HTML report and external tooling. Produced by optimus.report_context.build_report_context. Phase J introduced this contract; Phase K froze it for the v0.7.0 GA. Many keys are nullable (the section's renderer treats null/empty as 'skip this panel' rather than throwing).",
+  "type": "object",
+  "required": [
+    "session",
+    "tldr",
+    "kpis",
+    "repro",
+    "summary",
+    "findings",
+    "line_drilldown_runs",
+    "action_plan",
+    "waterfall",
+    "actions",
+    "background_jobs",
+    "doc_events",
+    "resource",
+    "frontend",
+    "hot_frames",
+    "slow_queries",
+    "db",
+    "how_to_read_items",
+    "footer"
+  ],
+  "properties": {
+    "session": {
+      "type": ["object", "null"],
+      "description": "Session-level metadata (uuid, title, user, status, started_at, stopped_at, total_*_ms)."
+    },
+    "tldr": {
+      "type": ["object", "null"],
+      "description": "TL;DR hero block. {headline_html, subline_html} both HTML-safe Markup."
+    },
+    "kpis": {
+      "type": ["array", "null"],
+      "description": "Top-of-page KPI strip; 4 items in document order."
+    },
+    "repro": {
+      "type": ["object", "null"],
+      "description": "Steps-to-reproduce content. {raw_html} from session.notes_html (sanitized)."
+    },
+    "summary": {
+      "type": ["object", "null"],
+      "description": "Render-time-built Summary block. {paragraphs_html: [str, ...]}."
+    },
+    "findings": {
+      "type": ["array", "null"],
+      "description": "All findings in the contract-shape (severity lowercased, title_html, etc.). Distinct from the legacy report_data.findings_by_app non-contract passthrough."
+    },
+    "line_drilldown_runs": {
+      "type": ["array", "null"],
+      "description": "Phase 2 line-profile runs (renamed Line-Level Drilldown in Phase J.16). [{number, status, total_ms_display, timestamp, picks, functions}, ...]."
+    },
+    "line_drilldown_html": {
+      "type": ["string", "null"],
+      "description": "Pre-rendered server-side HTML for the Line-Level Drilldown panel."
+    },
+    "action_plan": {
+      "type": ["array", "null"],
+      "description": "Recommended action plan. Each item {number, title_html, description_html, savings_display, savings_label, callsite}."
+    },
+    "waterfall": {
+      "type": ["array", "null"],
+      "description": "Per-action waterfall rows. Each item {width_pct, kind, is_hot_text, duration_display}."
+    },
+    "actions": {
+      "type": ["array", "null"],
+      "description": "Per-action breakdown rows for user-code actions. Each item contains contract shape + legacy spread fields."
+    },
+    "actions_framework": {
+      "type": ["array", "null"],
+      "description": "Non-contract pragmatic addition: framework-code actions. Same shape as ``actions``."
+    },
+    "background_jobs": {
+      "type": ["array", "null"],
+      "description": "Per-RQ-job rows. Mirrors ``actions`` shape."
+    },
+    "background_jobs_framework": {
+      "type": ["array", "null"],
+      "description": "Non-contract pragmatic addition: framework RQ jobs."
+    },
+    "background_jobs_summary": {
+      "type": ["object", "null"],
+      "description": "Non-contract aggregates: {count, total_ms, total_queries, any_findings_counted, framework_count}."
+    },
+    "doc_events": {
+      "type": ["object", "array", "null"],
+      "description": "Doc-event lifecycle. {doctypes: [{methods, hooks}, ...]} on populated sessions; empty list when no doc events were captured (renderer treats both as 'no panel')."
+    },
+    "resource": {
+      "type": ["object", "null"],
+      "description": "Server resource cards. {cards: [...]} with 4 KPI-style cards."
+    },
+    "frontend": {
+      "type": ["object", "null"],
+      "description": "Frontend timings. {kpis, xhrs, web_vitals}."
+    },
+    "hot_frames": {
+      "type": ["array", "null"],
+      "description": "User-code hot frames. Contract folds the framework split into a flat list with is_user_code flag."
+    },
+    "hot_frames_framework": {
+      "type": ["array", "null"],
+      "description": "Pragmatic split: framework-only hot frames."
+    },
+    "slow_queries": {
+      "type": ["array", "null"],
+      "description": "Top slow queries. Items carry SQL strings post-redaction (Phase K)."
+    },
+    "slow_queries_framework": {
+      "type": ["array", "null"],
+      "description": "Framework-app slow queries; pragmatic split."
+    },
+    "db": {
+      "type": ["object", "null"],
+      "description": "DB-tables section. {tables, index_recommendations}."
+    },
+    "how_to_read_items": {
+      "type": ["array", "null"],
+      "description": "How-to-read-this-report help items."
+    },
+    "footer": {
+      "type": ["object", "null"],
+      "description": "Footer settings dump. {framework, settings}."
+    },
+    "large_duration_threshold_ms": {
+      "type": ["number", "null"],
+      "description": "Threshold above which timings are rendered with the .time-high accent (default 1000)."
+    }
+  },
+  "additionalProperties": true
+}

@@ -8,6 +8,12 @@ Like ``test_backfill_ai_fixes_api.py`` this is a source-inspection test (the
 endpoint needs a live bench for a true integration run): we pin the contract —
 whitelisted, permission-gated, Ready-only, AI-enabled guard, re-fetches the
 recordings, calls ``ai_fix.humanize_steps``, persists ``notes``, re-renders.
+
+The internal mechanics (recording fetch, action build, LLM call, notes
+persist) were extracted into ``_humanize_steps_core`` so the new
+``refill_ai_suggestions`` endpoint can re-use them; the endpoint-level
+checks still cover the validation envelope, and the helper-level checks
+pin the mechanical moves.
 """
 
 import os
@@ -57,25 +63,35 @@ def test_ai_enabled_guard():
 
 
 def test_fetches_recordings_and_builds_actions():
-	body = _fn_body("humanize_steps")
+	# Moved into ``_humanize_steps_core`` so the new
+	# ``refill_ai_suggestions`` endpoint can re-use the same logic.
+	body = _fn_body("_humanize_steps_core")
 	assert "_fetch_recordings(" in body
 	assert "_actions_for_humanizer(" in body
 
 
 def test_calls_humanizer_and_converts_error():
-	body = _fn_body("humanize_steps")
-	assert "ai_fix.humanize_steps(" in body
-	assert "ai_fix.AiFixError" in body
-	assert "frappe.throw(str(e))" in body
+	# The LLM call moved into ``_humanize_steps_core`` (returns a status
+	# dict on AiFixError instead of throwing); the endpoint still
+	# converts a non-updated status into a ``frappe.throw`` so the
+	# legacy contract is preserved end-to-end.
+	core_body = _fn_body("_humanize_steps_core")
+	assert "ai_fix.humanize_steps(" in core_body
+	assert "ai_fix.AiFixError" in core_body
+	endpoint_body = _fn_body("humanize_steps")
+	assert "frappe.throw(reason)" in endpoint_body
 
 
 def test_persists_notes_and_re_renders():
-	body = _fn_body("humanize_steps")
-	assert 'frappe.db.set_value(' in body
-	assert '"notes"' in body
-	assert "_assemble_humanized_notes(" in body
+	# Persistence moved into ``_humanize_steps_core``; the final
+	# re-render stays at the endpoint level.
+	core_body = _fn_body("_humanize_steps_core")
+	assert 'frappe.db.set_value(' in core_body
+	assert '"notes"' in core_body
+	assert "_assemble_humanized_notes(" in core_body
 	# v0.6.x: explicit commits now route through ``safe_commit`` (rollback
 	# guard added in the audit-response round). The intent — commit after
 	# the set_value — is preserved.
-	assert ("frappe.db.commit()" in body) or ("safe_commit()" in body)
-	assert "regenerate_reports(session_uuid)" in body
+	assert ("frappe.db.commit()" in core_body) or ("safe_commit()" in core_body)
+	endpoint_body = _fn_body("humanize_steps")
+	assert "regenerate_reports(session_uuid)" in endpoint_body

@@ -200,6 +200,50 @@ def _sweep_old_sessions():
 		order_by="started_at asc",
 	)
 
+	# Phase K hardening: if this batch is at the per-run cap, the
+	# retention sweep may be falling behind the recording rate. Count
+	# the remaining stale sessions and stash an operator-visible
+	# backlog metric so monitoring catches the drift before the
+	# Optimus Session table grows unbounded.
+	if len(old) >= MAX_DELETIONS_PER_RUN:
+		try:
+			remaining = frappe.db.count(
+				"Optimus Session",
+				filters={
+					"status": ["in", ["Ready", "Failed"]],
+					"started_at": ["<", cutoff],
+				},
+			)
+		except Exception:
+			remaining = None
+		backlog = max(0, (remaining or 0) - len(old))
+		try:
+			frappe.cache.set_value(
+				"optimus:retention_backlog",
+				backlog,
+				expires_in_sec=3600,
+			)
+		except Exception:
+			pass
+		try:
+			frappe.logger().warning(
+				f"optimus janitor: MAX_DELETIONS_PER_RUN ({MAX_DELETIONS_PER_RUN}) "
+				f"hit; ~{backlog} stale session(s) remain after this batch"
+			)
+		except Exception:
+			pass
+	else:
+		# Backlog cleared - reset the counter so monitoring sees the
+		# recovery on the next pass.
+		try:
+			frappe.cache.set_value(
+				"optimus:retention_backlog",
+				0,
+				expires_in_sec=3600,
+			)
+		except Exception:
+			pass
+
 	# v0.6.x: preload File names for every candidate URL in ONE bulk fetch
 	# (was a per-URL get_value inside the outer loop → O(rows × urls/row)
 	# round-trips). Map url → File doc name; missing entries simply yield

@@ -61,6 +61,8 @@ After install, an **Optimus User** role is created automatically. All existing S
 
 > **Note for v0.5.x / v0.6.x users:** no in-place upgrade path is supported. `optimus` 0.7.0 is fresh-deploy only — see the CHANGELOG's `Install` section under the v0.7.0 entry.
 
+> **After every upgrade:** run `bench restart` so the new sign / verify code loads. Sessions captured **before** the restart have null call trees on their actions — their Phase-2 picker dialog opens with a yellow "No curated functions available" callout pointing this out. Capture a fresh session after the restart for a working picker.
+
 ---
 
 ## 60-second quickstart
