@@ -21,6 +21,7 @@ developer can manually retry the analyze.
 import html
 import json
 import os
+import re
 import time
 from collections import OrderedDict
 
@@ -365,6 +366,46 @@ def _short_exc(exc_info) -> str | None:
 	return lines[-1][:500] if lines else None
 
 
+def _rq_dt_to_db(dt):
+	"""RQ exposes ``started_at`` / ``ended_at`` as timezone-aware UTC datetimes;
+	``str()`` of one yields ``'...+00:00'`` and MariaDB's DATETIME column rejects
+	the tz offset (err 1292 — it crashed the whole report persist). Convert to
+	the site's system timezone and format naive (matching ``session.record_job``'s
+	``enqueued_at``), so it stores cleanly and reads consistently. Falls back to a
+	tz-stripped string if the frappe context can't resolve the system timezone."""
+	if not dt:
+		return None
+	try:
+		from frappe.utils import convert_utc_to_system_timezone, get_datetime_str
+
+		return get_datetime_str(convert_utc_to_system_timezone(dt))
+	except Exception:
+		try:
+			return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")
+		except Exception:
+			return None
+
+
+_TZ_OFFSET_RE = re.compile(r"([+-]\d{2}:?\d{2}|Z)$")
+
+
+def _db_datetime_str(val):
+	"""Make a datetime *string* MariaDB-safe by stripping any trailing tz offset
+	(``+00:00`` / ``+0000`` / ``-05:30`` / ``Z``); MariaDB's DATETIME column
+	rejects an offset (err 1292). New captures are already clean via
+	``_rq_dt_to_db``; this guards the DB-write boundary against values stored in
+	Redis by an older build (``str()`` of a tz-aware datetime), so re-analyzing a
+	pre-fix session persists instead of crashing again. A naive string (the date
+	uses ``-`` only internally, never at the end) passes through unchanged.
+	Returns None for an empty value."""
+	if not val:
+		return None
+	s = str(val).strip()
+	if not s:
+		return None
+	return _TZ_OFFSET_RE.sub("", s) or None
+
+
 def _capture_job_terminal_status(session_uuid: str, job_id: str) -> None:
 	"""Read a now-inactive RQ job's terminal status + timing and record it on
 	the session's job-meta hash, so analyze can persist it (Completed / Failed /
@@ -399,8 +440,8 @@ def _capture_job_terminal_status(session_uuid: str, job_id: str) -> None:
 			session_uuid, job_id,
 			status=status,
 			error=error,
-			started_at=str(started) if started else None,
-			ended_at=str(ended) if ended else None,
+			started_at=_rq_dt_to_db(started),
+			ended_at=_rq_dt_to_db(ended),
 			duration_ms=duration_ms,
 		)
 	except Exception:
@@ -1558,13 +1599,19 @@ def _persist(
 		for _jm in session.get_jobs(context.session_uuid):
 			try:
 				doc.append("background_jobs", {
-					"job_id": _jm.get("job_id") or "",
-					"method": _jm.get("method") or "",
+					# method / job_id are Data(140) and come from external sources
+					# (the enqueue call, RQ): cap them so an unusually long value
+					# can't raise a "Data too long" insert error and sink the whole
+					# report save (the datetimes are already DB-safe via _rq_dt_to_db).
+					"job_id": (_jm.get("job_id") or "")[:140],
+					"method": (_jm.get("method") or "")[:140],
 					"status": _jm.get("status") or "Running",
 					"error": (_jm.get("error") or "") or None,
-					"enqueued_at": _jm.get("enqueued_at"),
-					"started_at": _jm.get("started_at"),
-					"ended_at": _jm.get("ended_at"),
+					# DB-safety guard: strip any tz offset a pre-fix build may have
+					# stored in Redis, so MariaDB's DATETIME column accepts them.
+					"enqueued_at": _db_datetime_str(_jm.get("enqueued_at")),
+					"started_at": _db_datetime_str(_jm.get("started_at")),
+					"ended_at": _db_datetime_str(_jm.get("ended_at")),
 					"duration_ms": _jm.get("duration_ms") or 0,
 					"recording_uuid": _jm.get("recording_uuid") or "",
 				})
