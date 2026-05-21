@@ -84,12 +84,16 @@ class TestRenderPhase2PanelSingleRun:
 
 		assert "literal_value" in html
 
-	def test_zero_invocation_function_shows_warning(self):
+	def test_zero_invocation_function_listed_in_not_exercised_note(self):
+		# v0.7.x: no per-function "never invoked" panel (it bloated the
+		# drilldown). Uninvoked picks collapse into one concise note.
 		session = self._session([_function("my_app.never_runs", [])])
 
 		html = renderer._render_phase2_panel(session)
 
-		assert "never invoked" in html.lower()
+		assert "never invoked" not in html.lower()
+		assert "not exercised" in html.lower()
+		assert "my_app.never_runs" in html
 
 
 class TestRenderPhase2PanelDiff:

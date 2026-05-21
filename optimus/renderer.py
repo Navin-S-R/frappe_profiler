@@ -1620,6 +1620,13 @@ def _group_findings_by_root_cause(findings: list[dict]) -> list[dict]:
 	return result
 
 
+def _phase2_invoked(fn: dict) -> bool:
+	"""Whether a picked phase-2 function actually ran (≥1 line with hits or
+	time). Reuses the analyzer's canonical check so render + analyze agree."""
+	from optimus.line_profile.analyzer import _function_invoked
+	return _function_invoked(fn)
+
+
 def _render_phase2_function_table(fn: dict) -> str:
 	"""Per-function line table inside one phase-2 run.
 
@@ -1645,6 +1652,12 @@ def _render_phase2_function_table(fn: dict) -> str:
 	file_path = fn.get("file", "")
 	source = fn.get("source") or "curated"
 
+	# v0.7.x: a picked function that never ran (no lines, or all hits/total
+	# zero) renders nothing — the caller folds it into one "Not exercised in
+	# this pass" note instead of a noisy empty per-line table.
+	if not _phase2_invoked(fn):
+		return ""
+
 	is_descendant = source == "auto_expand"
 	indent_cls = " indent-1" if is_descendant else ""
 	header_prefix = (
@@ -1656,14 +1669,6 @@ def _render_phase2_function_table(fn: dict) -> str:
 		f'<div class="fn-name">{header_prefix}{_e(dotted)}</div>',
 		f'<div class="fn-path">{_e(file_path)}</div>',
 	]
-
-	if not rows:
-		html.append(
-			'<div class="picks"><em>'
-			'Function was instrumented but never invoked during phase 2.'
-			'</em></div></div>'
-		)
-		return "".join(html)
 
 	html.append(
 		'<table class="line-prof">'
@@ -1887,8 +1892,20 @@ def _render_line_drilldown_panel(session_doc: Any) -> str:
 			'</div>'
 			f'<div class="picks"><em>Picks:</em> {picks_summary or "-"}</div>'
 		)
+		# Render only functions that actually ran; collapse the rest into one
+		# concise note so the drilldown isn't padded with empty zero-hit tables.
+		not_exercised = []
 		for fn in run.get("functions", []):
-			html.append(_render_phase2_function_table(fn))
+			if _phase2_invoked(fn):
+				html.append(_render_phase2_function_table(fn))
+			else:
+				not_exercised.append(fn.get("dotted_path", "?"))
+		if not_exercised:
+			html.append(
+				'<div class="picks"><em>Not exercised in this pass:</em> '
+				+ ", ".join(_e(p) for p in not_exercised)
+				+ '</div>'
+			)
 		html.append('</div>')
 
 	if diffs:
