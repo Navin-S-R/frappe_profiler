@@ -535,9 +535,27 @@ def _auto_arm_phase2(docname: str, context) -> None:
 		doc.flags.ignore_validate_update_after_submit = True
 		doc.save(ignore_permissions=True)
 		safe_commit()
+
+		# Auto-arm runs server-side during analyze, when the user isn't on the
+		# form — tell them a pass is armed and what to do next (re-run + Stop),
+		# since arming alone does nothing until the flow re-executes.
+		functions = [r["dotted_path"].rsplit(".", 1)[-1] for r in eligible][:5]
+		try:
+			frappe.publish_realtime(
+				"optimus_phase2_armed",
+				{
+					"docname": docname,
+					"run_uuid": run_uuid,
+					"count": len(eligible),
+					"functions": functions,
+				},
+				user=user,
+			)
+		except Exception:
+			pass
 		frappe.logger().info(
 			f"optimus: auto-armed phase-2 pass {run_uuid} for {docname} "
-			f"({len(eligible)} function(s)) — re-run the flow to capture line data."
+			f"({len(eligible)} function(s)) — re-run the flow + Stop to capture line data."
 		)
 	except Exception:
 		# Never let auto-arm break a finished analyze.

@@ -411,7 +411,10 @@ def _sweep_stale_phase2_runs():
 				{
 					"status": "Failed",
 					"warnings_json": frappe.as_json([
-						"Phase 2 run stuck in Recording — auto-stopped by janitor.",
+						"Phase 2 run expired before any line data was captured "
+						"(no flow re-run within the window) — auto-stopped by "
+						"janitor. To retry: click \"Run Line-Profile Pass\", "
+						"re-run your flow, then \"Stop Phase 2 Run\".",
 					]),
 					"ended_at": now_datetime(),
 				},
