@@ -762,6 +762,9 @@ def render(
 	# finding's origin function down to the deepest user-code frame. Lets
 	# non-LLM users see the same actionable chain the AI narrative produces.
 	_attach_drilldown_chains(all_findings, actions, tracked_apps=tracked_apps)
+	# v0.7.x: self-time hot paths with no deeper user frame show the whole
+	# function body (Phase-1 can't pinpoint the line; the function is the unit).
+	_expand_self_time_snippets(all_findings, file_cache=_finding_file_cache)
 	# v0.7.x: re-anchor each finding's smoking-gun snippet on the deepest
 	# user-code frame of its drill-down chain (when the chain points at a
 	# different function than the wrapper). Must run AFTER
@@ -3118,6 +3121,97 @@ def _read_source_snippet(
 				content = content[:limit] + "..."
 			snippet.append({"lineno": n, "content": content})
 	return snippet or None
+
+
+def _read_function_body_snippet(
+	filename: str,
+	def_lineno,
+	*,
+	cache: dict | None = None,
+	max_lines: int = 40,
+) -> list[dict] | None:
+	"""v0.7.x: read a whole function body — from its ``def`` line to the end
+	of the function — as ``[{lineno, content}]`` (same shape as
+	``_read_source_snippet``). Used for self-time hot-path findings with no
+	deeper user-code frame: Phase-1 sampling can't pinpoint the hot line, but
+	the function is the relevant unit, so show all of it rather than a ±2-line
+	peek. The function ends at the first non-blank line indented at or below
+	the ``def``'s indentation (next def/class/module statement); capped at
+	``max_lines``. Returns ``None`` when the file isn't readable / lineno is
+	out of range."""
+	try:
+		ln = int(def_lineno)
+	except (TypeError, ValueError):
+		return None
+	if ln <= 0 or not filename:
+		return None
+
+	if cache is not None and filename in cache:
+		lines = cache[filename]
+	else:
+		resolved = _resolve_source_path(filename)
+		try:
+			with open(resolved, encoding="utf-8") as fh:
+				lines = fh.read().splitlines()
+		except Exception:
+			lines = None
+		if cache is not None:
+			cache[filename] = lines
+
+	if not lines or ln > len(lines):
+		return None
+
+	limit = _SNIPPET_TRUNCATE_CHARS
+
+	def _row(idx: int) -> dict:
+		content = lines[idx - 1]
+		if len(content) > limit:
+			content = content[:limit] + "..."
+		return {"lineno": idx, "content": content}
+
+	def_line = lines[ln - 1]
+	def_indent = len(def_line) - len(def_line.lstrip())
+
+	out = [_row(ln)]
+	n = ln + 1
+	while n <= len(lines) and len(out) < max_lines:
+		raw = lines[n - 1]
+		if raw.strip():
+			indent = len(raw) - len(raw.lstrip())
+			if indent <= def_indent:
+				break  # dedented to def level — function (and decorators) ended
+		out.append(_row(n))
+		n += 1
+	return out or None
+
+
+def _expand_self_time_snippets(findings, *, file_cache: dict | None = None) -> None:
+	"""v0.7.x: for self-time hot-path findings with no deeper user-code frame
+	(empty ``drilldown_chain``), replace the ±2-line callsite snippet with the
+	whole function body so the developer can read the hot code directly.
+
+	Runs AFTER ``_attach_drilldown_chains`` (which populates ``drilldown_chain``)
+	and mutates findings in place. Best-effort: only the empty-list case (a
+	deeper chain means the ±2 window + chain is enough; a missing key means the
+	chain was never computed); leaves the existing snippet when the body can't
+	be read."""
+	for finding in findings or []:
+		if (finding.get("finding_type") or "") != "Slow Hot Path":
+			continue
+		detail = finding.get("technical_detail") or {}
+		# Only when a chain was attempted AND came back empty (no deeper frame).
+		if detail.get("drilldown_chain") != []:
+			continue
+		callsite = detail.get("callsite") or {}
+		fn = callsite.get("filename")
+		ln = callsite.get("lineno")
+		if not fn or ln is None:
+			continue
+		body = _read_function_body_snippet(fn, ln, cache=file_cache)
+		if body:
+			callsite["source_snippet"] = body
+			detail["callsite"] = callsite
+			finding["technical_detail"] = detail
 
 
 def _action_dotted_entry(action) -> str | None:
