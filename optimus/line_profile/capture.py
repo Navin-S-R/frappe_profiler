@@ -394,6 +394,35 @@ def release_monitoring_tool() -> None:
 		pass
 
 
+def disengage_monitoring() -> None:
+	"""Stop line-trace overhead *without* unseating line_profiler — zero tool 2's
+	events but leave the tool registered.
+
+	This is the watchdog's disengage (vs ``release_monitoring_tool``'s full free).
+	The distinction is load-bearing: ``free_tool_id`` from the watchdog's *timer
+	thread*, while the request thread's profiler is still active, yanks tool 2 out
+	from under line_profiler's shared manager. Its own ``disable_by_count`` then
+	raises ``ValueError: tool 2 is not in use`` and leaves a half-torn-down
+	``LineProfiler`` whose weakref finalizer later fires ``handle_raise_event``
+	with the interpreter's ``sys`` torn down → ``'NoneType' object has no
+	attribute 'monitoring'``, which PEP 669 can surface into a live request and
+	break the user's submit. Zeroing events stops the overhead (observe, don't
+	spoil the flow) while keeping the manager consistent, so the request thread's
+	``disable_by_count`` still does the real, clean teardown.
+
+	Idempotent + version-safe: no-op on Python < 3.12 and when tool 2 isn't ours."""
+	mon = getattr(sys, "monitoring", None)
+	if mon is None:
+		return
+	try:
+		pid = mon.PROFILER_ID
+		if mon.get_tool(pid) != "line_profiler":
+			return
+		mon.set_events(pid, 0)
+	except Exception:
+		pass
+
+
 # ---------------------------------------------------------------------------
 # Overhead budget — observe without spoiling the flow
 # ---------------------------------------------------------------------------
@@ -439,10 +468,13 @@ def clear_budget_hit(run_uuid: str) -> None:
 
 def _disengage_run(run_uuid: str) -> None:
 	"""Watchdog callback: stop line tracing so the request finishes at its
-	natural speed, and flag the run as budget-truncated. Runs on a timer
-	thread; ``release_monitoring_tool`` is the same safe teardown after_request
-	uses, so it's race-tolerant + idempotent."""
-	release_monitoring_tool()
+	natural speed, and flag the run as budget-truncated. Runs on a timer thread,
+	so it uses ``disengage_monitoring`` (zero events) — NOT ``release_monitoring_tool``
+	(free the tool): freeing tool 2 out from under the request thread's still-active
+	profiler desyncs line_profiler's manager and orphans it (see
+	``disengage_monitoring``). The request thread's own ``disable_by_count`` does
+	the real teardown afterward."""
+	disengage_monitoring()
 	mark_budget_hit(run_uuid)
 
 
