@@ -13,9 +13,9 @@ worker dies. M3 dedups duplicate analyze enqueues for the same session.
 import inspect
 import types
 
+import frappe
 import pytest
 
-import frappe
 from optimus import analyze
 
 

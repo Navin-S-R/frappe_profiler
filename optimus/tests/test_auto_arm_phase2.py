@@ -10,12 +10,11 @@ for replay-safe flows). Heavily guarded and best-effort (never fails analyze).
 """
 
 import inspect
-import sys
 import types
 
+import frappe
 import pytest
 
-import frappe
 from optimus import analyze
 
 

@@ -14,11 +14,10 @@ import inspect
 import os
 import types
 
+import frappe
 import pytest
 
-import frappe
 from optimus import analyze
-
 
 # ---------------------------------------------------------------------------
 # M5 — os.nice
