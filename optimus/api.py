@@ -1765,6 +1765,24 @@ def get_installed_apps_for_tracking() -> list[str]:
 	return [app for app in apps if app != "optimus"]
 
 
+@frappe.whitelist()
+def get_config_profiles() -> dict:
+	"""Return the named Sensitivity Profile presets for the Optimus Settings
+	form. The ``config_profile`` change handler reads this so the threshold
+	field values it fills come from the single source of truth in
+	``optimus.settings._PROFILES`` (never hardcoded in JS).
+
+	Restricted to System Manager since Optimus Settings itself is.
+	"""
+	if "System Manager" not in (frappe.get_roles() or []):
+		frappe.throw(
+			"Only System Manager can read the Optimus sensitivity profiles."
+		)
+	from optimus import settings
+	# Plain dict of dicts — JSON-serializable as-is for the whitelist response.
+	return {name: dict(values) for name, values in settings._PROFILES.items()}
+
+
 # ---------------------------------------------------------------------------
 # Phase-2 line profiler API
 # ---------------------------------------------------------------------------

@@ -579,6 +579,8 @@ def render(
 				getattr(_cfg, "min_action_duration_ms", 0.0) or 0.0
 			),
 			"large_duration_threshold_ms": _large_duration_threshold_ms,
+			# v0.7.x: which Sensitivity Profile drove the thresholds for this render.
+			"config_profile": getattr(_cfg, "config_profile", "Custom"),
 		}
 	except Exception:
 		_ai_findings_on = _ai_indexes_on = True
@@ -592,6 +594,7 @@ def render(
 			"ai_suggest_indexes": True,
 			"min_action_duration_ms": 0.0,
 			"large_duration_threshold_ms": 1000.0,
+			"config_profile": "Custom",
 		}
 	# v0.6.x: Jinja-callable that formats a duration with the configured
 	# threshold. Closures over the resolved threshold so templates can just

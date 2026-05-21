@@ -9,6 +9,22 @@
 // which Frappe re-creates whenever the form rebinds. Setting options
 // on refresh survives reloads and "refresh" Ctrl-S cycles.
 
+// The nine detection-sensitivity threshold fields the Sensitivity Profile
+// governs. Kept in sync with optimus.settings._SENSITIVITY_KEYS — the preset
+// numbers themselves are NOT duplicated here; they're fetched at runtime from
+// optimus.api.get_config_profiles (single source of truth in settings.py).
+const OPTIMUS_SENSITIVITY_FIELDS = [
+	"redundant_doc_threshold",
+	"redundant_cache_threshold",
+	"redundant_perm_threshold",
+	"n_plus_one_min_occurrences",
+	"slow_query_threshold_ms",
+	"slow_hot_path_pct_threshold",
+	"slow_hot_path_min_ms",
+	"hot_line_high_pct",
+	"hot_line_high_min_ms",
+];
+
 frappe.ui.form.on("Optimus Settings", {
 	refresh(frm) {
 		frm.set_intro(
@@ -83,6 +99,40 @@ frappe.ui.form.on("Optimus Settings", {
 				});
 			});
 		}
+	},
+
+	config_profile(frm) {
+		// Sensitivity Profile changed. Under a named preset (Strict /
+		// Recommended / Relaxed) the threshold fields are read-only and the
+		// preset drives analysis at read time — but we ALSO fill the fields
+		// with the preset numbers so the operator can see what they're getting
+		// (and so they become the starting point if they later pick Custom).
+		// On Custom we just unlock the fields and leave their current values.
+		const profile = frm.doc.config_profile;
+		const refresh_fields = () =>
+			OPTIMUS_SENSITIVITY_FIELDS.forEach((f) => frm.refresh_field(f));
+
+		if (!profile || profile === "Custom") {
+			refresh_fields();
+			return;
+		}
+
+		frappe.call({
+			method: "optimus.api.get_config_profiles",
+			callback(r) {
+				const preset = (r && r.message && r.message[profile]) || null;
+				if (preset) {
+					OPTIMUS_SENSITIVITY_FIELDS.forEach((f) => {
+						if (preset[f] !== undefined) {
+							frm.set_value(f, preset[f]);
+						}
+					});
+				}
+				// Re-evaluate read_only_depends_on regardless, so the fields
+				// lock immediately without a save + reload.
+				refresh_fields();
+			},
+		});
 	},
 
 	ai_enabled(frm) {

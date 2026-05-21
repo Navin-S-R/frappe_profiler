@@ -35,6 +35,9 @@
   "column_break_display_filters",
   "large_duration_threshold_ms",
   "analysis_tab",
+  "sensitivity_section",
+  "sensitivity_description",
+  "config_profile",
   "thresholds_section",
   "thresholds_description",
   "redundant_doc_threshold",
@@ -244,6 +247,24 @@
    "label": "Analysis"
   },
   {
+   "fieldname": "sensitivity_section",
+   "fieldtype": "Section Break",
+   "label": "Sensitivity Profile"
+  },
+  {
+   "fieldname": "sensitivity_description",
+   "fieldtype": "HTML",
+   "options": "<p class=\"text-muted small\">Pick a preset to set every detection threshold below in one move. <b>Strict</b> catches more (more findings, more noise); <b>Relaxed</b> catches less; <b>Recommended</b> is the shipped default and automatically tracks future tuning. Choose <b>Custom</b> to edit the individual thresholds yourself — they stay locked under the named presets. Display filters, Phase-2, capture, retention and AI settings are not affected by the profile.</p>"
+  },
+  {
+   "default": "Recommended",
+   "description": "Detection-sensitivity preset for the thresholds below. Named presets (Strict / Recommended / Relaxed) drive the thresholds at analysis time and keep the individual fields read-only. Recommended tracks the shipped defaults across upgrades. Switch to Custom to hand-tune.",
+   "fieldname": "config_profile",
+   "fieldtype": "Select",
+   "label": "Sensitivity Profile",
+   "options": "Strict\nRecommended\nRelaxed\nCustom"
+  },
+  {
    "fieldname": "thresholds_section",
    "fieldtype": "Section Break",
    "label": "Analyzer Thresholds"
@@ -259,7 +280,8 @@
    "fieldname": "redundant_doc_threshold",
    "fieldtype": "Int",
    "label": "Redundant get_doc Threshold",
-   "non_negative": 1
+   "non_negative": 1,
+   "read_only_depends_on": "eval:doc.config_profile != \"Custom\""
   },
   {
    "default": "50",
@@ -267,7 +289,8 @@
    "fieldname": "redundant_cache_threshold",
    "fieldtype": "Int",
    "label": "Redundant Cache Lookup Threshold",
-   "non_negative": 1
+   "non_negative": 1,
+   "read_only_depends_on": "eval:doc.config_profile != \"Custom\""
   },
   {
    "fieldname": "column_break_thresholds",
@@ -279,7 +302,8 @@
    "fieldname": "redundant_perm_threshold",
    "fieldtype": "Int",
    "label": "Redundant Permission Check Threshold",
-   "non_negative": 1
+   "non_negative": 1,
+   "read_only_depends_on": "eval:doc.config_profile != \"Custom\""
   },
   {
    "default": "10",
@@ -287,7 +311,8 @@
    "fieldname": "n_plus_one_min_occurrences",
    "fieldtype": "Int",
    "label": "N+1 Minimum Occurrences",
-   "non_negative": 1
+   "non_negative": 1,
+   "read_only_depends_on": "eval:doc.config_profile != \"Custom\""
   },
   {
    "fieldname": "severity_section",
@@ -305,7 +330,8 @@
    "fieldname": "slow_query_threshold_ms",
    "fieldtype": "Float",
    "label": "Slow Query Threshold (ms)",
-   "non_negative": 1
+   "non_negative": 1,
+   "read_only_depends_on": "eval:doc.config_profile != \"Custom\""
   },
   {
    "default": "25",
@@ -313,7 +339,8 @@
    "fieldname": "slow_hot_path_pct_threshold",
    "fieldtype": "Float",
    "label": "Slow Hot Path Threshold (% of action wall time)",
-   "non_negative": 1
+   "non_negative": 1,
+   "read_only_depends_on": "eval:doc.config_profile != \"Custom\""
   },
   {
    "default": "200",
@@ -321,7 +348,8 @@
    "fieldname": "slow_hot_path_min_ms",
    "fieldtype": "Float",
    "label": "Slow Hot Path Minimum (ms)",
-   "non_negative": 1
+   "non_negative": 1,
+   "read_only_depends_on": "eval:doc.config_profile != \"Custom\""
   },
   {
    "fieldname": "column_break_severity",
@@ -333,7 +361,8 @@
    "fieldname": "hot_line_high_pct",
    "fieldtype": "Float",
    "label": "Hot Line High Severity (% of function time)",
-   "non_negative": 1
+   "non_negative": 1,
+   "read_only_depends_on": "eval:doc.config_profile != \"Custom\""
   },
   {
    "default": "100",
@@ -341,7 +370,8 @@
    "fieldname": "hot_line_high_min_ms",
    "fieldtype": "Float",
    "label": "Hot Line High Severity Min (ms)",
-   "non_negative": 1
+   "non_negative": 1,
+   "read_only_depends_on": "eval:doc.config_profile != \"Custom\""
   },
   {
    "fieldname": "phase2_section",
