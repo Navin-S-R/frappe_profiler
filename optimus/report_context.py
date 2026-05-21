@@ -920,6 +920,8 @@ def _build_footer(render_config) -> dict:
 	tracked = rc.get("tracked_apps") or ()
 	ignored = rc.get("ignored_apps") or ()
 	parts = [
+		# v0.7.x: which Sensitivity Profile drove the thresholds for this render.
+		f"config_profile={rc.get('config_profile') or 'Custom'}",
 		f"hide_framework_tables={'on' if rc.get('hide_framework_tables') else 'off'}",
 		f"tracked_apps={', '.join(tracked) if tracked else '(none)'}",
 		f"ignored_apps={', '.join(ignored) if ignored else '(none)'}",

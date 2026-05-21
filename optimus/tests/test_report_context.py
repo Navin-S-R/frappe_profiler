@@ -592,6 +592,18 @@ class TestFooterShape:
 		out = build_report_context(_doc(), _ctx())
 		assert out["footer"]["framework"] == "Frappe v16"
 
+	def test_footer_records_config_profile(self):
+		"""v0.7.x: the footer stamps which Sensitivity Profile was in effect,
+		so a saved report records the thresholds it was rendered under."""
+		rc = {"config_profile": "Strict"}
+		out = build_report_context(_doc(), _ctx(render_config=rc))
+		assert "config_profile=Strict" in out["footer"]["settings"]
+
+	def test_footer_config_profile_defaults_to_custom(self):
+		"""Absent from render_config (e.g. an older render path) → Custom."""
+		out = build_report_context(_doc(), _ctx(render_config={}))
+		assert "config_profile=Custom" in out["footer"]["settings"]
+
 
 class TestHowToReadItems:
 	def test_omitted_for_now(self):

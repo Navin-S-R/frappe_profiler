@@ -1560,7 +1560,13 @@ def analyze(recordings: list, context) -> AnalyzerResult:
 	node_cap = _conf_int("optimus_tree_node_cap", DEFAULT_TREE_NODE_CAP)
 
 	for action_idx, recording in enumerate(recordings):
-		pyi = recording.get("pyi_session")
+		# v0.7.x (M1): pop, don't get — call_tree is the ONLY consumer of the
+		# raw pyinstrument Session, and holding all recordings' trees in RAM at
+		# once was the dominant analyze-time memory spike (OOM on long flows).
+		# Popping frees each tree as soon as it's reconciled, so peak drops from
+		# "all trees at once" to "one at a time". Covers the pyi-is-None branch
+		# below too. (Guarded by a test that no later analyzer reads pyi_session.)
+		pyi = recording.pop("pyi_session", None)
 		calls = recording.get("calls") or []
 		# Track SQL time even if no pyi tree
 		sql_total_ms += sum(c.get("duration", 0) for c in calls)

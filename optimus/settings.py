@@ -107,6 +107,64 @@ _DEFAULTS = {
 	# everything on. (ai_humanize_steps above is the third one.)
 	"ai_suggest_findings": True,
 	"ai_suggest_indexes": True,
+	# v0.7.x: Sensitivity Profile. "Custom" means "read the per-field stored
+	# values" (the pre-profile behavior). The named presets below override the
+	# nine detection-sensitivity knobs at resolve time. Default is "Custom" so a
+	# pre-profile Single (no config_profile key) keeps its stored thresholds —
+	# see _read_doctype_row's coalesce and the back-compat note in _resolve.
+	"config_profile": "Custom",
+}
+
+# v0.7.x: the nine detection-sensitivity knobs the Sensitivity Profile governs.
+# These are the thresholds that decide whether / at what severity a finding
+# surfaces. NOT included: display filters (min_action_duration_ms,
+# large_duration_threshold_ms), Phase-2 UI knobs (auto_expand_*, phase2_*),
+# capture caps, retention, or AI — those are deployment choices, not detection
+# sensitivity, and stay editable regardless of profile.
+_SENSITIVITY_KEYS = (
+	"redundant_doc_threshold",
+	"redundant_cache_threshold",
+	"redundant_perm_threshold",
+	"n_plus_one_min_occurrences",
+	"slow_query_threshold_ms",
+	"slow_hot_path_pct_threshold",
+	"slow_hot_path_min_ms",
+	"hot_line_high_pct",
+	"hot_line_high_min_ms",
+)
+
+# Named Sensitivity Profiles — the single source of truth for preset numbers
+# (the DocType JS reads this via the get_config_profiles API; tests assert
+# Recommended == _DEFAULTS). "Recommended" mirrors the shipped _DEFAULTS, so a
+# user on Recommended automatically tracks any future retune. "Strict" catches
+# more (lower count/ms thresholds, lower %); "Relaxed" catches less. All values
+# respect the controller's _NUMERIC_FLOORS. "Custom" is intentionally absent —
+# _resolve keys off ``_PROFILES.get(profile)`` so Custom falls through to the
+# stored-value logic. Build Recommended from _DEFAULTS to prevent drift.
+_PROFILES = {
+	"Strict": {
+		"redundant_doc_threshold": 3,
+		"redundant_cache_threshold": 20,
+		"redundant_perm_threshold": 5,
+		"n_plus_one_min_occurrences": 5,
+		"slow_query_threshold_ms": 100.0,
+		"slow_hot_path_pct_threshold": 15.0,
+		"slow_hot_path_min_ms": 100.0,
+		"hot_line_high_pct": 35.0,
+		"hot_line_high_min_ms": 50.0,
+	},
+	"Recommended": {key: _DEFAULTS[key] for key in _SENSITIVITY_KEYS},
+	"Relaxed": {
+		"redundant_doc_threshold": 10,
+		"redundant_cache_threshold": 100,
+		"redundant_perm_threshold": 25,
+		"n_plus_one_min_occurrences": 25,
+		"slow_query_threshold_ms": 500.0,
+		"slow_hot_path_pct_threshold": 40.0,
+		"slow_hot_path_min_ms": 500.0,
+		"hot_line_high_pct": 70.0,
+		"hot_line_high_min_ms": 250.0,
+	},
 }
 
 # Keys we also accept from site_config.json for backwards compatibility
@@ -179,6 +237,12 @@ class OptimusConfig:
 	# v0.6.x: per-section "use the LLM for X" toggles (hard off).
 	ai_suggest_findings: bool = True
 	ai_suggest_indexes: bool = True
+	# v0.7.x: Sensitivity Profile name. "Custom" → the threshold fields above
+	# carry the authoritative values; a named preset (Strict/Recommended/
+	# Relaxed) overrides the nine _SENSITIVITY_KEYS at resolve time. Defaults to
+	# "Custom" so the no-frappe / pre-bench path uses the dataclass threshold
+	# defaults (= Recommended numbers) as-is.
+	config_profile: str = "Custom"
 
 
 _CACHE_KEY = "optimus_settings_cached"
@@ -273,6 +337,11 @@ def _read_doctype_row() -> dict | None:
 		"ai_humanize_steps": bool(doc.get("ai_humanize_steps", 1)),
 		"ai_suggest_findings": bool(doc.get("ai_suggest_findings", 1)),
 		"ai_suggest_indexes": bool(doc.get("ai_suggest_indexes", 1)),
+		# v0.7.x: Sensitivity Profile. Empty / missing (a pre-profile Single
+		# that predates the field, or an unsaved fresh Single) coalesces to
+		# "Custom" so existing stored thresholds keep driving analysis — no
+		# migration patch, no silent reset to Recommended.
+		"config_profile": (doc.get("config_profile") or "Custom"),
 	}
 
 
@@ -338,6 +407,24 @@ def _resolve() -> OptimusConfig:
 			return int(v)
 		return int(_DEFAULTS[key])
 
+	# v0.7.x: Sensitivity Profile. A named preset (Strict/Recommended/Relaxed)
+	# is authoritative for the nine _SENSITIVITY_KEYS — it overrides both the
+	# stored field value and the site_config fallback. "Custom" (or any
+	# unknown/absent value) → preset is None → fall through to the existing
+	# per-field precedence (DocType row > site_config > default).
+	profile = row.get("config_profile") or "Custom"
+	preset = _PROFILES.get(profile)
+
+	def _sens_int(key: str) -> int:
+		if preset is not None:
+			return int(preset[key])
+		return _threshold(key)
+
+	def _sens_float(key: str) -> float:
+		if preset is not None:
+			return float(preset[key])
+		return _float(key)
+
 	return OptimusConfig(
 		enabled=bool(row.get("enabled", _DEFAULTS["enabled"])),
 		session_retention_days=int(
@@ -351,15 +438,16 @@ def _resolve() -> OptimusConfig:
 			else _DEFAULTS["hide_framework_tables"]
 		),
 		max_queries_per_recording=_threshold("max_queries_per_recording"),
-		redundant_doc_threshold=_threshold("redundant_doc_threshold"),
-		redundant_cache_threshold=_threshold("redundant_cache_threshold"),
-		redundant_perm_threshold=_threshold("redundant_perm_threshold"),
-		n_plus_one_min_occurrences=_threshold("n_plus_one_min_occurrences"),
-		slow_query_threshold_ms=_float("slow_query_threshold_ms"),
-		slow_hot_path_pct_threshold=_float("slow_hot_path_pct_threshold"),
-		slow_hot_path_min_ms=_float("slow_hot_path_min_ms"),
-		hot_line_high_pct=_float("hot_line_high_pct"),
-		hot_line_high_min_ms=_float("hot_line_high_min_ms"),
+		# Nine detection-sensitivity knobs — profile-aware (see _sens_* above).
+		redundant_doc_threshold=_sens_int("redundant_doc_threshold"),
+		redundant_cache_threshold=_sens_int("redundant_cache_threshold"),
+		redundant_perm_threshold=_sens_int("redundant_perm_threshold"),
+		n_plus_one_min_occurrences=_sens_int("n_plus_one_min_occurrences"),
+		slow_query_threshold_ms=_sens_float("slow_query_threshold_ms"),
+		slow_hot_path_pct_threshold=_sens_float("slow_hot_path_pct_threshold"),
+		slow_hot_path_min_ms=_sens_float("slow_hot_path_min_ms"),
+		hot_line_high_pct=_sens_float("hot_line_high_pct"),
+		hot_line_high_min_ms=_sens_float("hot_line_high_min_ms"),
 		pyinstrument_sampler_interval_ms=_float("pyinstrument_sampler_interval_ms"),
 		# min_action_duration_ms allows 0 — read directly without the
 		# zero-falls-through helper.
@@ -420,6 +508,7 @@ def _resolve() -> OptimusConfig:
 			if "ai_suggest_indexes" in row
 			else _DEFAULTS["ai_suggest_indexes"]
 		),
+		config_profile=profile,
 	)
 
 
