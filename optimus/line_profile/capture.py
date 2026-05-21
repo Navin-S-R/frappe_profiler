@@ -26,6 +26,7 @@ import importlib
 import inspect
 import json
 import sys
+import threading
 
 from optimus.line_profile import diff
 
@@ -393,6 +394,75 @@ def release_monitoring_tool() -> None:
 		pass
 
 
+# ---------------------------------------------------------------------------
+# Overhead budget — observe without spoiling the flow
+# ---------------------------------------------------------------------------
+# line_profiler does deterministic per-line tracing, so instrumenting a hot
+# loop multiplies its runtime and would freeze the user's request. A watchdog
+# timer disengages tracing after a wall-clock budget so a profiled request can
+# never take more than ~budget longer than its natural time; the partial line
+# data still pinpoints the hot line. See feedback_observe_dont_spoil_flow.
+
+
+def _budget_hit_key(run_uuid: str) -> str:
+	return f"profiler:lp:budget_hit:{run_uuid}"
+
+
+def mark_budget_hit(run_uuid: str) -> None:
+	"""Record that this run's profiling was cut short by the overhead budget,
+	so analyze can flag the line data as partial. Best-effort."""
+	if not _FRAPPE_AVAILABLE or not run_uuid:
+		return
+	try:
+		frappe.cache.set_value(_budget_hit_key(run_uuid), "1", expires_in_sec=3600)
+	except Exception:
+		pass
+
+
+def budget_was_hit(run_uuid: str) -> bool:
+	if not _FRAPPE_AVAILABLE or not run_uuid:
+		return False
+	try:
+		return bool(frappe.cache.get_value(_budget_hit_key(run_uuid)))
+	except Exception:
+		return False
+
+
+def clear_budget_hit(run_uuid: str) -> None:
+	if not _FRAPPE_AVAILABLE or not run_uuid:
+		return
+	try:
+		frappe.cache.delete_value(_budget_hit_key(run_uuid))
+	except Exception:
+		pass
+
+
+def _disengage_run(run_uuid: str) -> None:
+	"""Watchdog callback: stop line tracing so the request finishes at its
+	natural speed, and flag the run as budget-truncated. Runs on a timer
+	thread; ``release_monitoring_tool`` is the same safe teardown after_request
+	uses, so it's race-tolerant + idempotent."""
+	release_monitoring_tool()
+	mark_budget_hit(run_uuid)
+
+
+def start_overhead_watchdog(run_uuid: str, budget_seconds):
+	"""Arm a one-shot timer that disengages line tracing after ``budget_seconds``
+	of wall time. Returns the started ``threading.Timer`` (cancel it in the
+	after_* hook when the request finishes within budget), or None when the
+	budget is disabled (``<= 0``)."""
+	try:
+		budget = float(budget_seconds or 0)
+	except (TypeError, ValueError):
+		budget = 0.0
+	if budget <= 0:
+		return None
+	timer = threading.Timer(budget, _disengage_run, args=(run_uuid,))
+	timer.daemon = True
+	timer.start()
+	return timer
+
+
 def make_profiler(run_uuid: str):
 	"""Build a fresh ``LineProfiler`` with the run's picks attached. Returns
 	None if line_profiler is unavailable, the run has no resolvable picks,
@@ -519,7 +589,7 @@ def cleanup_run(run_uuid: str) -> None:
 	Called at the end of analyze.run_analyze (success or failure) and from
 	the janitor for stale runs."""
 	_require_frappe()
-	for key_fn in (_picks_key, _source_key, _samples_key):
+	for key_fn in (_picks_key, _source_key, _samples_key, _budget_hit_key):
 		try:
 			frappe.cache.delete_value(key_fn(run_uuid))
 		except Exception:

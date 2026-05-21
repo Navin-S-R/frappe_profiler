@@ -595,6 +595,16 @@ def run_analyze(session_uuid: str, run_uuid: str) -> None:
 			# fall back to regex-only pass-through detection.
 			call_trees = []
 		result = analyze(results_json, call_trees=call_trees or None)
+		# Observe, don't spoil: if the overhead watchdog cut tracing short to
+		# protect the user's flow, the line data is partial — say so (read the
+		# flag before cleanup_run clears it below).
+		if capture.budget_was_hit(run_uuid):
+			result.warnings.append(
+				"Line profiling was time-budgeted to avoid freezing the flow, so "
+				"results are partial for the longest-running call(s). Tune "
+				"optimus_phase2_overhead_budget_seconds in site_config (lower = "
+				"snappier flow, higher = fuller data; 0 = unlimited)."
+			)
 		total_ms = sum(s.get("total_ms") or 0 for s in result.aggregate.get("phase2_functions", []))
 
 		# Persist to the run row + propagate findings to the parent session.
