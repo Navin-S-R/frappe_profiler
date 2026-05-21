@@ -499,11 +499,32 @@ def _enqueue_analyze(session_uuid: str, docname: str | None = None) -> bool:
 			)
 		return True
 
+	# v0.7.x (M3): per-session dedup. A stable job_id lets a double-Stop, a
+	# retry racing the janitor, etc. collapse into one analyze job instead of
+	# stacking duplicates (each duplicate ≈ a full extra analyze's RAM). The
+	# self-re-enqueues inside analyze.run (bg-job wait / single-flight) stay
+	# ANONYMOUS by design — a stable id there would block a running job from
+	# enqueuing its own continuation. So the id lives only on this external
+	# enqueue.
+	job_id = f"optimus-analyze-{session_uuid}"
+	try:
+		from frappe.utils.background_jobs import is_job_enqueued
+
+		if is_job_enqueued(job_id):
+			# A job for this session is already queued/started — don't stack
+			# another. The session is still mid-flight (not finalized) → False.
+			return False
+	except Exception:
+		# is_job_enqueued unavailable / errored — fall through and enqueue
+		# (today's behavior); the dedup is best-effort.
+		pass
+
 	frappe.enqueue(
 		"optimus.analyze.run",
 		queue="long",
 		session_uuid=session_uuid,
 		now=False,
+		job_id=job_id,
 	)
 	return False
 

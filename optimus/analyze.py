@@ -20,6 +20,7 @@ developer can manually retry the analyze.
 
 import html
 import json
+import os
 import time
 from collections import OrderedDict
 
@@ -215,6 +216,130 @@ _MAX_BG_JOB_WAIT_SECONDS = 300
 # forever) job from busy-looping our re-enqueues.
 _BG_WAIT_THROTTLE_SECONDS = 2.0
 
+# v0.7.x (M2): global single-flight for the heavy analyze phase. Two analyze
+# jobs running at once roughly DOUBLE peak RAM — the OOM trigger on long flows.
+# A best-effort Redis flag (NOT a held lock) lets only one session do the heavy
+# work at a time; others re-enqueue themselves to yield the worker (mirrors the
+# bg-job wait pattern), so a single-worker bench still makes progress.
+_SINGLEFLIGHT_KEY = "optimus:analyze:inflight"
+# Flag TTL. Heartbeated at each progress milestone in run(); if a worker dies
+# mid-analyze the flag self-heals within this window (no permanent strand).
+_SINGLEFLIGHT_TTL_SECONDS = 300
+# Throttle between polite re-enqueue cycles while another session holds the flag.
+_SINGLEFLIGHT_THROTTLE_SECONDS = 5.0
+# Hard ceiling on how long a session waits for the flag before degrading to the
+# pre-M2 behavior (proceed anyway) rather than waiting forever.
+_SINGLEFLIGHT_MAX_WAIT_SECONDS = 600
+
+
+def _apply_nice() -> None:
+	"""v0.7.x (M5): best-effort — lower this process's CPU scheduling priority
+	so a heavy analyze yields the CPU to live web traffic. A *positive* nice
+	increment never requires privilege. No-op when configured to 0 or on a
+	platform without ``os.nice``. CPU-politeness only, not a memory lever.
+
+	Caller gates this to the async (RQ-worker) path: ``os.nice`` is sticky
+	per-process, so renicing the shared gunicorn worker on the inline path
+	would persist for unrelated later requests."""
+	try:
+		inc = int(frappe.conf.get("optimus_analyze_nice", 5) or 0)
+	except Exception:
+		inc = 0
+	if inc and hasattr(os, "nice"):
+		try:
+			os.nice(inc)
+		except (OSError, ValueError):
+			pass
+
+
+def _touch_singleflight(session_uuid: str) -> None:
+	"""(Re)assert ownership of the single-flight flag and refresh its TTL.
+	Best-effort — a cache hiccup must never fail analyze."""
+	try:
+		frappe.cache.set_value(
+			_SINGLEFLIGHT_KEY, session_uuid, expires_in_sec=_SINGLEFLIGHT_TTL_SECONDS
+		)
+	except Exception:
+		pass
+
+
+def _release_singleflight(session_uuid: str) -> None:
+	"""Release the flag, but only if we still hold it (compare-then-delete) —
+	a TTL-expired-then-reacquired flag belonging to another session must not be
+	clobbered. Best-effort."""
+	try:
+		if frappe.cache.get_value(_SINGLEFLIGHT_KEY) == session_uuid:
+			frappe.cache.delete_value(_SINGLEFLIGHT_KEY)
+	except Exception:
+		pass
+
+
+def _acquire_singleflight(session_uuid: str, docname: str, deadline) -> bool:
+	"""Global single-flight gate for the heavy (memory-hungry) analyze phase.
+
+	Returns:
+	  * ``True``  — proceed with analysis. Either we acquired the flag, or
+	    single-flight doesn't apply (inline path / disabled), or we waited past
+	    the deadline and degrade to the pre-M2 behavior rather than strand.
+	  * ``False`` — another session holds the flag; we re-enqueued ourselves
+	    (anonymously, carrying ``_singleflight_deadline``) to yield the worker.
+	    The caller must ``return`` now.
+
+	Mirrors ``_bg_wait_for_pending_jobs``: re-enqueue + yield, never a held
+	lock. Skipped when the scheduler is disabled (analyze runs inline in a web
+	request — there's no worker to run our re-enqueued self, and inline peak is
+	already bounded by ``optimus_inline_analyze_limit``)."""
+	# Inline path: no worker to yield to — proceed.
+	try:
+		if is_scheduler_disabled():
+			return True
+	except Exception:
+		return True
+
+	try:
+		max_wait = int(frappe.conf.get("optimus_singleflight_max_wait_seconds")
+			or _SINGLEFLIGHT_MAX_WAIT_SECONDS)
+	except Exception:
+		max_wait = _SINGLEFLIGHT_MAX_WAIT_SECONDS
+	if max_wait <= 0:
+		return True  # single-flight disabled by config
+
+	try:
+		holder = frappe.cache.get_value(_SINGLEFLIGHT_KEY)
+	except Exception:
+		return True  # cache unavailable — degrade to pre-M2 behavior
+
+	if not holder or holder == session_uuid:
+		# Free, or already ours (our own self-re-enqueue / heartbeat) — take it.
+		_touch_singleflight(session_uuid)
+		return True
+
+	# Busy with a different session. Respect the wait deadline, else degrade.
+	if deadline is None:
+		deadline = time.time() + max_wait
+	if time.time() >= deadline:
+		return True  # waited long enough — proceed rather than strand
+
+	# Keep the UI honest, throttle, and re-enqueue ourselves to yield the worker.
+	try:
+		frappe.db.set_value("Optimus Session", docname, "status", "Analyzing")
+		safe_commit()
+	except Exception:
+		pass
+	_publish_progress(3, "Waiting for another analysis to finish…", session_uuid)
+	time.sleep(min(_SINGLEFLIGHT_THROTTLE_SECONDS, max(0.0, deadline - time.time())))
+	try:
+		frappe.enqueue(
+			"optimus.analyze.run",
+			queue="long",
+			session_uuid=session_uuid,
+			_singleflight_deadline=deadline,
+		)
+	except Exception:
+		frappe.log_error(title="optimus single-flight re-enqueue")
+		return True  # couldn't re-enqueue — just proceed
+	return False
+
 
 def _rq_job_active(job_id: str) -> bool:
 	"""True if RQ job ``job_id`` is still queued / started / deferred /
@@ -321,7 +446,8 @@ def _bg_wait_for_pending_jobs(session_uuid: str, docname: str, deadline):
 	return None
 
 
-def run(session_uuid: str, _bg_wait_until: float | None = None):
+def run(session_uuid: str, _bg_wait_until: float | None = None,
+	_singleflight_deadline: float | None = None):
 	"""Background-job entry point. Called from api.stop() via frappe.enqueue.
 
 	``_bg_wait_until`` is set only when ``run`` re-enqueues itself while
@@ -333,6 +459,16 @@ def run(session_uuid: str, _bg_wait_until: float | None = None):
 	# if the recording user also has an active profiler session (e.g.
 	# multiple sessions started in sequence) we could recurse.
 	frappe.local.optimus_analyzing = True
+
+	# v0.7.x (M5): de-prioritize this analyze on the async (worker) path so it
+	# doesn't starve live web traffic. Skipped inline (scheduler disabled) —
+	# os.nice is sticky per-process and would de-prioritize the shared gunicorn
+	# worker for unrelated later requests.
+	try:
+		if not is_scheduler_disabled():
+			_apply_nice()
+	except Exception:
+		pass
 
 	docname = frappe.db.get_value("Optimus Session", {"session_uuid": session_uuid}, "name")
 	if not docname:
@@ -353,6 +489,15 @@ def run(session_uuid: str, _bg_wait_until: float | None = None):
 		# disabled / no async worker is available.
 		bg_jobs_unfinished = _bg_wait_for_pending_jobs(session_uuid, docname, _bg_wait_until)
 		if bg_jobs_unfinished is None:
+			return  # re-enqueued — this invocation is done
+
+		# v0.7.x (M2): global single-flight — only one session does the heavy,
+		# memory-hungry analyze at a time so two stops can't stack to ~2× RAM
+		# and OOM the box. If another session holds the flag we re-enqueue
+		# ourselves and yield (skipped on the inline path). Acquired here, before
+		# the big materialization below; heartbeated at the progress milestones;
+		# released in the `finally`.
+		if not _acquire_singleflight(session_uuid, docname, _singleflight_deadline):
 			return  # re-enqueued — this invocation is done
 
 		# Phase: Analyzing
@@ -383,6 +528,7 @@ def run(session_uuid: str, _bg_wait_until: float | None = None):
 			_publish_progress(100, "Complete (no data)", session_uuid)
 			return
 
+		_touch_singleflight(session_uuid)  # M2 heartbeat before the EXPLAIN burst
 		_publish_progress(20, "Running EXPLAIN on queries", session_uuid)
 		enrichment_warnings = _enrich_recordings(recordings)
 
@@ -469,6 +615,15 @@ def run(session_uuid: str, _bg_wait_until: float | None = None):
 			pct = 50 + (25 * (i + 1) / len(analyzers))
 			_publish_progress(pct, f"Ran {analyzer_name.split('.')[-1]}", session_uuid)
 
+		# v0.7.x (M1): call_tree freed each recording's raw pyinstrument tree as
+		# it consumed it. Force a collection now so that memory is returned to
+		# the allocator BEFORE the persist + render phase (the next RAM peak),
+		# instead of waiting for a generational GC cycle. Conf-gated so it can be
+		# turned off if it ever shows up as latency on small sessions.
+		if frappe.conf.get("optimus_analyze_gc_collect", True):
+			import gc
+			gc.collect()
+
 		# How long did analyze take so far (before report rendering)?
 		analyze_elapsed_ms = (time.monotonic() - analyze_start) * 1000
 
@@ -510,6 +665,7 @@ def run(session_uuid: str, _bg_wait_until: float | None = None):
 		_publish_progress(80, "Writing session data", session_uuid)
 		_persist(docname, context, recordings, analyze_elapsed_ms)
 
+		_touch_singleflight(session_uuid)  # M2 heartbeat before the render phase
 		_publish_progress(90, "Rendering reports", session_uuid)
 		# Render and attach the HTML report to the DocType.
 		# IMPORTANT: this must run BEFORE _cleanup_redis, because raw mode
@@ -557,6 +713,10 @@ def run(session_uuid: str, _bg_wait_until: float | None = None):
 			pass
 		raise
 	finally:
+		# v0.7.x (M2): always release the single-flight flag so the next
+		# session can analyze. Compare-then-delete (only if we still hold it);
+		# a no-op on the early-return paths where we never acquired.
+		_release_singleflight(session_uuid)
 		# Round 2 fix #6: always clear the analyzing flag so subsequent
 		# requests in the same worker process can profile normally.
 		if hasattr(frappe.local, "optimus_analyzing"):
@@ -759,6 +919,23 @@ def _enrich_recordings(recordings: list[dict]) -> list[str]:
 	warnings: list[str] = []
 	truncated_queries = 0
 	total_queries_seen = 0   # for the truncation-banner percentage
+
+	# v0.7.x (M6): optional throttle of the EXPLAIN/sqlparse burst so a long
+	# flow doesn't hammer the DB/CPU continuously (and so GC gets breathing
+	# room). Off by default (every=0) — exact current behavior, zero overhead.
+	# Counts ACTUAL EXPLAIN executions (not cache hits); sleeping changes only
+	# timing, never which queries are EXPLAINed or any result.
+	try:
+		throttle_every = int(frappe.conf.get("optimus_enrich_throttle_every") or 0)
+	except Exception:
+		throttle_every = 0
+	try:
+		throttle_sleep_s = float(
+			frappe.conf.get("optimus_enrich_throttle_sleep_ms") or 5
+		) / 1000.0
+	except Exception:
+		throttle_sleep_s = 0.005
+	explains_issued = 0
 	# Cache EXPLAIN results by normalized query shape so we don't re-run
 	# EXPLAIN on the same query hundreds of times within a single session.
 	# This is the in-memory first tier; the second tier is the
@@ -857,6 +1034,12 @@ def _enrich_recordings(recordings: list[dict]) -> list[str]:
 
 			if "explain_result" not in call:
 				call["explain_result"] = []
+
+			# M6: we just issued a real EXPLAIN (cache hits / non-SELECTs
+			# `continue` above and don't reach here). Yield periodically.
+			explains_issued += 1
+			if throttle_every and explains_issued % throttle_every == 0:
+				time.sleep(throttle_sleep_s)
 
 		# mark_duplicates adds normalized_query, exact_copies, normalized_copies, index
 		try:
