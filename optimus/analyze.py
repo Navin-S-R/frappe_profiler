@@ -2739,18 +2739,18 @@ def _build_summary_html(
 		) if findings else None
 
 		if tied_finding:
+			# v0.7.x: the "See the Findings section below …" pointer lives once,
+			# on the issue-count sentence below — don't repeat it here.
 			parts.append(
 				f"The slowest one was <strong>{slowest_label_esc}</strong> at "
 				f"{slowest_ms:.0f}ms - and most of its time went into "
-				f"{_finding_phrase(tied_finding)}. See the Findings section below "
-				"for what to ask your developer to fix."
+				f"{_finding_phrase(tied_finding)}."
 			)
 		elif overall_finding:
 			parts.append(
 				f"The slowest one was <strong>{slowest_label_esc}</strong> at "
 				f"{slowest_ms:.0f}ms. The biggest issue this session "
-				f"(it affects several operations) was {_finding_phrase(overall_finding)}. "
-				"See the Findings section below."
+				f"(it affects several operations) was {_finding_phrase(overall_finding)}."
 			)
 		else:
 			parts.append(

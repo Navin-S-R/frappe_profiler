@@ -171,14 +171,16 @@ class TestSmokingGunBlockHoisting:
 
 		html = renderer.render_raw(doc, recordings=[])
 
-		# Both elements present.
+		# Callsite + fix_hint present.
 		callsite_pos = html.find(":42")
 		fix_hint_pos = html.find("Add an index on")
-		query_pos = html.find("SELECT * FROM")
-		assert callsite_pos > -1 and fix_hint_pos > -1 and query_pos > -1
-		# Callsite block (smoking gun) appears BEFORE both.
+		assert callsite_pos > -1 and fix_hint_pos > -1
+		# Callsite block (smoking gun) appears BEFORE the fix hint.
 		assert callsite_pos < fix_hint_pos
-		assert callsite_pos < query_pos
+		# v0.7.x: the "Query (normalized)" block was dropped from finding cards
+		# (the normalized SQL lives in the Slowest-queries / per-action tables).
+		assert "Query (normalized)" not in html
+		assert "SELECT * FROM" not in html
 
 
 class TestPhase2Crosslink:
@@ -973,13 +975,10 @@ class TestDocEventHookInsideSmokingGun:
 			"Doc-event hook breadcrumb must render INSIDE the smoking-gun "
 			f"block (after sg_open={sg_open}), got {hook_pos}"
 		)
-		# v0.7.x: no empty finding-detail container should appear for a
-		# Slow Hot Path-shaped finding (no inner rows match the gate).
-		fd_open = html.find('class="finding-detail"', sg_open)
-		assert fd_open == -1, (
-			"v0.7.x: finding-detail container suppressed when no inner "
-			"rows apply. Found one at " + str(fd_open)
-		)
+		# v0.7.x: actionable findings with no canonical fix now carry a uniform
+		# "Where to start" next-step, so the finding-detail container renders
+		# (with that one row) rather than being suppressed as an empty box.
+		assert "Where to start" in html
 
 	def test_target_doc_appears_with_hook(self):
 		"""When both target_doc + hook_events are set, both render on the
@@ -1251,3 +1250,29 @@ def test_phase2_callout_renders_for_empty_drilldown_self_time_finding():
 	assert "hottest line 204" in _plain(html), (
 		"empty-drilldown self-time finding did NOT get the Line-Level callout"
 	)
+
+
+class TestFindingsRefinements:
+	"""v0.7.x Findings refinements: uniform fix fallback + single-app intro."""
+
+	def test_actionable_finding_without_fix_hint_shows_where_to_start(self):
+		# A Slow Hot Path with no fix_hint and no AI fix gets a uniform
+		# next-step instead of a blank "what to do".
+		doc = _fake_doc([_finding_child(finding_type="Slow Hot Path")])
+		html = renderer.render_raw(doc, recordings=[])
+		assert "Where to start" in html
+
+	def test_finding_with_fix_hint_keeps_it(self):
+		doc = _fake_doc([_finding_child(
+			finding_type="N+1 Query",
+			extra_detail={"fix_hint": "Batch the query outside the loop."},
+		)])
+		html = renderer.render_raw(doc, recordings=[])
+		assert "Batch the query outside the loop." in html
+		assert "Where to start" not in html  # has a real fix → no fallback
+
+	def test_single_app_intro_drops_grouped_by_app(self):
+		doc = _fake_doc([_finding_child(filename="/abs/path/to/myapp/x.py")])
+		html = renderer.render_raw(doc, recordings=[])
+		assert "Sorted by severity, then by impact." in html
+		assert "Grouped by app" not in html  # only one user app → no grouping claim

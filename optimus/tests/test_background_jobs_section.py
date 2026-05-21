@@ -753,3 +753,14 @@ class TestBgJobActionLabelNormalisation:
 		out = renderer._action_to_dict(child)
 		# Label unchanged because the path was empty.
 		assert out["action_label"] == "GET something_weird"
+
+
+def test_rq_jobs_table_has_method_colgroup():
+	# v0.7.x: the RQ Jobs table was cramped across 8 columns — it now carries a
+	# colgroup that gives the Method column room.
+	doc = _doc([_action(action_label="Job: myapp.tasks.x", event_type="RQ Job",
+	                    path="myapp.tasks.x", recording_uuid="r1", duration_ms=500,
+	                    queries_count=2)])
+	html = renderer.render_raw(doc, recordings=[])
+	assert "bg-jobs-table" in html
+	assert "bgcol-method" in html

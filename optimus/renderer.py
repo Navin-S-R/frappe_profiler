@@ -1699,8 +1699,16 @@ def _render_phase2_function_table(fn: dict) -> str:
 
 	for line in rows:
 		ms = line.get("total_ms") or 0
+		hits = line.get("hits", 0) or 0
 		is_hot = max_ms > 0 and ms > 0 and ms / max_ms >= 0.25
-		tr_cls = ' class="hot"' if is_hot else ""
+		if is_hot:
+			tr_cls = ' class="hot"'
+		elif hits == 0 and ms == 0:
+			# v0.7.x: dim pure-context lines (def/comments/blank/closing parens)
+			# that never executed, so the lines that actually ran stand out.
+			tr_cls = ' class="zero"'
+		else:
+			tr_cls = ""
 		# `per_hit_us` is microseconds — convert to ms so the timing
 		# rule (1s threshold for the `.time-high` highlight) applies.
 		per_hit_ms = (line.get("per_hit_us") or 0) / 1000.0
@@ -1874,20 +1882,20 @@ def _render_line_drilldown_panel(session_doc: Any) -> str:
 		f'<span class="section-tag">{n_runs} run{"s" if n_runs != 1 else ""}</span>'
 		'</div>',
 		'<p class="section-intro">'
-		'Line-Level Drilldown captures only the flow you ran during the '
-		'line-profile recording. Make sure the line-profile reproduction '
-		'exercises the same code paths as the initial session recording - '
-		'function-not-invoked warnings indicate otherwise.'
+		'Line-Level Drilldown captures only the code paths you actually ran '
+		'during the line-profile pass. Any picked function that was not '
+		'exercised is listed under "Not exercised in this pass" below - re-run '
+		'the flow that calls it to capture its lines.'
 		'</p>',
 	]
 
 	for run_idx, run in enumerate(parsed_runs, start=1):
 		started = _e(run.get("started_at"))
-		picks_summary = ", ".join(
-			_e(p.get("dotted_path", "?")) for p in run.get("picks", [])
-		)
 		status = _e(run.get("status", ""))
 		total_ms = run.get("total_ms", 0)
+		# v0.7.x: the "Picks:" line is dropped — the per-function tables below
+		# enumerate the picks that ran, and the "Not exercised in this pass" note
+		# lists the rest, so listing all picks again here is redundant.
 		html.append(
 			'<div class="phase2-run">'
 			'<div class="phase2-run-head">'
@@ -1897,7 +1905,6 @@ def _render_line_drilldown_panel(session_doc: Any) -> str:
 			f'{total_ms:.2f}ms &middot; {started}'
 			'</span>'
 			'</div>'
-			f'<div class="picks"><em>Picks:</em> {picks_summary or "-"}</div>'
 		)
 		# Render only functions that actually ran; collapse the rest into one
 		# concise note so the drilldown isn't padded with empty zero-hit tables.
@@ -2460,9 +2467,12 @@ def _walk_drilldown_chain(
 		children = node.get("children") or []
 		if not children:
 			break
-		# Pick the hottest child by cumulative_ms.
+		# Pick the hottest child by cumulative_ms, skipping synthetic
+		# "[other: N frames]" collapse nodes (v0.7.x: not shown in chains —
+		# you can't drill into a collapsed bucket).
 		hottest = max(
-			(c for c in children if isinstance(c, dict)),
+			(c for c in children
+			 if isinstance(c, dict) and not _ct_is_other_frame(c.get("function"))),
 			key=lambda c: float(c.get("cumulative_ms") or 0),
 			default=None,
 		)
@@ -3913,11 +3923,63 @@ _CALL_TREE_MAX_DEPTH = 12  # default cap shown without a click
 _CALL_TREE_HARD_CAP = 64   # absolute ceiling — runaway protection
 
 
-def _render_call_tree_node(node, parent_ms, depth=0, unlimited=False):
+_CT_OTHER_RE = re.compile(r"^\[other: \d+ frames?\]$")
+_CT_TRIVIAL_SQL_MS = 1.0  # <sql> leaves below this are collapsed into one summary line
+
+
+def _ct_is_other_frame(fn) -> bool:
+	"""A synthetic ``[other: N frames]`` collapse node — dropped from the
+	call tree per user request (v0.7.x)."""
+	return bool(_CT_OTHER_RE.match((fn or "").strip()))
+
+
+def _ct_is_user_frame(node) -> bool:
+	"""A real user-app python frame (not framework, not a synthetic
+	``<sql>`` / ``[other]`` / ``<root>`` node). Used to auto-open the tree
+	down to the first user-app frame."""
+	fn = node.get("function") or ""
+	if not fn or fn.startswith("<") or fn.startswith("["):
+		return False
+	fname = (node.get("filename") or "").replace("\\", "/")
+	app = fname.split("/", 1)[0] if fname else ""
+	if not app:
+		return False
+	try:
+		from optimus.analyzers.base import FRAMEWORK_APPS
+	except Exception:
+		FRAMEWORK_APPS = frozenset()
+	return app not in FRAMEWORK_APPS
+
+
+def _ct_trivial_sql_summary(sql_children) -> str:
+	"""Collapse a run of sub-1ms ``<sql>`` leaf siblings into one expandable
+	'+N more sub-1ms queries' line — declutters the tail without dropping any
+	frame (they stay one click away)."""
+	n = len(sql_children)
+	total = sum(float((c or {}).get("cumulative_ms") or 0) for c in sql_children)
+	inner = []
+	for c in sql_children:
+		cn = c or {}
+		loc = (cn.get("filename") or "") + (f":{cn.get('lineno')}" if cn.get("lineno") else "")
+		inner.append(
+			'<div class="call-tree-node">'
+			'<span class="frame-name">&lt;sql&gt;</span> '
+			f'<span class="frame-meta">{_e(loc)} &middot; '
+			f'{float(cn.get("cumulative_ms") or 0):.1f}ms</span></div>'
+		)
+	plural = "y" if n == 1 else "ies"
+	return (
+		'<details class="call-tree-deeper-toggle">'
+		f'<summary><em>+{n} more sub-1ms quer{plural} &middot; {total:.0f}ms total</em></summary>'
+		'<div class="call-tree-children">' + "".join(inner) + '</div></details>'
+	)
+
+
+def _render_call_tree_node(node, parent_ms, depth=0, unlimited=False, breadcrumb=True):
 	"""Phase K.5: recursive nested-``<details>`` emit for a single
-	call_tree node. Auto-expands the first ``depth`` levels; deeper
-	branches start collapsed so the panel doesn't unfurl into thousands
-	of frames on first paint.
+	call_tree node. Auto-opens the hottest path down to the first user-app
+	frame (``breadcrumb``); deeper branches start collapsed so the panel
+	doesn't unfurl into thousands of frames on first paint.
 
 	Past ``_CALL_TREE_MAX_DEPTH`` the remaining subtree is wrapped in
 	a click-to-expand ``<details>`` so users can traverse deeper when
@@ -3928,6 +3990,10 @@ def _render_call_tree_node(node, parent_ms, depth=0, unlimited=False):
 	if not isinstance(node, dict):
 		return ""
 	fn = node.get("function") or "<?>"
+	# v0.7.x: drop synthetic "[other: N frames]" collapse nodes entirely (user
+	# request — accepts that a branch's visible children may not sum to its total).
+	if _ct_is_other_frame(fn):
+		return ""
 	file = node.get("filename") or ""
 	lineno = node.get("lineno") or ""
 	cum_ms = float(node.get("cumulative_ms") or 0)
@@ -3939,7 +4005,10 @@ def _render_call_tree_node(node, parent_ms, depth=0, unlimited=False):
 	if parent_ms and cum_ms / parent_ms >= 0.5:
 		cls += " call-tree-hot"
 
-	open_attr = " open" if depth < 1 else ""
+	# v0.7.x: auto-open the hottest path down to the first user-app frame so the
+	# tree "opens at" the user's code; collapse below it.
+	is_user = _ct_is_user_frame(node)
+	open_attr = " open" if breadcrumb else ""
 	meta_lineno = f":{lineno}" if lineno else ""
 	pct_label = f" &middot; {pct:.0f}%" if parent_ms else ""
 	self_label = ""
@@ -3955,20 +4024,44 @@ def _render_call_tree_node(node, parent_ms, depth=0, unlimited=False):
 		'</summary>',
 	]
 	if children:
+		# Drop [other: N frames] synthetic nodes, then order hottest-first.
+		real_children = [
+			c for c in children
+			if not _ct_is_other_frame((c or {}).get("function"))
+		]
 		children_sorted = sorted(
-			children,
+			real_children,
 			key=lambda c: float((c or {}).get("cumulative_ms") or 0),
 			reverse=True,
 		)
+		# Collapse sub-1ms <sql> leaf siblings into one expandable summary.
+		main, trivial_sql = [], []
+		for c in children_sorted:
+			cn = c or {}
+			if (cn.get("function") == "<sql>"
+					and float(cn.get("cumulative_ms") or 0) < _CT_TRIVIAL_SQL_MS
+					and not cn.get("children")):
+				trivial_sql.append(c)
+			else:
+				main.append(c)
+
 		within_default = unlimited or depth < _CALL_TREE_MAX_DEPTH
 		within_hard = depth < _CALL_TREE_HARD_CAP
 
 		if within_default and within_hard:
 			out.append('<div class="call-tree-children">')
-			for c in children_sorted:
+			for idx, c in enumerate(main):
+				# Continue the auto-open breadcrumb down the single hottest path
+				# until we reach a user-app frame; collapse once we're there.
+				child_bc = (
+					breadcrumb and not is_user and idx == 0
+					and depth < _CALL_TREE_MAX_DEPTH
+				)
 				out.append(_render_call_tree_node(
-					c, cum_ms, depth + 1, unlimited,
+					c, cum_ms, depth + 1, unlimited, breadcrumb=child_bc,
 				))
+			if trivial_sql:
+				out.append(_ct_trivial_sql_summary(trivial_sql))
 			out.append('</div>')
 		elif within_hard:
 			# Past default cap — click-to-expand the rest of the
@@ -3978,15 +4071,17 @@ def _render_call_tree_node(node, parent_ms, depth=0, unlimited=False):
 				'<div class="call-tree-children call-tree-deeper">'
 				'<details class="call-tree-deeper-toggle">'
 				'<summary>'
-				f'<em>show {len(children)} deeper frame(s) &middot; '
+				f'<em>show {len(main)} deeper frame(s) &middot; '
 				f'depth {depth + 1}+</em>'
 				'</summary>'
 				'<div class="call-tree-children">'
 			)
-			for c in children_sorted:
+			for c in main:
 				out.append(_render_call_tree_node(
-					c, cum_ms, depth + 1, unlimited=True,
+					c, cum_ms, depth + 1, unlimited=True, breadcrumb=False,
 				))
+			if trivial_sql:
+				out.append(_ct_trivial_sql_summary(trivial_sql))
 			out.append('</div></details></div>')
 		else:
 			# depth >= HARD_CAP; absolute truncation as safety net.
@@ -4072,9 +4167,10 @@ def _render_call_tree_panel(actions):
 		'</div>',
 		'<p class="section-intro">'
 		'Hierarchical breakdown of where wall-clock time went inside the slowest '
-		'action. Click any frame to expand its children. Numbers are cumulative time '
-		'(including children) and percentage of the parent. Branches consuming '
-		'&ge;50% of their parent are highlighted as hot.'
+		'action. The tree auto-opens down to your app\'s first hot frame; click any '
+		'frame to expand or collapse it. Numbers are cumulative time (including '
+		'children) and percentage of the parent. Branches consuming &ge;50% of their '
+		'parent are highlighted as hot.'
 		'</p>',
 		'<div class="call-tree">',
 	]
@@ -4850,9 +4946,10 @@ def build_hot_frames_table(rows: list, is_hot: bool = False) -> list:
 	"""
 	out = []
 	for row in rows or []:
-		display = redact_frame_name(
-			{"function": row.get("function"), "filename": "", "lineno": 0},
-		)
+		# The hot-frame key already encodes "<short_path>::<func>" — use it
+		# directly. Routing through redact_frame_name appended a bogus "(?:0)"
+		# (placeholder file "?" + lineno 0, since no file/line is known here).
+		display = row.get("function") or "<unknown>"
 		if is_hot:
 			display_ms = row.get("total_ms", 0)
 		else:

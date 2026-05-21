@@ -1391,6 +1391,13 @@
   .job-status-warn { background: var(--warn-soft); color: var(--warn); }
   .job-status-info { background: var(--info-soft); color: var(--info); }
   .job-status-mute { background: var(--rule); color: var(--ink-mute); }
+  /* v0.7.x: RQ Jobs table was cramped across 8 columns — give Method room and
+     keep the numeric columns tight (fixed layout so the colgroup widths hold). */
+  table.bg-jobs-table { table-layout: fixed; }
+  table.bg-jobs-table .bgcol-idx { width: 30px; }
+  table.bg-jobs-table .bgcol-method { width: 42%; }
+  table.bg-jobs-table .bgcol-status { width: 92px; }
+  table.bg-jobs-table td, table.bg-jobs-table th { overflow-wrap: anywhere; }
   .picks {
     font-size: 12px; color: var(--ink-mute);
     margin-bottom: 8px; font-family: var(--mono);
@@ -1448,6 +1455,9 @@
     background: var(--hot);
   }
   table.line-prof tbody tr.hot td.num { color: var(--accent); font-weight: 600; }
+  /* v0.7.x: dim lines that never executed (0 hits / 0ms) - def, comments,
+     blank, closing parens - so the lines that actually ran stand out. */
+  table.line-prof tbody tr.zero td { color: var(--ink-mute); opacity: 0.7; }
   table.line-prof tbody tr.added td { background: rgba(45, 106, 60, 0.12); }
   table.line-prof tbody tr.removed td { background: rgba(197, 57, 43, 0.12); }
 
@@ -1806,6 +1816,10 @@
        that this block displays (Slow Hot Path / Hook Bottleneck / Hot Line
        / Function Not Invoked - their meaningful content lives in the
        smoking-gun block above, not here). #}
+    {# v0.7.x: actionable findings with no canonical fix (Slow Hot Path / Hot
+       Line / Hook Bottleneck) get a uniform "Where to start" next-step so every
+       finding tells the reader what to do. #}
+    {% set _show_fix_fallback = (show_fix_hint_label == "How to fix" and not detail.fix_hint and not (f.llm_fix and f.llm_fix.suggestion_html)) %}
     {% set _has_detail_rows = (
          detail.normalized_query
       or detail.suggested_ddl
@@ -1816,6 +1830,7 @@
       or detail.occurrences
       or (detail.projected_avg_time_ms is defined and detail.projected_avg_time_ms)
       or ((not callsite.filename or not callsite.lineno) and (detail.target_doc or detail.hook_events))
+      or _show_fix_fallback
     ) %}
     {% if f.technical_detail and _has_detail_rows %}
     <div class="finding-detail">
@@ -1834,10 +1849,10 @@
         </p>
       {% endif %}
 
-      {% if detail.normalized_query %}
-        <span class="label">Query (normalized)</span>
-        <pre>{{ detail.normalized_query }}</pre>
-      {% endif %}
+      {# v0.7.x: the "Query (normalized)" block was dropped from finding cards
+         per user request - the callsite + fix already say what to change, and
+         the normalized SQL still lives in the Slowest-queries / per-action
+         tables. #}
 
       {% if detail.suggested_ddl %}
         <span class="label">Suggested DDL</span>
@@ -1859,6 +1874,14 @@
       {% if detail.fix_hint %}
         <span class="label">{{ show_fix_hint_label }}</span>
         <p>{{ detail.fix_hint }}</p>
+      {% elif _show_fix_fallback %}
+        {# v0.7.x: uniform next-step so every actionable finding carries a fix
+           hint - the self-time hot-path / hot-line types have no canonical
+           one-line fix, so point at how to attack them. #}
+        <span class="label">Where to start</span>
+        <p>This is the hottest code on this path. Cut its cost - fewer loop
+        iterations or queries, cache repeated work, or move it off the request
+        path. A Line-Level Drilldown pass pinpoints the exact line.</p>
       {% endif %}
 
       {% if detail.validation_note %}
@@ -2417,7 +2440,11 @@
        reads legacy field names (severity="High", technical_detail dict,
        etc.) and the bucketing logic stays in renderer.py. #}
     {% if report_data.findings_by_app %}
+      {% if report_data.findings_by_app | length > 1 %}
       <p class="small muted">Sorted by severity, then by impact. Grouped by app so you can focus on your custom code without scanning through framework noise.</p>
+      {% else %}
+      <p class="small muted">Sorted by severity, then by impact.</p>
+      {% endif %}
       <p class="small muted" style="font-style: italic;">
         Note: finding impacts may overlap when several findings cover the
         same code path (e.g. a Slow Hot Path and an N+1 inside the same
@@ -2526,7 +2553,7 @@
       <h2>Where the time went</h2>
       <span class="section-tag">top {{ report_data.waterfall | length }} actions</span>
     </div>
-    <p class="section-intro">Wall-clock time per action, scaled to the slowest one shown. Red = a High-severity finding ties to this action; amber = RQ Job; blue = everything else.</p>
+    <p class="section-intro">Wall-clock time per action, longest first. Bar colour: red = action with a High-severity finding, amber = background (RQ) job, blue = everything else.</p>
     <div class="waterfall">
       {% for row in report_data.waterfall %}
       <div class="waterfall-row">
@@ -2685,7 +2712,12 @@
        migrates with the heading block in a later sub-phase. #}
     {% if report_data.background_jobs %}
     {% set _max_job_ms = (report_data.background_jobs | map(attribute='duration_ms') | map('default', 0) | list | max) or 1 %}
-    <table class="data">
+    <table class="data bg-jobs-table">
+      <colgroup>
+        <col class="bgcol-idx"><col class="bgcol-method"><col class="bgcol-status">
+        <col class="bgcol-num"><col class="bgcol-num"><col class="bgcol-num"><col class="bgcol-num">
+        {% if report_data.background_jobs_summary.any_findings_counted %}<col class="bgcol-num">{% endif %}
+      </colgroup>
       <thead>
         <tr>
           <th>#</th>
@@ -2726,7 +2758,12 @@
     {% set _max_fw_job_ms = (report_data.background_jobs_framework | map(attribute='duration_ms') | map('default', 0) | list | max) or 1 %}
     <details class="subsection">
       <summary class="small muted"><strong>{{ report_data.background_jobs_summary.framework_count }}</strong> framework job{{ "s" if report_data.background_jobs_summary.framework_count != 1 else "" }} (click to expand) - <code>frappe</code>, <code>erpnext</code>, and friends; the developer can't easily patch these</summary>
-      <table class="data">
+      <table class="data bg-jobs-table">
+        <colgroup>
+          <col class="bgcol-idx"><col class="bgcol-method"><col class="bgcol-status">
+          <col class="bgcol-num"><col class="bgcol-num"><col class="bgcol-num"><col class="bgcol-num">
+          {% if report_data.background_jobs_summary.any_findings_counted %}<col class="bgcol-num">{% endif %}
+        </colgroup>
         <thead>
           <tr>
             <th>#</th>
@@ -3429,12 +3466,12 @@
   <section class="how-to" id="how-to-read">
     <h2>How to read this report</h2>
     <ul class="small" style="margin:6px 0 0 18px;padding:0;line-height:1.7;">
-      <li>Start with <strong>Findings</strong> - that's the punch list of what to fix. The <em>Observations</em> sub-list under it is FYI signal (framework-level issues, system pressure) with no concrete fix you can ship.</li>
+      <li>Start with <strong>Findings</strong> - that's the punch list of what to fix.{% if report_data.observational_findings %} The <em>Observations</em> sub-list under it is FYI signal (framework-level issues, system pressure) with no concrete fix you can ship.{% endif %}</li>
       <li>The per-action table below lists every request the session captured, sorted by duration; the background-jobs section lists the jobs those requests enqueued (captured and analyzed too).</li>
-      <li>The database-tables section shows where DB time went, with an index candidate per table; the <em>tables written to</em> line at the top of it lists every table the session wrote - writes are cheap, so they rank low by time. The slowest-queries section covers your own app's code only.</li>
+      <li>The database-tables section shows where DB time went; the <em>tables written to</em> line at the top of it lists every table the session wrote - writes are cheap, so they rank low by time. The slowest-queries section covers your own app's code only.</li>
       <li>The server-resource and frontend panels show CPU / memory / queue pressure and browser timings - only when captured.</li>
-      <li>The full-recordings and queries-per-action sections hold the raw SQL, headers, form data and stack traces - for deep dives.</li>
-      <li>Hover any <code>file.py:123</code> callsite to open it in VS&nbsp;Code. Anything starting with <code>tab</code> is a database table; the DocType is the part after <code>tab</code>.</li>
+      <li>Expand any row of the per-action breakdown for that action's queries and timings - the deep-dive detail.</li>
+      <li>Click any <code>file.py:123</code> callsite to open it in VS&nbsp;Code. Anything starting with <code>tab</code> is a database table; the DocType is the part after <code>tab</code>.</li>
       <li>Every duration carries a small grey scope tag: <strong>per hit</strong> (one occurrence — a single request, one query execution) or <strong>consolidated</strong> (sum across all hits in this session — total time in a table, full impact of a finding's pattern, etc.).</li>
       <li>Call-tree and Hot-frame timings come from a wall-clock sampler at ≈{{ report_data.sampler_interval_ms }}ms intervals. Functions whose execution is shorter than the interval can be under-sampled or invisible — for exact per-line timings, use the <strong>Line-Level Drilldown</strong>.</li>
       <li><strong>Self-time</strong> is wall-clock self-time (the sampler measures elapsed time, not CPU). A function that blocks on I/O — <code>requests.get</code>, sync DB calls outside the recorder, <code>time.sleep</code> — counts that wait as self-time. Check the call tree for hidden I/O before optimising compute.</li>
