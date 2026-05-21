@@ -3924,7 +3924,6 @@ _CALL_TREE_HARD_CAP = 64   # absolute ceiling — runaway protection
 
 
 _CT_OTHER_RE = re.compile(r"^\[other: \d+ frames?\]$")
-_CT_TRIVIAL_SQL_MS = 1.0  # <sql> leaves below this are collapsed into one summary line
 
 
 def _ct_is_other_frame(fn) -> bool:
@@ -3951,10 +3950,12 @@ def _ct_is_user_frame(node) -> bool:
 	return app not in FRAMEWORK_APPS
 
 
-def _ct_trivial_sql_summary(sql_children) -> str:
-	"""Collapse a run of sub-1ms ``<sql>`` leaf siblings into one expandable
-	'+N more sub-1ms queries' line — declutters the tail without dropping any
-	frame (they stay one click away)."""
+def _ct_sql_summary(sql_children) -> str:
+	"""Collapse a node's ``<sql>`` leaf siblings into one expandable
+	'N SQL queries · Xms total' line. The call tree shows the Python call
+	hierarchy; individual query rows are noise here (they live, itemised, in
+	the Slowest-queries / DB-tables sections). Collapsed one-click-away, not
+	dropped — the aggregate time stays visible."""
 	n = len(sql_children)
 	total = sum(float((c or {}).get("cumulative_ms") or 0) for c in sql_children)
 	inner = []
@@ -3970,7 +3971,7 @@ def _ct_trivial_sql_summary(sql_children) -> str:
 	plural = "y" if n == 1 else "ies"
 	return (
 		'<details class="call-tree-deeper-toggle">'
-		f'<summary><em>+{n} more sub-1ms quer{plural} &middot; {total:.0f}ms total</em></summary>'
+		f'<summary><em>{n} SQL quer{plural} &middot; {total:.0f}ms total (click to expand)</em></summary>'
 		'<div class="call-tree-children">' + "".join(inner) + '</div></details>'
 	)
 
@@ -4034,14 +4035,14 @@ def _render_call_tree_node(node, parent_ms, depth=0, unlimited=False, breadcrumb
 			key=lambda c: float((c or {}).get("cumulative_ms") or 0),
 			reverse=True,
 		)
-		# Collapse sub-1ms <sql> leaf siblings into one expandable summary.
-		main, trivial_sql = [], []
+		# Collapse ALL <sql> leaf siblings into one expandable summary — the
+		# call tree is the Python hierarchy; per-query rows belong in the
+		# Slowest-queries / DB-tables sections.
+		main, sql_leaves = [], []
 		for c in children_sorted:
 			cn = c or {}
-			if (cn.get("function") == "<sql>"
-					and float(cn.get("cumulative_ms") or 0) < _CT_TRIVIAL_SQL_MS
-					and not cn.get("children")):
-				trivial_sql.append(c)
+			if cn.get("function") == "<sql>" and not cn.get("children"):
+				sql_leaves.append(c)
 			else:
 				main.append(c)
 
@@ -4060,8 +4061,8 @@ def _render_call_tree_node(node, parent_ms, depth=0, unlimited=False, breadcrumb
 				out.append(_render_call_tree_node(
 					c, cum_ms, depth + 1, unlimited, breadcrumb=child_bc,
 				))
-			if trivial_sql:
-				out.append(_ct_trivial_sql_summary(trivial_sql))
+			if sql_leaves:
+				out.append(_ct_sql_summary(sql_leaves))
 			out.append('</div>')
 		elif within_hard:
 			# Past default cap — click-to-expand the rest of the
@@ -4080,8 +4081,8 @@ def _render_call_tree_node(node, parent_ms, depth=0, unlimited=False, breadcrumb
 				out.append(_render_call_tree_node(
 					c, cum_ms, depth + 1, unlimited=True, breadcrumb=False,
 				))
-			if trivial_sql:
-				out.append(_ct_trivial_sql_summary(trivial_sql))
+			if sql_leaves:
+				out.append(_ct_sql_summary(sql_leaves))
 			out.append('</div></details></div>')
 		else:
 			# depth >= HARD_CAP; absolute truncation as safety net.
@@ -4179,8 +4180,22 @@ def _render_call_tree_panel(actions):
 		key=lambda c: float((c or {}).get("cumulative_ms") or 0),
 		reverse=True,
 	)
+	# The profiler attributes SQL queries as root-level siblings of the entry
+	# frame, so the panel renders them directly (bypassing the per-node child
+	# loop). Drop [other] nodes and collapse the root <sql> leaves here too.
+	root_main, root_sql = [], []
 	for c in root_children_sorted:
+		cn = c or {}
+		if _ct_is_other_frame(cn.get("function")):
+			continue
+		if cn.get("function") == "<sql>" and not cn.get("children"):
+			root_sql.append(c)
+		else:
+			root_main.append(c)
+	for c in root_main:
 		parts.append(_render_call_tree_node(c, total_ms, depth=0))
+	if root_sql:
+		parts.append(_ct_sql_summary(root_sql))
 	parts.append('</div>')
 	parts.append('</section>')
 	return "".join(parts)
