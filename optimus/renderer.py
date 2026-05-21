@@ -2171,9 +2171,13 @@ def _finding_to_dict(child: Any, file_cache: dict | None = None) -> dict:
 					"source_snippet": _read_source_snippet(_abs, _ln, cache=file_cache),
 				}
 
-	# v0.6.0 Round 2: fold a Hot Line finding's persisted ``line_content``
-	# directly into a single-row source_snippet. The text is already in
-	# the finding's technical_detail; no file read needed.
+	# v0.6.0 Round 2 / v0.7.x: a Hot Line finding carries the exact profiled
+	# line in ``line_content``. Show it WITH ±2 context lines (read from the
+	# file, like call-tree findings) instead of a lone row — but keep the
+	# profiled text authoritative for the hot line itself, so a file that
+	# drifted since the run can't misrepresent what was actually profiled.
+	# Falls back to the single stored line when the file can't be read at
+	# render (offline / regenerated without the source) or the line is gone.
 	callsite = detail.get("callsite") or {}
 	if (
 		callsite
@@ -2181,10 +2185,20 @@ def _finding_to_dict(child: Any, file_cache: dict | None = None) -> dict:
 		and detail.get("line_content")
 		and callsite.get("lineno") is not None
 	):
-		callsite["source_snippet"] = [{
-			"lineno": callsite["lineno"],
-			"content": detail["line_content"],
-		}]
+		hot_ln = callsite["lineno"]
+		window = _read_source_snippet(
+			callsite.get("filename"), hot_ln, cache=file_cache,
+		)
+		if window and any(r.get("lineno") == hot_ln for r in window):
+			for r in window:
+				if r.get("lineno") == hot_ln:
+					r["content"] = detail["line_content"]  # profiled text wins
+			callsite["source_snippet"] = window
+		else:
+			callsite["source_snippet"] = [{
+				"lineno": hot_ln,
+				"content": detail["line_content"],
+			}]
 		detail["callsite"] = callsite
 
 	# v0.6.0 Round 2: lazy snippet read at render time when nothing has
