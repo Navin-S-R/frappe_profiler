@@ -25,6 +25,7 @@ without its dependency raises ``RuntimeError``.
 import importlib
 import inspect
 import json
+import sys
 
 from optimus.line_profile import diff
 
@@ -363,6 +364,33 @@ def _get_or_resolve_picks(run_uuid: str) -> list:
 			fns.append(fn)
 	_resolved_fns_by_run[run_uuid] = fns
 	return fns
+
+
+def release_monitoring_tool() -> None:
+	"""Guarantee phase-2 leaves no ``sys.monitoring`` line-trace hook behind.
+
+	On Python 3.12+ line_profiler drives the *process-global* ``sys.monitoring``
+	``PROFILER_ID`` (tool id 2). If a per-request teardown fails (e.g.
+	line_profiler's own ``disable()`` raising ``ValueError: tool 2 is not in
+	use``), tool 2's line events stay registered and EVERY subsequent request in
+	the worker is line-traced → CPU saturation and a frozen UI. This forcibly
+	clears + frees tool 2 so the hook can't leak, regardless of line_profiler's
+	(fragile) internal bookkeeping.
+
+	Idempotent and version-safe: a no-op on Python < 3.12 (no ``sys.monitoring``)
+	and when tool 2 isn't ours. Only reclaims the tool when it's registered to
+	``line_profiler``, so it never stomps a different profiler tool."""
+	mon = getattr(sys, "monitoring", None)
+	if mon is None:
+		return
+	try:
+		pid = mon.PROFILER_ID
+		if mon.get_tool(pid) != "line_profiler":
+			return
+		mon.set_events(pid, 0)
+		mon.free_tool_id(pid)
+	except Exception:
+		pass
 
 
 def make_profiler(run_uuid: str):

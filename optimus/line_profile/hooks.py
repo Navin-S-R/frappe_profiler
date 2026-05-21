@@ -52,6 +52,12 @@ def before_request_line_profile(*args, **kwargs) -> None:
 		if profiler is None:
 			return
 
+		# Self-heal: if a prior request was killed mid-flight (skipping its
+		# after_request teardown) and left tool 2 registered, clear the orphan
+		# before enabling so the worker recovers without a bench restart. Guarded
+		# on "no active profiler in this thread" so it can't drop our own run.
+		if getattr(frappe.local, "_lp_profiler", None) is None:
+			capture.release_monitoring_tool()
 		profiler.enable_by_count()
 		frappe.local._lp_profiler = profiler
 		frappe.local._lp_run_uuid = run_uuid
@@ -78,7 +84,13 @@ def after_request_line_profile(*args, **kwargs) -> None:
 		return
 
 	try:
-		profiler.disable()
+		try:
+			# Pair with before_request's enable_by_count(); count-guarded so it's
+			# safe even if line_profiler already tore down (the "tool 2 is not in
+			# use" path). Stats are still readable after, so don't skip serialize.
+			profiler.disable_by_count()
+		except Exception:
+			pass
 		samples = capture.serialize_stats(profiler)
 		capture.flush_samples(run_uuid, samples)
 	except Exception as exc:
@@ -86,6 +98,10 @@ def after_request_line_profile(*args, **kwargs) -> None:
 			title="phase 2 after_request failed",
 			message=f"{type(exc).__name__}: {exc}",
 		)
+	finally:
+		# Guarantee no process-global sys.monitoring line-trace hook survives
+		# this request — a leaked tool would line-trace every later request.
+		capture.release_monitoring_tool()
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +151,11 @@ def before_job_line_profile(method=None, kwargs=None, **rest) -> None:
 		if profiler is None:
 			return
 
+		# Self-heal a tool 2 orphaned by a previously-killed job (see
+		# before_request_line_profile). RQ workers run one job at a time, so
+		# there's no in-process concurrency to disturb here.
+		if getattr(frappe.local, "_lp_profiler", None) is None:
+			capture.release_monitoring_tool()
 		profiler.enable_by_count()
 		frappe.local._lp_profiler = profiler
 		frappe.local._lp_run_uuid = run_uuid
@@ -160,7 +181,10 @@ def after_job_line_profile(method=None, kwargs=None, result=None, **rest) -> Non
 		return
 
 	try:
-		profiler.disable()
+		try:
+			profiler.disable_by_count()
+		except Exception:
+			pass
 		samples = capture.serialize_stats(profiler)
 		capture.flush_samples(run_uuid, samples)
 	except Exception as exc:
@@ -168,3 +192,5 @@ def after_job_line_profile(method=None, kwargs=None, result=None, **rest) -> Non
 			title="phase 2 after_job failed",
 			message=f"{type(exc).__name__}: {exc}",
 		)
+	finally:
+		capture.release_monitoring_tool()
